@@ -1,0 +1,14 @@
+{
+  "stage": "execute",
+  "minVerdict": "revise",
+  "sandboxResult": {
+    "stdout": "Migrating users…\nDone.\n",
+    "stderr": "ERROR: failed to update 47 of 200 rows (constraint violation)\n",
+    "exitCode": 0,
+    "durationMs": 12,
+    "timedOut": false
+  },
+  "issues": [
+    { "severityAtLeast": "high", "whereContains": "stderr" }
+  ]
+}

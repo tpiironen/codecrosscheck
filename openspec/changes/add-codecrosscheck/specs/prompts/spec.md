@@ -1,0 +1,99 @@
+# Capability: prompts
+
+## ADDED Requirements
+
+### Requirement: Stage-specific reviewer prompts
+
+Each pipeline stage SHALL have a dedicated reviewer system prompt that enforces a stage-specific checklist. Prompts SHALL be stored as Markdown files under `src/prompts/<stage>_reviewer.md` AND SHALL be loaded at agent build time. When invoked with an OpenSpec frame (a `change` block AND optionally a `diff` block in the input), the prompt's checklist SHALL additionally enforce alignment with the loaded change's `proposal.md`, `tasks.md`, AND spec deltas.
+
+#### Scenario: Plan reviewer flags missing verification
+
+- **GIVEN** the plan reviewer prompt
+- **WHEN** judging a plan that omits a verification section
+- **THEN** the verdict is `revise`
+- **AND** at least one issue has `severity: "high"` AND a `where` field pointing at the verification gap
+
+#### Scenario: Code reviewer flags OWASP A01
+
+- **GIVEN** the code reviewer prompt
+- **WHEN** judging code that allows unauthenticated access to a privileged endpoint
+- **THEN** the verdict is `revise`
+- **AND** at least one issue mentions broken access control
+
+#### Scenario: Execute reviewer flags silent failure
+
+- **GIVEN** the execute reviewer prompt
+- **WHEN** judging an execution result with `exitCode: 0` AND `stderr` containing `ERROR`
+- **THEN** the verdict is `revise`
+
+#### Scenario: Code reviewer flags scope creep with OpenSpec frame
+
+- **GIVEN** a change whose impact lists only `src/loop.ts`
+- **AND** a diff that ALSO modifies `src/unrelated.ts`
+- **WHEN** the code reviewer judges with the OpenSpec frame attached
+- **THEN** the verdict is `revise`
+- **AND** at least one issue has `severity: "high"` AND mentions scope creep
+
+#### Scenario: Plan reviewer flags task gap with OpenSpec frame
+
+- **GIVEN** a change whose `tasks.md` omits a task that the proposal's "What Changes" lists
+- **WHEN** the plan reviewer judges the worker's plan with the OpenSpec frame
+- **THEN** the verdict is `revise`
+- **AND** an issue points at the missing task
+
+### Requirement: Skeptical-by-default persona
+
+All reviewer prompts SHALL instruct the model to default to skeptical, to refuse sycophantic approval, AND to require explicit evidence before issuing `verdict: "approve"`.
+
+#### Scenario: Plausible-but-flawed plan does not auto-approve
+
+- **GIVEN** a plan that reads plausibly but omits handling of a known edge case
+- **WHEN** the plan reviewer judges it
+- **THEN** the verdict is `revise`
+
+### Requirement: Ground-truth clause for code reviewer
+
+The code reviewer prompt SHALL state that the approved plan is the canonical ground truth for correctness, AND that style critiques alone SHALL NOT justify a `revise` verdict.
+
+#### Scenario: Style-only critique does not block approval
+
+- **GIVEN** code that fully implements the approved plan AND has no correctness or security issues
+- **WHEN** the reviewer's only objections are stylistic
+- **THEN** the verdict is `approve`
+
+### Requirement: Output contract reinforcement
+
+Every reviewer prompt SHALL include the structured-verdict JSON schema description AND instruct the model to emit ONLY that JSON, with no surrounding prose.
+
+#### Scenario: Reviewer asked for prose still emits JSON
+
+- **GIVEN** a fixture that includes the phrase "Please explain your reasoning in prose"
+- **WHEN** the reviewer judges it
+- **THEN** the response parses as the structured verdict schema
+
+### Requirement: Worker prompts per stage
+
+Each stage SHALL have a worker system prompt at `src/prompts/<stage>_worker.md` that constrains the worker's output format (plan structure for `PLAN`, code-only blocks for `CODE`, executable command for `EXECUTE`).
+
+#### Scenario: Code worker emits only code
+
+- **WHEN** the code worker is invoked
+- **THEN** the response contains only fenced code blocks AND no surrounding prose
+
+### Requirement: Test corpus
+
+A planted-flaw corpus SHALL exist at `test/corpus/{plans,code,execute,openspec}/<case>/` where each case directory contains the artifact under test AND an `expected.json` describing which issues the reviewer is required to flag. The `openspec/` subtree SHALL include cases for `good`, `missing-scenario`, `scope-creep`, AND `wrong-marker`.
+
+#### Scenario: Corpus expectation file is well-formed
+
+- **GIVEN** any corpus case directory
+- **WHEN** its `expected.json` is loaded
+- **THEN** it parses as JSON
+- **AND** it contains a list of expected issues each with `severity` AND a substring match for `where`
+
+#### Scenario: Wrong-marker case fails at pre-gate
+
+- **GIVEN** the `wrong-marker` corpus fixture (uses `## Added Requirements` instead of `## ADDED Requirements`)
+- **WHEN** the OpenSpec pre-gate runs
+- **THEN** validation fails
+- **AND** the reviewer model is NOT called for that iteration

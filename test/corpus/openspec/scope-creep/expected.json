@@ -1,0 +1,7 @@
+{
+  "stage": "code",
+  "minVerdict": "revise",
+  "issues": [
+    { "severityAtLeast": "high", "whereContains": "scope" }
+  ]
+}

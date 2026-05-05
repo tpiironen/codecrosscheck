@@ -1,0 +1,5 @@
+# Replace REPLACE_ORG with your Azure DevOps organisation name.
+registry=https://pkgs.dev.azure.com/REPLACE_ORG/_packaging/codecrosscheck-npm/npm/registry/
+//pkgs.dev.azure.com/REPLACE_ORG/_packaging/codecrosscheck-npm/npm/registry/:always-auth=true
+//pkgs.dev.azure.com/REPLACE_ORG/_packaging/codecrosscheck-npm/npm/:always-auth=true
+always-auth=true

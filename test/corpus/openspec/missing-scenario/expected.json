@@ -1,0 +1,8 @@
+{
+  "stage": "openspec-validate",
+  "minVerdict": "revise",
+  "expectValidatorFailure": true,
+  "issues": [
+    { "severityAtLeast": "high", "whereContains": "Scenario" }
+  ]
+}

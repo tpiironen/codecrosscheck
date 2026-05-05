@@ -1,0 +1,7 @@
+{
+  "stage": "plan",
+  "minVerdict": "revise",
+  "issues": [
+    { "severityAtLeast": "high", "whereContains": "verification" }
+  ]
+}

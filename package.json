@@ -1,0 +1,237 @@
+{
+  "name": "codecrosscheck",
+  "version": "0.2.7",
+  "description": "Two-model review loop: a worker LLM produces, a reviewer LLM judges, both as a Node CLI and a VS Code chat participant.",
+  "type": "module",
+  "engines": {
+    "node": ">=20",
+    "vscode": "^1.93.0"
+  },
+  "main": "./dist/extension.cjs",
+  "bin": {
+    "codecrosscheck": "./dist/cli.js",
+    "ccc": "./dist/cli.js",
+    "codecrosscheck-install": "./dist/install.js"
+  },
+  "files": [
+    "dist/",
+    "src/prompts/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/copy-assets.mjs && node scripts/bundle-extension.mjs",
+    "test": "vitest run",
+    "verify": "npm ci && npm run build && npm test",
+    "selftest": "npm run build && node scripts/selftest.mjs",
+    "selftest:openspec": "npm run build && node scripts/selftest-openspec.mjs",
+    "publish:npm": "npm publish",
+    "publish:vsix": "node scripts/publish-vsix.mjs",
+    "release": "node scripts/release.mjs"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "undici": "^6.19.8",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.93.0",
+    "@vscode/vsce": "^3.1.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "peerDependencies": {
+    "vscode": "^1.93.0"
+  },
+  "peerDependenciesMeta": {
+    "vscode": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "registry": "https://pkgs.dev.azure.com/REPLACE_ORG/_packaging/codecrosscheck-npm/npm/registry/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://dev.azure.com/REPLACE_ORG/REPLACE_PROJECT/_git/CodeCrossCheck"
+  },
+  "publisher": "internal",
+  "displayName": "CodeCrossCheck",
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "activationEvents": [
+    "onChatParticipant:codecrosscheck",
+    "onCommand:codecrosscheck.reviewSelection",
+    "onCommand:codecrosscheck.reviewActiveFile",
+    "onCommand:codecrosscheck.installSkill"
+  ],
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "codecrosscheck",
+        "name": "codecrosscheck",
+        "fullName": "CodeCrossCheck",
+        "description": "Two-model review loop for plans, code, and execution.",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "plan",
+            "description": "Run only the PLAN stage"
+          },
+          {
+            "name": "code",
+            "description": "Run only the CODE stage"
+          },
+          {
+            "name": "execute",
+            "description": "Run only the EXECUTE stage"
+          },
+          {
+            "name": "review-branch",
+            "description": "Review the current branch diff (vs origin/main merge-base)"
+          },
+          {
+            "name": "apply-review",
+            "description": "Apply the latest /review-branch fix proposal to the working tree"
+          },
+          {
+            "name": "openspec-init",
+            "description": "Scaffold openspec/ in this workspace"
+          },
+          {
+            "name": "openspec-new",
+            "description": "Create a new OpenSpec change directory"
+          },
+          {
+            "name": "openspec-implement",
+            "description": "Run full pipeline against an OpenSpec change"
+          },
+          {
+            "name": "openspec-archive",
+            "description": "Archive an OpenSpec change"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "codecrosscheck.reviewSelection",
+        "title": "CodeCrossCheck: Review Selection"
+      },
+      {
+        "command": "codecrosscheck.reviewActiveFile",
+        "title": "CodeCrossCheck: Review Active File"
+      },
+      {
+        "command": "codecrosscheck.installSkill",
+        "title": "CodeCrossCheck: Install Delegation Skill"
+      }
+    ],
+    "configuration": {
+      "title": "CodeCrossCheck",
+      "properties": {
+        "codecrosscheck.workerModel": {
+          "type": "string",
+          "default": "openai/gpt-5.4",
+          "enum": [
+            "anthropic/claude-opus-4.6",
+            "anthropic/claude-opus-4.7",
+            "anthropic/claude-sonnet-4.6",
+            "anthropic/claude-sonnet-4.5",
+            "anthropic/claude-haiku-4.5",
+            "openai/gpt-5.5",
+            "openai/gpt-5.4",
+            "openai/gpt-5.4-mini",
+            "openai/gpt-5.3-codex",
+            "openai/gpt-5.2",
+            "openai/gpt-4.1",
+            "openai/gpt-4o",
+            "google/gemini-3.1-pro",
+            "google/gemini-3-flash",
+            "xai/grok-code-fast-1"
+          ],
+          "description": "Model family used by the worker (the producing LLM)."
+        },
+        "codecrosscheck.reviewerModel": {
+          "type": "string",
+          "default": "anthropic/claude-opus-4.6",
+          "enum": [
+            "anthropic/claude-opus-4.6",
+            "anthropic/claude-opus-4.7",
+            "anthropic/claude-sonnet-4.6",
+            "anthropic/claude-sonnet-4.5",
+            "anthropic/claude-haiku-4.5",
+            "openai/gpt-5.5",
+            "openai/gpt-5.4",
+            "openai/gpt-5.4-mini",
+            "openai/gpt-5.3-codex",
+            "openai/gpt-5.2",
+            "openai/gpt-4.1",
+            "openai/gpt-4o",
+            "google/gemini-3.1-pro",
+            "google/gemini-3-flash",
+            "xai/grok-code-fast-1"
+          ],
+          "description": "Model family used by the reviewer (the judging LLM). Should differ from the worker for cross-vendor review."
+        },
+        "codecrosscheck.workerModelOverride": {
+          "type": "string",
+          "default": "",
+          "description": "Free-text model family override for the worker. If non-empty, takes precedence over the workerModel dropdown (e.g. 'openai/gpt-6' or 'anthropic/claude-opus-5')."
+        },
+        "codecrosscheck.reviewerModelOverride": {
+          "type": "string",
+          "default": "",
+          "description": "Free-text model family override for the reviewer. If non-empty, takes precedence over the reviewerModel dropdown."
+        },
+        "codecrosscheck.useChatPickerWorker": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, the chat participant uses the model picked in the Copilot Chat model picker as the worker, falling back to codecrosscheck.workerModel if no model is provided. The reviewer always uses codecrosscheck.reviewerModel."
+        },
+        "codecrosscheck.maxIters": {
+          "type": "integer",
+          "default": 6,
+          "minimum": 1,
+          "description": "Maximum loop iterations per stage before returning the last artifact unapproved."
+        },
+        "codecrosscheck.execute.timeoutMs": {
+          "type": "integer",
+          "default": 30000,
+          "description": "Hard timeout (milliseconds) for sandboxed code execution."
+        },
+        "codecrosscheck.execute.allowNetwork": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, sandboxed execution may access the network. Best-effort only — not adversarial-grade."
+        },
+        "codecrosscheck.applyReview.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional shell command run in a dedicated VS Code terminal after /apply-review writes edits (e.g. 'npm test'). Empty disables the test step."
+        },
+        "codecrosscheck.applyReview.buildCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Optional shell command run synchronously after /apply-review writes edits (e.g. 'dotnet build -nologo' or 'npm run build'). Unlike testCommand, the result is captured: exit code and tail of output are surfaced in chat, and a non-zero exit code is reported as a build-gate failure so /review-branch can be re-run with the build error as input. Empty disables the gate."
+        },
+        "codecrosscheck.applyReview.buildTimeoutMs": {
+          "type": "integer",
+          "default": 300000,
+          "minimum": 1000,
+          "description": "Hard timeout (milliseconds) for codecrosscheck.applyReview.buildCommand. Default 5 minutes."
+        },
+        "codecrosscheck.applyReview.dryRun": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, /apply-review prints planned edits without writing to disk."
+        }
+      }
+    }
+  }
+}
