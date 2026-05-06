@@ -54,6 +54,16 @@ only).
   Aligns with the model already hardcoded in code; dropdown default now
   matches.
 
+### Fixed
+
+- **`/review-branch` now supports `diff-base=<ref>` in the prompt.**
+  Pass any git ref (branch, tag, SHA) to override the default merge-base
+  detection — e.g. `@codecrosscheck /review-branch diff-base=empty`.
+  Uses two-dot diff syntax (`ref..HEAD`) so orphan branches work.
+- **Merge-base resolution falls back to `origin/master`** when
+  `origin/main` does not exist, fixing "No diff" errors in repos that
+  use `master` as the default branch.
+
 - **`/apply-review` slash command.** Closes the review loop by turning
   the latest `/review-branch` fix proposal into actual file edits. The
   handler locates the newest review transcript, extracts the worker's

@@ -115,7 +115,9 @@ Activate with `@codecrosscheck` in chat. Slash commands:
 
 - `/plan`, `/code`, `/execute` — single-stage runs
 - `/review-branch [extra instructions]` — worker↔reviewer dialogue on the
-  current branch diff (vs `origin/main` merge-base). Iteration 1: reviewer
+  current branch diff (vs `origin/main` or `origin/master` merge-base).
+  Add `diff-base=<ref>` to override (e.g. `diff-base=HEAD~3`,
+  `diff-base=empty`). Iteration 1: reviewer
   reads the diff and emits findings (every finding it can identify, ordered
   high → low). Iterations 2..N: worker proposes a complete, self-contained
   fix proposal for every finding, reviewer re-judges. Capped by

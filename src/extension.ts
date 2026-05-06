@@ -286,13 +286,18 @@ async function handleReviewBranch(
   cfg: vscode.WorkspaceConfiguration,
 ): Promise<void> {
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-  stream.progress("Computing branch diff vs origin/main merge-base\u2026");
-  const diff = await getChangeDiff({ cwd }).catch((err: Error) => {
-    stream.markdown(`\u274c Could not compute branch diff: \`${err.message}\`\n\n`);
+
+  // Parse optional diff-base from prompt (e.g. "diff-base=empty" or "diff-base=origin/develop").
+  const diffBaseMatch = request.prompt.match(/\bdiff-base=(\S+)/i);
+  const diffBase = diffBaseMatch?.[1];
+
+  stream.progress(`Computing branch diff${diffBase ? ` vs ${diffBase}` : ""}…`);
+  const diff = await getChangeDiff({ cwd, baseRef: diffBase }).catch((err: Error) => {
+    stream.markdown(`❌ Could not compute branch diff: \`${err.message}\`\n\n`);
     return "";
   });
   if (!diff.trim()) {
-    stream.markdown(`\u26a0\ufe0f No diff against \`origin/main\`. Nothing to review.\n\n`);
+    stream.markdown(`⚠️ No diff found. Nothing to review.\n\n`);
     return;
   }
 
@@ -326,7 +331,7 @@ async function handleReviewBranch(
   const taskHeader = userTask
     ? `# Reviewer instructions\n${userTask}`
     : `# Reviewer instructions\nReview this branch diff for OWASP issues, dead code, missing tests, and OpenSpec drift. Cite file:line for each issue.`;
-  const diffBlock = `# Branch diff (vs origin/main merge-base)\n\n\`\`\`diff\n${diff}\n\`\`\``;
+  const diffBlock = `# Branch diff${diffBase ? ` (vs ${diffBase})` : " (vs merge-base)"}\n\n\`\`\`diff\n${diff}\n\`\`\``;
 
   const transcriptPath = openTranscript();
   const writeEvent = (e: object) => fs.appendFileSync(transcriptPath, JSON.stringify(e) + "\n", "utf8");

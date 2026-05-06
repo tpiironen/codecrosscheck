@@ -11,7 +11,11 @@ export interface DiffOptions {
 export async function getChangeDiff(opts: DiffOptions = {}): Promise<string> {
   const cwd = opts.cwd ?? process.cwd();
   const base = opts.baseRef ?? (await resolveMergeBase(cwd));
-  const range = `${base}...HEAD`;
+  // Three-dot (A...B) computes the merge-base automatically — great for
+  // branches that share history. Two-dot (A..B) works for orphan refs that
+  // have no common ancestor. Use two-dot when the caller supplied an
+  // explicit baseRef (they know what they want).
+  const range = opts.baseRef ? `${base}..HEAD` : `${base}...HEAD`;
 
   const raw = await runGit(["diff", range], cwd);
   if (!opts.scopePaths || opts.scopePaths.length === 0) return raw;
@@ -19,12 +23,15 @@ export async function getChangeDiff(opts: DiffOptions = {}): Promise<string> {
 }
 
 async function resolveMergeBase(cwd: string): Promise<string> {
-  try {
-    const out = await runGit(["merge-base", "HEAD", "origin/main"], cwd);
-    return out.trim() || "HEAD";
-  } catch {
-    return "HEAD";
+  for (const remote of ["origin/main", "origin/master"]) {
+    try {
+      const out = await runGit(["merge-base", "HEAD", remote], cwd);
+      if (out.trim()) return out.trim();
+    } catch {
+      // try next
+    }
   }
+  return "HEAD";
 }
 
 function runGit(args: string[], cwd: string): Promise<string> {
