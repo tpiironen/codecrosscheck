@@ -86,22 +86,20 @@ export class VscodeLmClient implements ChatClient {
   ): Promise<T> {
     const send = (msgs: ChatMessage[]) => this.sendRaw(msgs);
 
-    const extractJson = (raw: string): string => {
-      // The model may wrap JSON in fences or prose. Extract the largest JSON object substring.
-      const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (fence?.[1]) return fence[1].trim();
-      const first = raw.indexOf("{");
-      const last = raw.lastIndexOf("}");
-      if (first >= 0 && last > first) return raw.slice(first, last + 1);
-      return raw.trim();
+    const tryParseOrRefuse = (raw: string): T => {
+      // Refusals never become valid JSON — surface them up immediately so the user sees the cause
+      // instead of a confusing "Unexpected token 'S'" parse error after a wasted retry.
+      assertNotRefusal(raw, this.modelId);
+      return schema.parse(JSON.parse(extractJson(raw)));
     };
 
-    const tryParse = (raw: string): T => schema.parse(JSON.parse(extractJson(raw)));
-
+    let firstRaw = "";
     let firstError: unknown;
     try {
-      return tryParse(await send(messages));
+      firstRaw = await send(messages);
+      return tryParseOrRefuse(firstRaw);
     } catch (err) {
+      if (err instanceof ModelRefusalError) throw err;
       firstError = err;
     }
 
@@ -115,15 +113,64 @@ export class VscodeLmClient implements ChatClient {
           schemaDescription(schema),
       },
     ];
+    let retryRaw = "";
     try {
-      return tryParse(await send(retryMessages));
+      retryRaw = await send(retryMessages);
+      return tryParseOrRefuse(retryRaw);
     } catch (err) {
+      if (err instanceof ModelRefusalError) throw err;
       throw new Error(
         `vscode.lm response failed schema "${schemaName}" twice. ` +
-          `First: ${(firstError as Error)?.message}. Retry: ${(err as Error)?.message}`,
+          `First: ${(firstError as Error)?.message} (raw: ${snippet(firstRaw)}). ` +
+          `Retry: ${(err as Error)?.message} (raw: ${snippet(retryRaw)}).`,
       );
     }
   }
+}
+
+/** Thrown when a model returns a content-policy refusal instead of an answer. Retry won't help. */
+export class ModelRefusalError extends Error {
+  constructor(public readonly modelId: string, public readonly raw: string) {
+    super(
+      `Model "${modelId}" refused the request (no structured output produced). ` +
+        `Response: ${snippet(raw)}. ` +
+        `Try a different worker/reviewer model, shorten or rephrase the prompt, ` +
+        `or remove content that may have triggered the content filter.`,
+    );
+    this.name = "ModelRefusalError";
+  }
+}
+
+const REFUSAL_PATTERNS: readonly RegExp[] = [
+  /^\s*(?:```[a-z]*\s*)?sorry,?\s+(?:i|but i)\b[^.\n]*?(?:can(?:not|'t)|won'?t|unable)\b/i,
+  /^\s*(?:```[a-z]*\s*)?i(?:'m| am)?\s+(?:sorry|afraid)[^.\n]*?(?:can(?:not|'t)|unable|won'?t)\b/i,
+  /^\s*(?:```[a-z]*\s*)?i(?:'m| am)?\s+(?:can(?:not|'t)|won'?t|unable(?:\s+to)?)\s+(?:assist|help|comply|do that|provide|continue|fulfill|respond)\b/i,
+];
+
+function assertNotRefusal(raw: string, modelId: string): void {
+  const head = raw.slice(0, 400);
+  if (REFUSAL_PATTERNS.some((re) => re.test(head))) {
+    throw new ModelRefusalError(modelId, raw);
+  }
+}
+
+export { assertNotRefusal };
+
+function snippet(raw: string): string {
+  const s = raw.replace(/\s+/g, " ").trim();
+  return s.length > 160 ? `${s.slice(0, 160)}…` : s;
+}
+
+function extractJson(raw: string): string {
+  // The model may wrap JSON in fences or prose. Extract the largest JSON object substring.
+  // Only strip fences explicitly labelled `json` or unlabelled — never trust an unknown tag
+  // like ```text, which could hide a refusal inside what looks like a JSON fence to a naive regex.
+  const fence = raw.match(/```(?:json)?\r?\n([\s\S]*?)```/);
+  if (fence?.[1]) return fence[1].trim();
+  const first = raw.indexOf("{");
+  const last = raw.lastIndexOf("}");
+  if (first >= 0 && last > first) return raw.slice(first, last + 1);
+  return raw.trim();
 }
 
 function schemaDescription(schema: z.ZodSchema<unknown>): string {

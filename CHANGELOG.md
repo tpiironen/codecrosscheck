@@ -56,6 +56,28 @@ only).
 
 ### Fixed
 
+- **Content-policy refusals no longer surface as misleading
+  `JSON.parse` errors.** When `vscode.lm` returned
+  `Sorry, I can't assist with that.` the user previously saw
+  `vscode.lm response failed schema "WorkerOutput" twice. First:
+  Unexpected token 'S'... Retry: Unexpected token 'e', "text\nSorry"...`,
+  which masked the true cause (the model refused) and burned reviewer
+  tokens on a doomed retry. `VscodeLmClient.sendStructured` and
+  `GithubModelsClient.sendStructured` now inspect each raw response for
+  a refusal pattern *before* parsing, throw a new `ModelRefusalError`
+  that names the model and quotes the response, and skip the
+  schema-reminder retry (it cannot recover a refusal). The two-strike
+  fallback error also now includes a 160-char snippet of each raw
+  response so schema drift can be diagnosed from chat output alone.
+  Tracked under OpenSpec change
+  `fix-model-refusal-detection` (`openspec/changes/`).
+- **`extractJson` no longer silently unwraps unknown-language fences.**
+  The fence regex was `/```(?:json)?\s*([\s\S]*?)```/`, which on a
+  ` ```text\nSorry...\n``` ` response stripped the fence and fed
+  `text\nSorry...` straight into `JSON.parse`. The regex is now
+  `/```(?:json)?\r?\n([\s\S]*?)```/` — only `json` or unlabelled
+  fences are unwrapped; everything else falls through to the
+  brace-pair fallback. Covered by `test/refusal.test.ts`.
 - **`/review-branch` now supports `diff-base=<ref>` in the prompt.**
   Pass any git ref (branch, tag, SHA) to override the default merge-base
   detection — e.g. `@codecrosscheck /review-branch diff-base=empty`.

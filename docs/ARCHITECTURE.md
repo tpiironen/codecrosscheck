@@ -126,7 +126,19 @@ Key behaviours encoded in [src/loop.ts](../src/loop.ts):
 
 - **Single-retry on malformed JSON.** `ChatClient.sendStructured` retries once
   with a stricter system message before failing. Two consecutive malformed
-  responses fail the iteration with a descriptive error.
+  responses fail the iteration with a descriptive error that now includes a
+  160-char snippet of each raw response so schema drift can be diagnosed
+  from chat output alone.
+- **Refusal short-circuit.** Before either parse attempt,
+  `sendStructured` (both transports) checks the raw response against a
+  conservative refusal-pattern list. When a content-policy refusal is
+  detected, it throws a `ModelRefusalError` carrying the model id and a
+  truncated response snippet, and *skips* the schema-reminder retry — a
+  model that refused on attempt 1 will refuse on attempt 2. The
+  fence-extraction regex is also strict: only `json`-labelled or
+  unlabelled fences are unwrapped, so a ` ```text\nSorry...\n``` `
+  refusal cannot masquerade as JSON. See OpenSpec change
+  `fix-model-refusal-detection`.
 - **Revision prompts include structured issues, not raw reviewer prose.**
   `buildRevisionInput` formats `severity / where / why / suggestion` so the
   worker sees machine-actionable feedback.
