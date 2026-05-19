@@ -145,8 +145,32 @@ Activate with `@codecrosscheck` in chat. Slash commands:
   `<workspace>/.codecrosscheck/runs/<iso>-apply.json`. Recommended
   loop: `/review-branch` → `/apply-review` → `git diff` → commit. Use
   `codecrosscheck.applyReview.dryRun` to preview without writing.
-- `/openspec-init`, `/openspec-new <id>`, `/openspec-implement <id>`,
-  `/openspec-archive <id>`
+- `/openspec-init`, `/openspec-new <id>`, `/openspec-review <id>`,
+  `/openspec-archive <id>` — see [Spec-driven implementation](#spec-driven-implementation) below.
+  (`/openspec-implement` is kept as a deprecated alias for `/openspec-review`.)
+
+### Spec-driven implementation
+
+If you have an OpenSpec change folder under `openspec/changes/<id>/`
+(with `proposal.md`, optional `tasks.md`, and optional `specs/**/spec.md`),
+the two-step workflow is:
+
+1. `@codecrosscheck /openspec-review <change-id>` — loads the change frame,
+   runs `openspec validate <id> --strict` as a pre-gate before each
+   reviewer call, drives the worker through PLAN and CODE stages, and
+   writes a transcript to `.codecrosscheck/runs/<iso>.jsonl`. The
+   EXECUTE stage is skipped (the sandbox can never reproduce a real
+   workspace, so its verdict would be misleading).
+2. `@codecrosscheck /apply-review` — reads the transcript, derives
+   structured `{path, oldString, newString}` edits from the CODE-stage
+   artifact, validates each path under the workspace root, and writes
+   the edits via `vscode.workspace.fs`. Optionally runs the configured
+   `applyReview.buildCommand` as a gate. Use
+   `codecrosscheck.applyReview.dryRun` to preview without writing.
+
+The two-step shape mirrors `/review-branch` → `/apply-review` so there is
+one mental model for "draft → write". The transcript files are
+interchangeable between the two flows.
 
 Editor commands (Command Palette):
 

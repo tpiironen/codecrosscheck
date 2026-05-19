@@ -100,57 +100,7 @@ export function activate(context: vscode.ExtensionContext): void {
       fs.appendFileSync(transcriptPath, JSON.stringify(event) + "\n", "utf8");
     };
 
-    const onEvent = (ev: PipelineEvent) => {
-      writeEvent({ event: ev.type, ...ev });
-      if (ev.type === "stage-start") {
-        stream.markdown(
-          `\n## Stage: \`${ev.stage}\`\n\nWorker \`${ev.workerId}\` \u2192 reviewer \`${ev.reviewerId}\`.\n\n`,
-        );
-      } else if (ev.type === "iteration-start") {
-        stream.markdown(`---\n\n**Iteration ${ev.iteration} / ${ev.maxIters}**\n\n`);
-      } else if (ev.type === "worker-start") {
-        stream.progress(`${ev.stage} \u00b7 iteration ${ev.iteration} \u00b7 worker \`${ev.modelId}\` thinking\u2026`);
-      } else if (ev.type === "worker") {
-        stream.markdown(`#### \ud83d\udcdd Worker (\`${ev.modelId}\`) produced\n\n`);
-        const trimmed = ev.artifact.length > 4000
-          ? ev.artifact.slice(0, 4000) + "\n\n\u2026 _(truncated for chat; full text in transcript)_"
-          : ev.artifact;
-        stream.markdown(`\`\`\`\n${trimmed}\n\`\`\`\n\n`);
-      } else if (ev.type === "reviewer-start") {
-        stream.progress(`${ev.stage} \u00b7 iteration ${ev.iteration} \u00b7 reviewer \`${ev.modelId}\` judging\u2026`);
-      } else if (ev.type === "verdict") {
-        const v = ev.verdict;
-        const icon = v.verdict === "approve" ? "\u2705" : "\u274c";
-        const sourceTag = ev.source === "validator" ? " _(via openspec validate)_" : "";
-        stream.markdown(
-          `#### ${icon} Reviewer (\`${ev.modelId}\`)${sourceTag} \u2192 **${v.verdict.toUpperCase()}**\n\n`,
-        );
-        if (v.issues.length > 0) {
-          for (const issue of v.issues) {
-            const sevIcon =
-              issue.severity === "high" ? "\ud83d\udd34" :
-              issue.severity === "medium" ? "\ud83d\udfe1" : "\ud83d\udd35";
-            stream.markdown(
-              `- ${sevIcon} **${issue.severity}** \u00b7 \`${issue.where}\`\n  - **why:** ${issue.why}\n  - **suggestion:** ${issue.suggestion}\n`,
-            );
-          }
-          stream.markdown("\n");
-        } else if (v.verdict === "approve") {
-          stream.markdown("_No issues. Approved as-is._\n\n");
-        }
-      } else if (ev.type === "stage-end") {
-        const icon = ev.approved ? "\u2705" : "\u26a0\ufe0f";
-        stream.markdown(
-          `\n${icon} **Stage \`${ev.stage}\` ${ev.approved ? "approved" : "did not converge"}** after ${ev.iterations} iteration(s).\n\n`,
-        );
-      } else if (ev.type === "sandbox") {
-        stream.markdown(
-          `\n#### \ud83d\udda5\ufe0f Sandbox run\n\nexitCode=\`${ev.sandbox.exitCode}\` durationMs=\`${ev.sandbox.durationMs}\`\n\n` +
-            `\`\`\`\n${ev.sandbox.stdout}\n\`\`\`\n\n`,
-        );
-        if (ev.sandbox.stderr) stream.markdown(`stderr:\n\`\`\`\n${ev.sandbox.stderr}\n\`\`\`\n\n`);
-      }
-    };
+    const onEvent = createPipelineEventHandler(stream, writeEvent);
 
     const startedAt = Date.now();
     const result = await runPipeline(resolvedPrompt, {
@@ -884,6 +834,68 @@ function renderWorkerArtifact(stream: vscode.ChatResponseStream, artifact: strin
 }
 
 
+/**
+ * Shared chat-stream renderer for `PipelineEvent`s. Used by both the default
+ * staged-pipeline handler (`/plan`, `/code`, `/execute`) and the OpenSpec
+ * review handler so both surfaces emit identical iteration progress.
+ */
+function createPipelineEventHandler(
+  stream: vscode.ChatResponseStream,
+  writeEvent: (event: Record<string, unknown>) => void,
+): (ev: PipelineEvent) => void {
+  return (ev) => {
+    writeEvent({ event: ev.type, ...ev });
+    if (ev.type === "stage-start") {
+      stream.markdown(
+        `\n## Stage: \`${ev.stage}\`\n\nWorker \`${ev.workerId}\` \u2192 reviewer \`${ev.reviewerId}\`.\n\n`,
+      );
+    } else if (ev.type === "iteration-start") {
+      stream.markdown(`---\n\n**Iteration ${ev.iteration} / ${ev.maxIters}**\n\n`);
+    } else if (ev.type === "worker-start") {
+      stream.progress(`${ev.stage} \u00b7 iteration ${ev.iteration} \u00b7 worker \`${ev.modelId}\` thinking\u2026`);
+    } else if (ev.type === "worker") {
+      stream.markdown(`#### \ud83d\udcdd Worker (\`${ev.modelId}\`) produced\n\n`);
+      const trimmed = ev.artifact.length > 4000
+        ? ev.artifact.slice(0, 4000) + "\n\n\u2026 _(truncated for chat; full text in transcript)_"
+        : ev.artifact;
+      stream.markdown(`\`\`\`\n${trimmed}\n\`\`\`\n\n`);
+    } else if (ev.type === "reviewer-start") {
+      stream.progress(`${ev.stage} \u00b7 iteration ${ev.iteration} \u00b7 reviewer \`${ev.modelId}\` judging\u2026`);
+    } else if (ev.type === "verdict") {
+      const v = ev.verdict;
+      const icon = v.verdict === "approve" ? "\u2705" : "\u274c";
+      const sourceTag = ev.source === "validator" ? " _(via openspec validate)_" : "";
+      stream.markdown(
+        `#### ${icon} Reviewer (\`${ev.modelId}\`)${sourceTag} \u2192 **${v.verdict.toUpperCase()}**\n\n`,
+      );
+      if (v.issues.length > 0) {
+        for (const issue of v.issues) {
+          const sevIcon =
+            issue.severity === "high" ? "\ud83d\udd34" :
+            issue.severity === "medium" ? "\ud83d\udfe1" : "\ud83d\udd35";
+          stream.markdown(
+            `- ${sevIcon} **${issue.severity}** \u00b7 \`${issue.where}\`\n  - **why:** ${issue.why}\n  - **suggestion:** ${issue.suggestion}\n`,
+          );
+        }
+        stream.markdown("\n");
+      } else if (v.verdict === "approve") {
+        stream.markdown("_No issues. Approved as-is._\n\n");
+      }
+    } else if (ev.type === "stage-end") {
+      const icon = ev.approved ? "\u2705" : "\u26a0\ufe0f";
+      stream.markdown(
+        `\n${icon} **Stage \`${ev.stage}\` ${ev.approved ? "approved" : "did not converge"}** after ${ev.iterations} iteration(s).\n\n`,
+      );
+    } else if (ev.type === "sandbox") {
+      stream.markdown(
+        `\n#### \ud83d\udda5\ufe0f Sandbox run\n\nexitCode=\`${ev.sandbox.exitCode}\` durationMs=\`${ev.sandbox.durationMs}\`\n\n` +
+          `\`\`\`\n${ev.sandbox.stdout}\n\`\`\`\n\n`,
+      );
+      if (ev.sandbox.stderr) stream.markdown(`stderr:\n\`\`\`\n${ev.sandbox.stderr}\n\`\`\`\n\n`);
+    }
+  };
+}
+
 async function handleOpenSpecCommand(
   cmd: string,
   request: vscode.ChatRequest,
@@ -912,52 +924,13 @@ async function handleOpenSpecCommand(
     stream.markdown(`Scaffolded \`openspec/changes/${id}/\`.\n`);
     return;
   }
-  if (verb === "implement") {
-    const id = request.prompt.trim();
-    if (!id) {
-      stream.markdown("Provide a change id.\n");
-      return;
+  if (verb === "review" || verb === "implement") {
+    if (verb === "implement") {
+      stream.markdown(
+        "\u26a0\ufe0f `/openspec-implement` is deprecated — use `/openspec-review`. Running the equivalent now.\n\n",
+      );
     }
-    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-    const change = loadChange(id, ws);
-    const cfg = vscode.workspace.getConfiguration("codecrosscheck");
-    const useChatPickerWorker = cfg.get<boolean>("useChatPickerWorker") ?? true;
-    const workerClient = useChatPickerWorker && request.model
-      ? new VscodeLmClient({ family: request.model.family, model: request.model })
-      : new VscodeLmClient({
-          family: stripVendor(cfg.get<string>("workerModel") ?? "gpt-5.4"),
-        });
-    const reviewerClient = new VscodeLmClient({
-      family: stripVendor(cfg.get<string>("reviewerModel") ?? "claude-opus-4.6"),
-    });
-    const frame = renderChangeFrame(change);
-    const preReviewFactory: (stage: Stage) => LoopOptions["preReview"] = () => async () => {
-      const result = await validateStrict(id, ws);
-      if (result.ok) return null;
-      return {
-        verdict: "revise",
-        issues: [
-          {
-            severity: "high",
-            where: `openspec validate ${id} --strict`,
-            why: result.output.trim() || "validator pre-gate failed",
-            suggestion: "Fix the OpenSpec change structure first.",
-          },
-        ],
-      };
-    };
-    stream.markdown(`Implementing change \`${id}\` with OpenSpec frame attached.\n\n`);
-    await runPipeline(`${request.prompt}\n\n${frame}`, {
-      workerClient,
-      reviewerClient,
-      maxIters: cfg.get<number>("maxIters") ?? 3,
-      preReview: preReviewFactory,
-      onEvent: (ev) => {
-        if (ev.type === "stage-end") {
-          stream.markdown(`_${ev.stage}: ${ev.approved ? "approved" : "not approved"}._\n\n`);
-        }
-      },
-    });
+    await handleOpenSpecReview(request, stream);
     return;
   }
   if (verb === "archive") {
@@ -965,6 +938,169 @@ async function handleOpenSpecCommand(
     return;
   }
   stream.markdown(`Unknown openspec command: \`${verb}\`.\n`);
+}
+
+/**
+ * `/openspec-review <change-id>` — load the change frame, run the validator
+ * pre-gate, drive the worker through PLAN + CODE stages, and write a
+ * transcript that `/apply-review` can read. EXECUTE is skipped: the sandbox
+ * cannot reproduce a real workspace, so its verdict is misleading for
+ * spec-driven implementation work.
+ *
+ * `/openspec-implement` is registered as a deprecated alias and delegates
+ * here after printing a one-line notice.
+ */
+async function handleOpenSpecReview(
+  request: vscode.ChatRequest,
+  stream: vscode.ChatResponseStream,
+): Promise<void> {
+  const id = request.prompt.trim().split(/\s+/)[0] ?? "";
+  if (!id) {
+    stream.markdown(
+      "Provide a change id, e.g. `@codecrosscheck /openspec-review add-foo`.\n",
+    );
+    return;
+  }
+
+  const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  const cfg = vscode.workspace.getConfiguration("codecrosscheck");
+
+  // Load the change folder. Surface any error (missing folder, missing
+  // proposal.md) in chat rather than letting it bubble past the participant.
+  let change;
+  try {
+    change = loadChange(id, ws);
+  } catch (err) {
+    stream.markdown(
+      `\u274c Could not load OpenSpec change \`${id}\`: \`${(err as Error).message}\`\n\n` +
+        `Expected layout: \`openspec/changes/${id}/proposal.md\` (and optional \`tasks.md\`, \`specs/<capability>/spec.md\`).\n`,
+    );
+    return;
+  }
+
+  // Stream the proposal summary as the first message (spec requires this).
+  const proposalSummary = change.proposal.length > 2000
+    ? change.proposal.slice(0, 2000) + "\n\n\u2026 _(proposal truncated for chat; full text injected into the prompt frame)_"
+    : change.proposal;
+  stream.markdown(
+    `## OpenSpec review: \`${id}\`\n\nLoaded from \`${path.relative(ws, change.changeDir) || change.changeDir}\`.\n\n` +
+      `### Proposal\n\n${proposalSummary}\n\n---\n\n`,
+  );
+
+  // Model selection mirrors the main handler: respect overrides, prefer
+  // the chat-picker model for the worker, configured reviewer for cross-vendor.
+  const workerFamily = (cfg.get<string>("workerModelOverride") ?? "").trim() || (cfg.get<string>("workerModel") ?? "gpt-5.4");
+  const reviewerFamily = (cfg.get<string>("reviewerModelOverride") ?? "").trim() || (cfg.get<string>("reviewerModel") ?? "claude-opus-4.6");
+  const useChatPickerWorker = cfg.get<boolean>("useChatPickerWorker") ?? true;
+  const maxIters = cfg.get<number>("maxIters") ?? 3;
+
+  const workerClient = useChatPickerWorker && request.model
+    ? new VscodeLmClient({ family: request.model.family, model: request.model })
+    : new VscodeLmClient({ family: stripVendor(workerFamily) });
+  const reviewerClient = new VscodeLmClient({ family: stripVendor(reviewerFamily) });
+
+  if (workerClient.modelId === reviewerClient.modelId) {
+    stream.markdown(
+      `> **Note:** worker and reviewer resolved to the same model (\`${workerClient.modelId}\`). ` +
+        `Cross-vendor review is disabled.\n\n`,
+    );
+  }
+
+  stream.markdown(
+    `Running CodeCrossCheck (OpenSpec mode) \u2014 worker \`${workerClient.modelId}\`, reviewer \`${reviewerClient.modelId}\`, stages \`plan, code\`.\n\n`,
+  );
+
+  // Validator pre-gate: short-circuit the reviewer with a synthetic `revise`
+  // verdict whenever `openspec validate <id> --strict` fails. Zero reviewer
+  // tokens spent on structurally invalid specs.
+  const preReviewFactory: (stage: Stage) => LoopOptions["preReview"] = () => async () => {
+    const result = await validateStrict(id, ws);
+    if (result.ok) return null;
+    return {
+      verdict: "revise",
+      issues: [
+        {
+          severity: "high",
+          where: `openspec validate ${id} --strict`,
+          why: result.output.trim() || "validator pre-gate failed",
+          suggestion: "Fix the OpenSpec change structure first.",
+        },
+      ],
+    };
+  };
+
+  const transcriptPath = openTranscript();
+  const writeEvent = (event: Record<string, unknown>) => {
+    fs.appendFileSync(transcriptPath, JSON.stringify(event) + "\n", "utf8");
+  };
+
+  // Wrap the shared event handler with a translator that ALSO emits
+  // `review-branch-iter` events for CODE-stage worker artifacts and reviewer
+  // verdicts. That is the exact schema `/apply-review`'s
+  // `findLatestTranscript` + `extractFixProposal` look for, so the user can
+  // chain `/openspec-review` \u2192 `/apply-review` without any glue.
+  const baseHandler = createPipelineEventHandler(stream, writeEvent);
+  let codeIter = 0;
+  const onEvent = (ev: PipelineEvent) => {
+    baseHandler(ev);
+    if (ev.type === "worker" && ev.stage === "code") {
+      codeIter = ev.iteration;
+      writeEvent({
+        event: "review-branch-iter",
+        iteration: ev.iteration,
+        role: "worker",
+        workerId: ev.modelId,
+        artifact: ev.artifact,
+      });
+    } else if (ev.type === "verdict" && ev.stage === "code") {
+      writeEvent({
+        event: "review-branch-iter",
+        iteration: ev.iteration,
+        role: "reviewer",
+        reviewerId: ev.modelId,
+        verdict: ev.verdict,
+        source: ev.source,
+        changeId: id,
+      });
+    }
+  };
+
+  const frame = renderChangeFrame(change);
+  const taskPrompt = request.prompt.replace(/^\s*\S+\s*/, "").trim();
+  const fullPrompt = `${taskPrompt || `Implement the OpenSpec change \`${id}\` exactly as specified.`}\n\n${frame}`;
+
+  const startedAt = Date.now();
+  let approved = false;
+  try {
+    const result = await runPipeline(fullPrompt, {
+      workerClient,
+      reviewerClient,
+      stages: ["plan", "code"],
+      maxIters,
+      preReview: preReviewFactory,
+      onEvent,
+    });
+    approved = result.approved;
+  } catch (err) {
+    stream.markdown(`\u274c Pipeline failed: \`${(err as Error).message}\`\n\n`);
+  }
+
+  writeEvent({
+    event: "review-branch-done",
+    approved,
+    iterations: codeIter,
+    elapsedMs: Date.now() - startedAt,
+    changeId: id,
+  });
+
+  const uri = vscode.Uri.file(transcriptPath);
+  stream.markdown(
+    `\n---\n\n## Next step\n\n` +
+      (codeIter > 0
+        ? `Run \`/apply-review\` to write the drafted edits to your workspace.\n\n`
+        : `No CODE-stage artifact was produced. Fix the validator errors above or refine the prompt, then re-run.\n\n`) +
+      `Transcript: [${path.basename(transcriptPath)}](${uri.toString()})\n`,
+  );
 }
 
 function stripVendor(model: string): string {

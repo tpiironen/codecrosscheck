@@ -1,6 +1,6 @@
 {
   "name": "codecrosscheck",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "description": "Two-model review loop: a worker LLM produces, a reviewer LLM judges, both as a Node CLI and a VS Code chat participant.",
   "type": "module",
   "engines": {
@@ -108,8 +108,12 @@
             "description": "Create a new OpenSpec change directory"
           },
           {
+            "name": "openspec-review",
+            "description": "Draft an implementation for an OpenSpec change (validator-gated). Chain with /apply-review to write the drafted edits."
+          },
+          {
             "name": "openspec-implement",
-            "description": "Run full pipeline against an OpenSpec change"
+            "description": "Deprecated alias for /openspec-review."
           },
           {
             "name": "openspec-archive",
