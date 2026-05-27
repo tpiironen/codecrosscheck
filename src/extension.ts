@@ -251,6 +251,23 @@ async function handleReviewBranch(
     return;
   }
 
+  // Hard char-budget guard: bail fast with a clear message instead of letting the LM return
+  // "Message exceeds token limit" + an empty body that the schema-retry path cannot recover.
+  // ~200 KB is a conservative default that fits in even the smallest Copilot context windows;
+  // override via `codecrosscheck.reviewBranch.maxDiffChars` (0 disables the guard).
+  const maxDiffChars = cfg.get<number>("reviewBranch.maxDiffChars") ?? 200_000;
+  if (maxDiffChars > 0 && diff.length > maxDiffChars) {
+    stream.markdown(
+      `❌ Branch diff is too large to review in one pass: \`${diff.length.toLocaleString()}\` chars ` +
+        `(cap \`${maxDiffChars.toLocaleString()}\`). The reviewer model will reject the prompt as ` +
+        `exceeding its context window. Options: pass a closer base via \`diff-base=<ref>\` ` +
+        `(e.g. \`diff-base=origin/master\`), split the branch into smaller PRs, or raise ` +
+        `\`codecrosscheck.reviewBranch.maxDiffChars\` if you have confirmed the picked reviewer model ` +
+        `can handle it.\n\n`,
+    );
+    return;
+  }
+
   // Worker = picker model if set, else configured worker. Reviewer = configured reviewer.
   const workerFamilyCfg = (cfg.get<string>("workerModelOverride") ?? "").trim() || (cfg.get<string>("workerModel") ?? "gpt-5.4");
   const reviewerFamilyCfg = (cfg.get<string>("reviewerModelOverride") ?? "").trim() || (cfg.get<string>("reviewerModel") ?? "openai/gpt-5.4");
@@ -321,9 +338,40 @@ async function handleReviewBranch(
   // ---- Iteration 1: reviewer reads the raw diff. ----
   iter = 1;
   stream.markdown(`---\n\n### Iteration ${iter} / ${maxIters} \u2014 initial review\n\n`);
+
+  // Best-effort token-budget preflight on the reviewer model. If the model exposes
+  // `countTokens` + `maxInputTokens` (vscode 1.93+ LanguageModelChat), measure the assembled
+  // prompt and bail before the call when it cannot fit. This catches cases where the diff is
+  // under `maxDiffChars` but still too large for a smaller reviewer model.
+  const reviewerPrompt = `${taskHeader}\n\n${diffBlock}`;
+  try {
+    const lmModule = await import("vscode").catch(() => undefined);
+    if (lmModule?.lm?.selectChatModels) {
+      const candidates = await lmModule.lm.selectChatModels({ family: stripVendor(reviewerFamilyCfg) });
+      const lmModel = candidates[0] as unknown as { countTokens?: (t: string) => Thenable<number>; maxInputTokens?: number } | undefined;
+      if (lmModel?.countTokens && typeof lmModel.maxInputTokens === "number" && lmModel.maxInputTokens > 0) {
+        const tokens = await lmModel.countTokens(reviewerPrompt);
+        // Reserve ~10% of the window for the response. If the prompt alone exceeds 90% of
+        // maxInputTokens the LM will reject it.
+        const budget = Math.floor(lmModel.maxInputTokens * 0.9);
+        if (tokens > budget) {
+          stream.markdown(
+            `\u274c Reviewer prompt is too large for \`${reviewer.modelId}\`: \`${tokens.toLocaleString()}\` tokens ` +
+              `vs budget \`${budget.toLocaleString()}\` (90% of maxInputTokens \`${lmModel.maxInputTokens.toLocaleString()}\`). ` +
+              `Pass a closer \`diff-base=<ref>\`, pick a larger reviewer model via \`codecrosscheck.reviewerModel\`, ` +
+              `or split the branch.\n\n`,
+          );
+          return;
+        }
+      }
+    }
+  } catch {
+    // countTokens is best-effort; if it throws (older VS Code, missing on this model), fall through.
+  }
+
   stream.progress(`Reviewer \`${reviewer.modelId}\` reading diff\u2026`);
   try {
-    verdict = await reviewer.judge(`${taskHeader}\n\n${diffBlock}`);
+    verdict = await reviewer.judge(reviewerPrompt);
   } catch (err) {
     stream.markdown(`\u274c Reviewer call failed: \`${(err as Error).message}\`\n\n`);
     return;

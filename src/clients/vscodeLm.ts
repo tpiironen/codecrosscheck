@@ -100,6 +100,10 @@ export class VscodeLmClient implements ChatClient {
       return tryParseOrRefuse(firstRaw);
     } catch (err) {
       if (err instanceof ModelRefusalError) throw err;
+      // Token-limit failures cannot be fixed by re-asking with the same prompt + a schema reminder.
+      // Re-throw as a typed error so callers (and users) see the actual problem instead of a
+      // wasted retry that fails the same way.
+      assertNotOversized(err, this.modelId);
       firstError = err;
     }
 
@@ -119,6 +123,7 @@ export class VscodeLmClient implements ChatClient {
       return tryParseOrRefuse(retryRaw);
     } catch (err) {
       if (err instanceof ModelRefusalError) throw err;
+      assertNotOversized(err, this.modelId);
       throw new Error(
         `vscode.lm response failed schema "${schemaName}" twice. ` +
           `First: ${(firstError as Error)?.message} (raw: ${snippet(firstRaw)}). ` +
@@ -155,6 +160,42 @@ function assertNotRefusal(raw: string, modelId: string): void {
 }
 
 export { assertNotRefusal };
+
+/**
+ * Thrown when the LM rejects the prompt as too large for its context window. Retrying with the
+ * same prompt + a schema reminder cannot succeed — surface the failure so the caller can shrink
+ * the input (or guard on token count before sending).
+ */
+export class OversizedPromptError extends Error {
+  constructor(public readonly modelId: string, public readonly cause: Error) {
+    super(
+      `Model "${modelId}" rejected the prompt as too large for its context window: ${cause.message}. ` +
+        `Shrink the input (e.g. pass diff-base=<closer-ref> to /review-branch, split the branch, ` +
+        `or remove large attachments) and try again. Retrying with the same prompt cannot succeed.`,
+    );
+    this.name = "OversizedPromptError";
+  }
+}
+
+// Phrases LM providers use when the prompt exceeds the model's context window. Kept conservative
+// — we only short-circuit retry on a high-confidence match.
+const OVERSIZED_PATTERNS: readonly RegExp[] = [
+  /message exceeds (?:the )?token limit/i,
+  /context (?:window|length) (?:exceeded|exhausted|too (?:large|long))/i,
+  /prompt is too (?:long|large)/i,
+  /input (?:is )?too (?:long|large)/i,
+  /maximum context length/i,
+  /request too large/i,
+  /\b(?:tokens?|context).{0,40}\bexceed(?:s|ed)?\b/i,
+];
+
+export function assertNotOversized(err: unknown, modelId: string): void {
+  if (err instanceof OversizedPromptError) throw err;
+  const msg = (err as { message?: string })?.message ?? "";
+  if (OVERSIZED_PATTERNS.some((re) => re.test(msg))) {
+    throw new OversizedPromptError(modelId, err as Error);
+  }
+}
 
 function snippet(raw: string): string {
   const s = raw.replace(/\s+/g, " ").trim();

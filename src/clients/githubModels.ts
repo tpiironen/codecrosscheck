@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import type { ChatClient, ChatMessage } from "./ChatClient.js";
-import { ModelRefusalError, assertNotRefusal } from "./vscodeLm.js";
+import { ModelRefusalError, assertNotRefusal, assertNotOversized } from "./vscodeLm.js";
 
 const DEFAULT_ENDPOINT = "https://models.github.ai/inference/chat/completions";
 
@@ -104,6 +104,7 @@ export class GithubModelsClient implements ChatClient {
       return tryParse(content);
     } catch (err) {
       if (err instanceof ModelRefusalError) throw err;
+      assertNotOversized(err, this.modelId);
       firstError = err;
     }
 
@@ -123,6 +124,7 @@ export class GithubModelsClient implements ChatClient {
       return tryParse(content);
     } catch (err) {
       if (err instanceof ModelRefusalError) throw err;
+      assertNotOversized(err, this.modelId);
       throw new Error(
         `Reviewer response failed schema "${schemaName}" twice. ` +
           `First error: ${(firstError as Error)?.message}. Retry error: ${(err as Error)?.message}`,

@@ -56,6 +56,33 @@ only).
 
 ### Fixed
 
+- **`/review-branch` no longer turns a too-large diff into a confusing Zod
+  schema error.** Previously, passing a multi-megabyte branch diff to the
+  reviewer surfaced as `vscode.lm response failed schema "Verdict" twice.
+  First: Message exceeds token limit. Retry: … Invalid enum value. Expected
+  'approve' | 'revise', received 'invalid' …` because the schema-reminder
+  retry re-sent the same oversized prompt. Three new guards make this fail
+  fast with actionable messages:
+    1. **Hard char-budget guard** on `/review-branch`, governed by the new
+       `codecrosscheck.reviewBranch.maxDiffChars` setting (integer,
+       default `200000`, `0` disables). When the assembled diff exceeds
+       the cap the handler aborts before any LM call with guidance to
+       pass a closer `diff-base=<ref>` or split the branch.
+    2. **Best-effort token preflight** using the reviewer model's
+       `countTokens` + `maxInputTokens` (VS Code 1.93+
+       `LanguageModelChat`). When the assembled prompt would consume more
+       than 90% of `maxInputTokens`, the handler aborts naming the token
+       count, the budget, and the reviewer model id.
+    3. **`OversizedPromptError` short-circuit** in both
+       `VscodeLmClient.sendStructured` and
+       `GithubModelsClient.sendStructured`. Token-limit /
+       context-window-exceeded errors from the underlying transport
+       (`Message exceeds token limit`, `maximum context length`,
+       `prompt is too long`, `request too large`, `context window
+       exceeded`) now throw a typed `OversizedPromptError` instead of
+       triggering the wasted schema-reminder retry.
+  Tracked under OpenSpec change `guard-oversized-review-prompts`
+  (`openspec/changes/`). Covered by `test/oversized.test.ts` (4 cases).
 - **Content-policy refusals no longer surface as misleading
   `JSON.parse` errors.** When `vscode.lm` returned
   `Sorry, I can't assist with that.` the user previously saw

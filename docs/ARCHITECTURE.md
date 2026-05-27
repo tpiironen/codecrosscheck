@@ -139,6 +139,17 @@ Key behaviours encoded in [src/loop.ts](../src/loop.ts):
   unlabelled fences are unwrapped, so a ` ```text\nSorry...\n``` `
   refusal cannot masquerade as JSON. See OpenSpec change
   `fix-model-refusal-detection`.
+- **Oversized-prompt short-circuit.** Token-limit / context-window
+  failures from the underlying LM (`Message exceeds token limit`,
+  `maximum context length`, `prompt is too long`, `request too large`,
+  `context window exceeded`) are detected in both transports' catch
+  blocks and rethrown as a typed `OversizedPromptError` *without*
+  triggering the schema-reminder retry. `/review-branch` adds two
+  upstream guards: a hard char-budget cap
+  (`codecrosscheck.reviewBranch.maxDiffChars`, default 200 KB) and a
+  best-effort `countTokens` preflight against the reviewer model's
+  `maxInputTokens` (with a 10% response reserve). See OpenSpec change
+  `guard-oversized-review-prompts`.
 - **Revision prompts include structured issues, not raw reviewer prose.**
   `buildRevisionInput` formats `severity / where / why / suggestion` so the
   worker sees machine-actionable feedback.

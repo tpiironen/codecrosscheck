@@ -204,6 +204,12 @@
           "minimum": 1,
           "description": "Maximum loop iterations per stage before returning the last artifact unapproved."
         },
+        "codecrosscheck.reviewBranch.maxDiffChars": {
+          "type": "integer",
+          "default": 200000,
+          "minimum": 0,
+          "description": "Hard char-budget cap for /review-branch. If the assembled branch diff exceeds this many characters, the command aborts with guidance to pass a closer diff-base or split the branch, instead of letting the reviewer LM return 'Message exceeds token limit'. Set to 0 to disable the guard."
+        },
         "codecrosscheck.execute.timeoutMs": {
           "type": "integer",
           "default": 30000,
