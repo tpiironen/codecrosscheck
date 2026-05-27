@@ -61,6 +61,9 @@ describe("VscodeLmClient oversized-prompt handling", () => {
   it("ignores unrelated errors (does NOT misclassify generic failures as oversized)", () => {
     expect(() => assertNotOversized(new Error("ECONNRESET"), "stub/stub")).not.toThrow();
     expect(() => assertNotOversized(new Error("Unexpected token 'S' in JSON"), "stub/stub")).not.toThrow();
+    // Regression: gRPC/HTTP deadline-exceeded must not be misclassified as an oversized prompt.
+    expect(() => assertNotOversized(new Error("context deadline exceeded"), "stub/stub")).not.toThrow();
+    expect(() => assertNotOversized(new Error("deadline exceeded after 30s"), "stub/stub")).not.toThrow();
   });
 
   it("OversizedPromptError message names the model and suggests remediation", () => {

@@ -178,7 +178,9 @@ export class OversizedPromptError extends Error {
 }
 
 // Phrases LM providers use when the prompt exceeds the model's context window. Kept conservative
-// — we only short-circuit retry on a high-confidence match.
+// — we only short-circuit retry on a high-confidence match. Generic transport failures such as
+// "context deadline exceeded" (gRPC/HTTP timeout) MUST NOT be classified as oversized; see the
+// chat-loop spec scenario "Unrelated failures are not misclassified".
 const OVERSIZED_PATTERNS: readonly RegExp[] = [
   /message exceeds (?:the )?token limit/i,
   /context (?:window|length) (?:exceeded|exhausted|too (?:large|long))/i,
@@ -186,7 +188,6 @@ const OVERSIZED_PATTERNS: readonly RegExp[] = [
   /input (?:is )?too (?:long|large)/i,
   /maximum context length/i,
   /request too large/i,
-  /\b(?:tokens?|context).{0,40}\bexceed(?:s|ed)?\b/i,
 ];
 
 export function assertNotOversized(err: unknown, modelId: string): void {
