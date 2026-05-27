@@ -1,6 +1,6 @@
 {
   "name": "codecrosscheck",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Two-model review loop: a worker LLM produces, a reviewer LLM judges, both as a Node CLI and a VS Code chat participant.",
   "type": "module",
   "engines": {
