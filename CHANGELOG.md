@@ -6,7 +6,99 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include breaking changes; patch bumps are bug-fix
 only).
 
+Each release heading includes both a SemVer tag **and** the date it shipped
+(e.g. `## [0.3.1] — 2026-05-27`), so this file can be read as either a version
+history or a timeline. On every version bump, rename `## [Unreleased]` to
+`## [<new-version>] — <today>` and add a fresh empty `## [Unreleased]` above it.
+
 ## [Unreleased]
+
+_No unreleased changes — promote the next batch of work here as it lands._
+
+## [0.3.1] — 2026-05-27
+
+OpenSpec change: [`guard-oversized-review-prompts`](openspec/changes/guard-oversized-review-prompts/proposal.md).
+
+### Added
+
+- **Self-review mandate (`.github/copilot-instructions.md`).** Codifies the
+  dog-fooding workflow for this repo: after any non-trivial change under
+  `src/` or `test/`, invoke `@codecrosscheck /review-branch` and only commit
+  after the reviewer returns `approve` (or the user adjudicates
+  disagreements). Doc-only edits and trivial typo fixes are exempt.
+
+### Fixed
+
+- **`/review-branch` no longer turns a too-large diff into a confusing Zod
+  schema error.** Previously, passing a multi-megabyte branch diff to the
+  reviewer surfaced as `vscode.lm response failed schema "Verdict" twice.
+  First: Message exceeds token limit. Retry: … Invalid enum value. Expected
+  'approve' | 'revise', received 'invalid' …` because the schema-reminder
+  retry re-sent the same oversized prompt. Three new guards make this fail
+  fast with actionable messages:
+    1. **Hard char-budget guard** on `/review-branch`, governed by the new
+       `codecrosscheck.reviewBranch.maxDiffChars` setting (integer,
+       default `200000`, `0` disables). When the assembled diff exceeds
+       the cap the handler aborts before any LM call with guidance to
+       pass a closer `diff-base=<ref>` or split the branch.
+    2. **Best-effort token preflight** using the reviewer model's
+       `countTokens` + `maxInputTokens` (VS Code 1.93+
+       `LanguageModelChat`). When the assembled prompt would consume more
+       than 90% of `maxInputTokens`, the handler aborts naming the token
+       count, the budget, and the reviewer model id.
+    3. **`OversizedPromptError` short-circuit** in both
+       `VscodeLmClient.sendStructured` and
+       `GithubModelsClient.sendStructured`. Token-limit /
+       context-window-exceeded errors from the underlying transport
+       (`Message exceeds token limit`, `maximum context length`,
+       `prompt is too long`, `request too large`, `context window
+       exceeded`) now throw a typed `OversizedPromptError` instead of
+       triggering the wasted schema-reminder retry. Covered by
+       `test/oversized.test.ts` (4 cases).
+- **`OVERSIZED_PATTERNS` tightened to avoid misclassifying transport
+  timeouts.** The initial pattern list included a broad fallback
+  `\b(?:tokens?|context).{0,40}\bexceed(?:s|ed)?\b` that matched generic
+  gRPC/HTTP failures such as `context deadline exceeded`, violating the
+  chat-loop spec scenario "Unrelated failures are not misclassified". The
+  fallback was removed; the remaining six explicit phrasings still cover
+  every provider error enumerated in the spec. Regression test added.
+  *(Self-review with `@codecrosscheck /review-branch` caught this issue in
+  the same session it was introduced — the dog-food rule pays for itself.)*
+
+## [0.3.0] — 2026-05-19
+
+OpenSpec change: [`rename-openspec-implement-to-review`](openspec/changes/rename-openspec-implement-to-review/proposal.md).
+
+### Changed
+
+- **`/openspec-implement` renamed to `/openspec-review`** to better reflect
+  what the command does — it runs a worker↔reviewer dialogue against an
+  OpenSpec change frame, it does not actually implement the change.
+  `/openspec-implement` is kept as a deprecated alias that prints a notice
+  and forwards. Contract test in `test/openspec-review.test.ts`.
+
+## [0.2.10] — 2026-05-19
+
+OpenSpec change: [`fix-model-refusal-detection`](openspec/changes/fix-model-refusal-detection/proposal.md).
+
+### Fixed
+
+- **Content-policy refusals no longer surface as misleading
+  `JSON.parse` errors.** When `vscode.lm` returned
+  `Sorry, I can't assist with that.` the user previously saw
+  `vscode.lm response failed schema "WorkerOutput" twice. First:
+  Unexpected token 'S'... Retry: Unexpected token 'e', "text\\nSorry"...`,
+  which masked the true cause (the model refused) and burned reviewer
+  tokens on a doomed retry. `VscodeLmClient.sendStructured` and
+  `GithubModelsClient.sendStructured` now inspect each raw response for
+  a refusal pattern *before* parsing, throw a new `ModelRefusalError`
+  that names the model and quotes the response, and skip the
+  schema-reminder retry (it cannot recover a refusal). The two-strike
+  fallback error also now includes a 160-char snippet of each raw
+  response so schema drift can be diagnosed from chat output alone.
+- **`extractJson` no longer silently unwraps unknown-language fences.**\n  The fence regex was `/```(?:json)?\\s*([\\s\\S]*?)```/`, which on a\n  ` ```text\\nSorry...\\n``` ` response stripped the fence and fed\n  `text\\nSorry...` straight into `JSON.parse`. The regex is now\n  `/```(?:json)?\\r?\\n([\\s\\S]*?)```/` — only `json` or unlabelled\n  fences are unwrapped; everything else falls through to the\n  brace-pair fallback. Covered by `test/refusal.test.ts`.
+
+## [0.2.8] — 2026-05-06
 
 ### Added
 
@@ -56,55 +148,6 @@ only).
 
 ### Fixed
 
-- **`/review-branch` no longer turns a too-large diff into a confusing Zod
-  schema error.** Previously, passing a multi-megabyte branch diff to the
-  reviewer surfaced as `vscode.lm response failed schema "Verdict" twice.
-  First: Message exceeds token limit. Retry: … Invalid enum value. Expected
-  'approve' | 'revise', received 'invalid' …` because the schema-reminder
-  retry re-sent the same oversized prompt. Three new guards make this fail
-  fast with actionable messages:
-    1. **Hard char-budget guard** on `/review-branch`, governed by the new
-       `codecrosscheck.reviewBranch.maxDiffChars` setting (integer,
-       default `200000`, `0` disables). When the assembled diff exceeds
-       the cap the handler aborts before any LM call with guidance to
-       pass a closer `diff-base=<ref>` or split the branch.
-    2. **Best-effort token preflight** using the reviewer model's
-       `countTokens` + `maxInputTokens` (VS Code 1.93+
-       `LanguageModelChat`). When the assembled prompt would consume more
-       than 90% of `maxInputTokens`, the handler aborts naming the token
-       count, the budget, and the reviewer model id.
-    3. **`OversizedPromptError` short-circuit** in both
-       `VscodeLmClient.sendStructured` and
-       `GithubModelsClient.sendStructured`. Token-limit /
-       context-window-exceeded errors from the underlying transport
-       (`Message exceeds token limit`, `maximum context length`,
-       `prompt is too long`, `request too large`, `context window
-       exceeded`) now throw a typed `OversizedPromptError` instead of
-       triggering the wasted schema-reminder retry.
-  Tracked under OpenSpec change `guard-oversized-review-prompts`
-  (`openspec/changes/`). Covered by `test/oversized.test.ts` (4 cases).
-- **Content-policy refusals no longer surface as misleading
-  `JSON.parse` errors.** When `vscode.lm` returned
-  `Sorry, I can't assist with that.` the user previously saw
-  `vscode.lm response failed schema "WorkerOutput" twice. First:
-  Unexpected token 'S'... Retry: Unexpected token 'e', "text\nSorry"...`,
-  which masked the true cause (the model refused) and burned reviewer
-  tokens on a doomed retry. `VscodeLmClient.sendStructured` and
-  `GithubModelsClient.sendStructured` now inspect each raw response for
-  a refusal pattern *before* parsing, throw a new `ModelRefusalError`
-  that names the model and quotes the response, and skip the
-  schema-reminder retry (it cannot recover a refusal). The two-strike
-  fallback error also now includes a 160-char snippet of each raw
-  response so schema drift can be diagnosed from chat output alone.
-  Tracked under OpenSpec change
-  `fix-model-refusal-detection` (`openspec/changes/`).
-- **`extractJson` no longer silently unwraps unknown-language fences.**
-  The fence regex was `/```(?:json)?\s*([\s\S]*?)```/`, which on a
-  ` ```text\nSorry...\n``` ` response stripped the fence and fed
-  `text\nSorry...` straight into `JSON.parse`. The regex is now
-  `/```(?:json)?\r?\n([\s\S]*?)```/` — only `json` or unlabelled
-  fences are unwrapped; everything else falls through to the
-  brace-pair fallback. Covered by `test/refusal.test.ts`.
 - **`/review-branch` now supports `diff-base=<ref>` in the prompt.**
   Pass any git ref (branch, tag, SHA) to override the default merge-base
   detection — e.g. `@codecrosscheck /review-branch diff-base=empty`.
@@ -112,6 +155,14 @@ only).
 - **Merge-base resolution falls back to `origin/master`** when
   `origin/main` does not exist, fixing "No diff" errors in repos that
   use `master` as the default branch.
+
+## [0.2.7] — 2026-05-05
+
+Initial public release of the cross-vendor AI review gate. Establishes the
+worker↔reviewer chat loop, the `/review-branch` → `/apply-review` workflow,
+and the supporting `applyReview.ts` toolkit.
+
+### Added
 
 - **`/apply-review` slash command.** Closes the review loop by turning
   the latest `/review-branch` fix proposal into actual file edits. The
@@ -132,7 +183,6 @@ only).
   Recommended workflow: `/review-branch` → review proposal →
   `/apply-review` → `git diff` → commit → optional `/review-branch`
   re-check.
-
 - **`/apply-review` safety-net repairs.** When the worker's literal
   `oldString` doesn't match the target file verbatim, the handler now
   tries a deterministic sequence of conservative repairs and uses the
@@ -177,7 +227,6 @@ only).
   a concrete fix for every reviewer finding and forbids `Disagree:` in
   that round. Helper: `parseDisagreements` in
   [`src/applyReview.ts`](src/applyReview.ts).
-
 - **`/review-branch` blocked-finding detection.** A complementary
   `parseBlockedFindings` helper flags issue sections where the worker
   dodged producing a concrete patch via prose ("Data I need",
@@ -214,6 +263,17 @@ only).
   parses `max-iters=N` / `maxiters=N` / `iters=N` from the user prompt
   (whole-token, case-insensitive, range 1..20) and overrides
   `codecrosscheck.maxIters` for that run only.
+- **`ChatClient.sendText(messages)`** — plain-text path with no JSON
+  parsing or schema retry. Implemented for both `VscodeLmClient` and
+  `GithubModelsClient`. Used by `buildWorkerWithPrompt` so workers
+  producing rich Markdown (e.g. fix proposals containing C# code blocks)
+  don't have to round-trip through a `{"artifact": "..."}` envelope that
+  large-context models tend to drop.
+- **`buildWorkerWithPrompt(system, client)` and `loadPromptByName(name)`**
+  in `src/agents.ts` — lets callers build workers outside the Stage
+  pipeline with arbitrary system prompts. Used by `/review-branch`.
+- **`.vscode/launch.json` and `.vscode/tasks.json`** for one-key F5
+  Extension Development Host launch with auto-build.
 
 ### Changed
 
@@ -239,20 +299,6 @@ only).
   per-iteration progress indicators, severity-icon issue lists, and
   truncated worker artifacts as they arrive instead of dumping
   everything at the end.
-
-### Added
-
-- **`ChatClient.sendText(messages)`** — plain-text path with no JSON
-  parsing or schema retry. Implemented for both `VscodeLmClient` and
-  `GithubModelsClient`. Used by `buildWorkerWithPrompt` so workers
-  producing rich Markdown (e.g. fix proposals containing C# code blocks)
-  don't have to round-trip through a `{"artifact": "..."}` envelope that
-  large-context models tend to drop.
-- **`buildWorkerWithPrompt(system, client)` and `loadPromptByName(name)`**
-  in `src/agents.ts` — lets callers build workers outside the Stage
-  pipeline with arbitrary system prompts. Used by `/review-branch`.
-- **`.vscode/launch.json` and `.vscode/tasks.json`** for one-key F5
-  Extension Development Host launch with auto-build.
 
 ### Fixed
 
@@ -389,5 +435,10 @@ Initial internal release. OpenSpec change:
 - Reviewer: `anthropic/claude-opus-4.5`
 
 [Unreleased]: ./CHANGELOG.md
+[0.3.1]: ./CHANGELOG.md#031--2026-05-27
+[0.3.0]: ./CHANGELOG.md#030--2026-05-19
+[0.2.10]: ./CHANGELOG.md#0210--2026-05-19
+[0.2.8]: ./CHANGELOG.md#028--2026-05-06
+[0.2.7]: ./CHANGELOG.md#027--2026-05-05
 [0.2.0]: ./CHANGELOG.md#020--2026-04-28
 [0.1.0]: ./CHANGELOG.md#010--2026-04-26
