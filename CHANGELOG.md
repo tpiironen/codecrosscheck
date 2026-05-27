@@ -96,7 +96,13 @@ OpenSpec change: [`fix-model-refusal-detection`](openspec/changes/fix-model-refu
   schema-reminder retry (it cannot recover a refusal). The two-strike
   fallback error also now includes a 160-char snippet of each raw
   response so schema drift can be diagnosed from chat output alone.
-- **`extractJson` no longer silently unwraps unknown-language fences.**\n  The fence regex was `/```(?:json)?\\s*([\\s\\S]*?)```/`, which on a\n  ` ```text\\nSorry...\\n``` ` response stripped the fence and fed\n  `text\\nSorry...` straight into `JSON.parse`. The regex is now\n  `/```(?:json)?\\r?\\n([\\s\\S]*?)```/` — only `json` or unlabelled\n  fences are unwrapped; everything else falls through to the\n  brace-pair fallback. Covered by `test/refusal.test.ts`.
+- **`extractJson` no longer silently unwraps unknown-language fences.**
+  The fence regex was `/```(?:json)?\s*([\s\S]*?)```/`, which on a
+  ` ```text\nSorry...\n``` ` response stripped the fence and fed
+  `text\nSorry...` straight into `JSON.parse`. The regex is now
+  `/```(?:json)?\r?\n([\s\S]*?)```/` — only `json` or unlabelled
+  fences are unwrapped; everything else falls through to the
+  brace-pair fallback. Covered by `test/refusal.test.ts`.
 
 ## [0.2.8] — 2026-05-06
 
