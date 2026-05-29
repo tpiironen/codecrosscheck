@@ -49,9 +49,9 @@ The same engine ships as both a Node CLI (`codecrosscheck`, alias `ccc`) and a V
 
 | Surface | Identifier |
 |---|---|
-| npm package | `@internal/codecrosscheck` |
+| npm package | `codecrosscheck` |
 | CLI binary | `codecrosscheck` (alias `ccc`) |
-| VS Code extension id | `<publisher>.codecrosscheck` |
+| VS Code extension id | `tpiironen.codecrosscheck` |
 | Chat participant | `@codecrosscheck` |
 | Settings namespace | `codecrosscheck.*` |
 | Transcript directory | `.codecrosscheck/runs/<timestamp>.jsonl` |

@@ -15,6 +15,24 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 _No unreleased changes — promote the next batch of work here as it lands._
 
+## [0.4.0] — 2026-05-29
+
+### Changed
+
+- **First public release.** Repository moved to GitHub
+  ([`tpiironen/codecrosscheck`](https://github.com/tpiironen/codecrosscheck)),
+  licensed MIT, default branch renamed `master` → `main`. Added
+  `LICENSE`, [`CONTRIBUTING.md`](CONTRIBUTING.md),
+  [`SECURITY.md`](SECURITY.md), and a GitHub Actions CI workflow
+  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that runs
+  build + tests on Ubuntu and Windows against Node 20.
+  `package.json` `publisher` / `publishConfig` / `repository` switched
+  from internal Azure DevOps to public GitHub + npm; the
+  `.npmrc.template` pointing at a private Azure Artifacts feed was
+  removed.
+- **No functional changes** vs `0.3.1`. The version bump marks the
+  distribution change, not a code change.
+
 ## [0.3.1] — 2026-05-27
 
 OpenSpec change: [`guard-oversized-review-prompts`](openspec/changes/guard-oversized-review-prompts/proposal.md).
@@ -441,6 +459,7 @@ Initial internal release. OpenSpec change:
 - Reviewer: `anthropic/claude-opus-4.5`
 
 [Unreleased]: ./CHANGELOG.md
+[0.4.0]: ./CHANGELOG.md#040--2026-05-29
 [0.3.1]: ./CHANGELOG.md#031--2026-05-27
 [0.3.0]: ./CHANGELOG.md#030--2026-05-19
 [0.2.10]: ./CHANGELOG.md#0210--2026-05-19

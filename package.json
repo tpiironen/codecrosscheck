@@ -1,6 +1,6 @@
 {
   "name": "codecrosscheck",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Two-model review loop: a worker LLM produces, a reviewer LLM judges, both as a Node CLI and a VS Code chat participant.",
   "type": "module",
   "engines": {
@@ -51,13 +51,29 @@
     }
   },
   "publishConfig": {
-    "registry": "https://pkgs.dev.azure.com/REPLACE_ORG/_packaging/codecrosscheck-npm/npm/registry/"
+    "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "https://dev.azure.com/REPLACE_ORG/REPLACE_PROJECT/_git/CodeCrossCheck"
+    "url": "https://github.com/tpiironen/codecrosscheck.git"
   },
-  "publisher": "internal",
+  "homepage": "https://github.com/tpiironen/codecrosscheck#readme",
+  "bugs": {
+    "url": "https://github.com/tpiironen/codecrosscheck/issues"
+  },
+  "license": "MIT",
+  "author": "Timo Piironen",
+  "keywords": [
+    "code-review",
+    "llm",
+    "ai",
+    "vscode",
+    "chat-participant",
+    "cross-vendor",
+    "copilot",
+    "adversarial-review"
+  ],
+  "publisher": "tpiironen",
   "displayName": "CodeCrossCheck",
   "categories": [
     "AI",
