@@ -40,7 +40,7 @@ flowchart TB
 
   subgraph Adapters["ChatClient adapters"]
     IFACE["src/clients/ChatClient.ts<br/>sendStructured&lt;T&gt;"]
-    GH["src/clients/githubModels.ts<br/>global fetch + json_schema"]
+    GH["src/clients/openaiCompatible.ts<br/>global fetch + json_schema"]
     VLM["src/clients/vscodeLm.ts<br/>vscode.lm + extractJson"]
   end
 
@@ -187,17 +187,23 @@ flowchart LR
 ### 4.1 How a `/review-branch` dialogue ends
 
 `/review-branch` does not use `runPipeline`; it drives its own
-reviewer→worker→reviewer dialogue and classifies the ending into exactly one
-`ReviewOutcome`. The distinction matters because two of these look like
-success and only one is:
+reviewer→triage→worker→reviewer dialogue and classifies the ending into exactly
+one `ReviewOutcome`. The distinction matters because three of these look like
+success and only one is an approval of a fix:
 
 | Outcome | Meaning | Rendered as |
 |---|---|---|
 | `approved` | The reviewer returned `verdict: "approve"` on its own. | ✅ Approved |
+| `defended` | Triage could not confirm a single remaining finding, so nothing was drafted. **The code was defended against the findings** — a different claim from "the fix is good". | 🛡️ Findings did not survive triage, with the evidence for each rejection |
 | `rebutted` | Every outstanding finding matched a fingerprint the worker had rebutted with `**Fix:** Disagree:`, so the filter emptied the list. **The reviewer never approved.** | 🤝 Stalled on disagreement, with the rebuttals listed for the user to adjudicate |
 | `exhausted` | `maxIters` reached with findings still open. | ⚠️ Did not converge |
 | `cancelled` | The request's `CancellationToken` fired. | ⏹️ Cancelled |
 | `failed` | Diff could not be computed, budget exceeded, or a model call failed. | ❌ with `ChatResult.errorDetails` |
+
+`defended` and `rebutted` both mean "no fix was produced", but they arrive
+differently: `rebutted` is the worker declining while drafting, recovered by
+parsing prose; `defended` is a dedicated triage pass returning a schema-validated
+judgement with evidence, before any drafting happens.
 
 `rebutted` exists because of a real defect: `filterRejectedIssues` used to flip
 the verdict to `approve` when suppression emptied the issue list, and the
@@ -222,7 +228,6 @@ code. Guarantees:
 | Fresh working dir per run | `fs.mkdtempSync(path.join(os.tmpdir(), "ccc-"))` |
 | Env scrubbed to allowlist | `PATH`, `LANG`, `TMPDIR`/`TEMP`, `HOME`/`USERPROFILE` only |
 | Hard timeout | Default 30 s; process tree killed on expiry |
-| Network deny by default | `NO_PROXY=*` injected unless `--allow-network` |
 | Cleanup | `rm -rf` of tmpdir on completion (success or failure) |
 
 The sandbox is **not** an adversarial isolator. Treat it as a guardrail
@@ -239,9 +244,9 @@ classDiagram
     +modelId: string
     +sendStructured~T~(messages, schema) Promise~T~
   }
-  class GitHubModelsClient {
-    +endpoint: "models.github.ai/inference/chat/completions"
-    +reads GITHUB_TOKEN
+  class OpenAiCompatibleClient {
+    +endpoint: $CODECROSSCHECK_BASE_URL + "/chat/completions"
+    +optional bearer key; omitted when unset
     +response_format: json_schema strict
   }
   class VscodeLmClient {
@@ -250,16 +255,19 @@ classDiagram
     +preselected model? LmChat
     +extractJson(streamedText)
   }
-  ChatClient <|.. GitHubModelsClient
+  ChatClient <|.. OpenAiCompatibleClient
   ChatClient <|.. VscodeLmClient
 ```
 
-- **`githubModels.ts`** is what the CLI uses. It sends OpenAI-style
+- **`openaiCompatible.ts`** is what the CLI uses. It sends OpenAI-style
   `response_format: { type: "json_schema" }` derived from the zod schema via
   zod 4's native `z.toJSONSchema()`. `strict` is declared only when the
   generated schema actually satisfies strict mode (every property required,
   `additionalProperties: false`), because declaring it otherwise makes the
   provider reject the request. HTTP goes through the platform `fetch`.
+  There is deliberately no default base URL: the previous client hard-coded
+  GitHub Models, and when that service was retired on 2026-07-30 every CLI
+  invocation broke. The API key is optional so keyless local servers work.
 - **`vscodeLm.ts`** is what the extension uses. `vscode.lm` wants a `family`
   string (`"claude-opus-5"`), not a vendor-prefixed id
   (`"anthropic/claude-opus-5"`); the
@@ -477,7 +485,7 @@ flowchart LR
 - **Unit tests** drive `loop.ts` and `pipeline.ts` with a deterministic
   `FakeChatClient` whose responses are scripted; no network, no
   flakiness. Sandbox tests use real subprocesses but tiny scripts.
-- **Live integration test** is gated on `RUN_LIVE_TESTS=1` + `GITHUB_TOKEN`
+- **Live integration test** is gated on `RUN_LIVE_TESTS=1` + `CODECROSSCHECK_BASE_URL`
   and is the only test that touches the network in CI.
 - **Selftests** are end-to-end smoke tests run manually with a token. They
   exercise the actual binaries against live GitHub Models, including the

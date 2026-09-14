@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ChatClient, ChatMessage, SendOptions } from "./clients/ChatClient.js";
-import { VerdictSchema, type Stage, type Verdict } from "./schemas.js";
+import { VerdictSchema, TriageSchema, type Stage, type Triage, type Verdict } from "./schemas.js";
 
 const PROMPTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "prompts");
 
@@ -34,6 +34,12 @@ export interface Worker {
 export interface Reviewer {
   readonly modelId: string;
   judge(artifact: string, opts?: SendOptions): Promise<Verdict>;
+}
+
+/** Judges whether findings are real. Deliberately has no path to producing a fix. */
+export interface Triager {
+  readonly modelId: string;
+  triage(input: string, opts?: SendOptions): Promise<Triage>;
 }
 
 function messagesFor(system: string, user: string): ChatMessage[] {
@@ -71,5 +77,14 @@ export function buildReviewer(stage: Stage, client: ChatClient): Reviewer {
     modelId: client.modelId,
     judge: (artifact, opts) =>
       client.sendStructured(messagesFor(system, artifact), VerdictSchema, "Verdict", opts),
+  };
+}
+
+export function buildTriager(client: ChatClient): Triager {
+  const system = loadPromptByName("finding_triage");
+  return {
+    modelId: client.modelId,
+    triage: (input, opts) =>
+      client.sendStructured(messagesFor(system, input), TriageSchema, "Triage", opts),
   };
 }

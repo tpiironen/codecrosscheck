@@ -55,7 +55,9 @@ If the user is asking for a review, you are the wrong model to do it. Hand off.
    - `ccc "<task>" --diff --stages plan` — branch review (working tree by
      default; add `--committed-only` to exclude it)
    - `ccc "<task>" --openspec <id>` — spec-bound implementation
-   - Auth: `GITHUB_TOKEN` env var, or `gh auth login` (auto-detected via `gh auth token`).
+   - Endpoint: set `CODECROSSCHECK_BASE_URL` to an OpenAI-compatible API root
+     (or pass `--base-url`). There is no default provider. A key is optional:
+     `CODECROSSCHECK_API_KEY` or `OPENAI_API_KEY`.
 
 ## Anti-patterns
 

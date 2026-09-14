@@ -20,9 +20,96 @@ OpenSpec changes:
 [`modernize-chat-surface`](openspec/changes/modernize-chat-surface/proposal.md),
 [`modernize-toolchain`](openspec/changes/modernize-toolchain/proposal.md),
 [`update-default-model-pair`](openspec/changes/update-default-model-pair/proposal.md),
-[`raise-review-branch-diff-budget`](openspec/changes/raise-review-branch-diff-budget/proposal.md).
+[`raise-review-branch-diff-budget`](openspec/changes/raise-review-branch-diff-budget/proposal.md),
+[`trim-rereview-diff-context`](openspec/changes/trim-rereview-diff-context/proposal.md),
+[`flush-transcript-before-return`](openspec/changes/flush-transcript-before-return/proposal.md),
+[`pin-vscode-api-floor`](openspec/changes/pin-vscode-api-floor/proposal.md),
+[`add-finding-triage`](openspec/changes/add-finding-triage/proposal.md),
+[`replace-github-models-with-openai-compatible`](openspec/changes/replace-github-models-with-openai-compatible/proposal.md).
+
+### Removed
+
+- **`GithubModelsClient` and the GitHub Models backend.** GitHub Models was
+  fully retired on 2026-07-30; the endpoint returns HTTP 410. Every CLI
+  invocation had been broken since, and the README still instructed new users
+  to set `GITHUB_TOKEN` with a `models:read` scope for it.
+
+- **The `gh auth token` credential fallback.** It resolved a GitHub credential
+  for what is now an arbitrary configured base URL — a credential-leak shape.
+
+### Added
+
+- **`OpenAiCompatibleClient`: bring your own endpoint.** The CLI now talks to
+  any OpenAI-compatible `/chat/completions` API — OpenAI, Azure AI Foundry,
+  vLLM, Ollama, LM Studio. Configure with `CODECROSSCHECK_BASE_URL` or
+  `--base-url`. There is deliberately **no default provider**: hard-coding one
+  is exactly how the CLI came to depend on a service that was switched off.
+  The API key is optional (`CODECROSSCHECK_API_KEY` or `OPENAI_API_KEY`); when
+  unset the `Authorization` header is omitted entirely, so keyless local
+  servers work unmodified.
+
+  The VS Code extension is unaffected — it runs on `vscode.lm`, which GitHub's
+  retirement notice describes as a separate, unrelated service.
+
+### Added
+
+- **`/review-branch` now triages findings before drafting fixes.** The worker
+  is asked, per finding, whether the finding is real — as a schema-validated
+  judgement (`confirmed` / `rejected` / `uncertain`) with mandatory evidence in
+  both directions — before any fix is written. Only confirmed findings reach
+  the fixer; `uncertain` never does, so a guess cannot become a code edit.
+  `force-fix-all` bypasses triage so you can still overrule the worker.
+
+  This exists because of a real failure. In the run recorded at
+  `2026-09-14T12-25-09-360Z.jsonl`, the reviewer claimed
+  `WorkspaceEdit.createFile(uri, { contents })` does not accept a `contents`
+  payload. It does, and the VS Code typings say so. The worker did not push
+  back: it restated the false premise, rewrote `workspaceEditHost().commit`
+  with an extra `fs.stat` per file, and added the comment "`createFile` only
+  creates the file; the content must be a separate text edit". The reviewer
+  approved it. Applying that proposal would have replaced working code with
+  more complex code and recorded a falsehood in a comment. A worker instructed
+  to fix N issues fixes N issues, including the ones that are wrong.
+
+- **New `defended` review outcome**, for a run where no remaining finding
+  survived triage. That is an assessment of your code, not an approval of a fix
+  proposal, and the two are now reported differently.
 
 ### Changed
+
+- **Minimum VS Code is now 1.95.0** (was 1.93.0), and `@types/vscode` is pinned
+  with a tilde range. `engines.vscode` declared `^1.93.0` while `@types/vscode`
+  used a caret and resolved to **1.116.0**, so typecheck validated against an
+  API surface 23 minor versions newer than the advertised range. Pinning to
+  1.93 produced four errors, all `ChatRequest.model`, which only exists from
+  1.95.0. Since `useChatPickerWorker` defaults to `true`, the picker-as-worker
+  feature silently did nothing on 1.93 and 1.94. The floor is now enforced by
+  the compiler instead of assumed.
+
+### Fixed
+
+- **`/apply-review` could fail to find a review that had just succeeded.**
+  Transcript writes were queued and the handler returned without waiting, so
+  the terminal `review-branch-done` event was not guaranteed to be on disk —
+  including when `/apply-review` was launched from the button the review itself
+  renders. Handlers now flush before returning. Append failures were also
+  discarded by a bare `.catch(() => undefined)`, making a dropped event
+  indistinguishable from a stale build; the first failure is now reported and
+  surfaced in chat as a warning, without failing a run that produced a verdict.
+  Found by the tool reviewing its own branch.
+
+- **`/review-branch` no longer resends the whole branch diff on every
+  re-review.** Each iteration previously carried the full diff to both the
+  fixer and the reviewer. Measured on this repository: a two-iteration run made
+  three calls that each carried 178,575 chars — 535,725 chars of duplicated
+  diff, roughly 150,000 input tokens, to produce two findings. The re-review
+  pass now sends only the files its own prior findings cited, reusing the path
+  set already harvested for the fixer's file context. The prompt states how
+  many files were omitted so the reviewer is not misled about the branch's
+  size, and the counts are recorded in the transcript so the saving can be
+  checked rather than taken on trust. When no cited path matches the diff, the
+  full diff is sent unchanged — scoping never empties the reviewer's context.
+  The initial review pass is untouched and still sees everything.
 
 - **`codecrosscheck.reviewBranch.maxDiffChars` now defaults to `1100000`**
   (was `200000`). The old cap aborted `/review-branch` on ordinary working

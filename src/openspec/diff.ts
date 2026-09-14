@@ -99,6 +99,35 @@ export function filterPatchToScope(patch: string, scopePaths: string[]): string 
   return kept.join("");
 }
 
+/** Count the per-file blocks in a unified-diff patch. */
+export function countPatchFiles(patch: string): number {
+  return patch.split(/^(?=diff --git )/m).filter((b) => b.trim()).length;
+}
+
+export interface ScopedPatch {
+  patch: string;
+  included: number;
+  omitted: number;
+  /** False when `paths` matched nothing and the full patch was kept instead. */
+  scoped: boolean;
+}
+
+/**
+ * Narrow a patch to `paths` for a re-review prompt. Falls back to the whole
+ * patch when nothing matches — an empty diff would tell the reviewer the
+ * branch changed nothing, which is worse than sending too much.
+ */
+export function scopePatchToPaths(patch: string, paths: string[]): ScopedPatch {
+  const total = countPatchFiles(patch);
+  if (paths.length === 0) return { patch, included: total, omitted: 0, scoped: false };
+
+  const filtered = filterPatchToScope(patch, paths);
+  if (!filtered.trim()) return { patch, included: total, omitted: 0, scoped: false };
+
+  const included = countPatchFiles(filtered);
+  return { patch: filtered, included, omitted: Math.max(0, total - included), scoped: true };
+}
+
 /** Estimate tokens as ceil(chars / 4); split a patch into per-file chunks under `budgetTokens`. */
 export function chunkPatch(patch: string, budgetTokens: number): string[] {
   const budgetChars = budgetTokens * 4;

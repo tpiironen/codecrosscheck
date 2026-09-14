@@ -1,11 +1,13 @@
 import * as vscode from "vscode";
-import { buildReviewer, buildWorkerWithPrompt, loadPromptByName, reviewerOwaspEdition } from "./agents.js";
+import { buildReviewer, buildTriager, buildWorkerWithPrompt, loadPromptByName, reviewerOwaspEdition } from "./agents.js";
 import { readConfig, resolveClients, stripVendor, type ResolvedConfig } from "./config.js";
 import { runPipeline, type PipelineEvent } from "./pipeline.js";
 import { loadChange, renderChangeFrame } from "./openspec/loader.js";
 import { validateStrict } from "./openspec/validate.js";
-import { getChangeDiff } from "./openspec/diff.js";
-import type { Stage, Verdict } from "./schemas.js";
+import { getChangeDiff, scopePatchToPaths } from "./openspec/diff.js";
+import { createTranscriptWriter, type TranscriptWriter as Transcript } from "./transcript.js";
+import { selectConfirmedFindings } from "./triage.js";
+import type { Issue, Stage, Triage, Verdict } from "./schemas.js";
 import type { LoopOptions } from "./loop.js";
 import { ReviewCancelledError } from "./clients/ChatClient.js";
 import * as fs from "node:fs";
@@ -48,7 +50,7 @@ const SLASH_TO_STAGE: Record<string, Stage[]> = {
  * purpose: the reviewer never approved, the worker merely talked its way out
  * of every finding, and only the user can adjudicate that.
  */
-type ReviewOutcome = "approved" | "rebutted" | "exhausted" | "cancelled" | "failed";
+type ReviewOutcome = "approved" | "defended" | "rebutted" | "exhausted" | "cancelled" | "failed";
 
 interface CccResultMetadata {
   outcome: ReviewOutcome;
@@ -225,6 +227,7 @@ async function routeRequest(
     stream.markdown(`\`\`\`\n${lastArtifact}\n\`\`\`\n\n</details>\n\n`);
   }
 
+  await flushTranscript(stream, transcript);
   linkTranscript(stream, transcript.path);
   return {
     metadata: { outcome, command: cmd, hasFixProposal: false, iterations: totalIters },
@@ -428,6 +431,7 @@ async function handleReviewBranch(
 
   const { worker: workerClient, reviewer: reviewerClient } = resolveClients(cfg, request.model);
   const fixer = buildWorkerWithPrompt(loadPromptByName("review_branch_fixer"), workerClient);
+  const triager = buildTriager(workerClient);
   const reviewer = buildReviewer("code", reviewerClient);
 
   const userTask = request.prompt.trim();
@@ -551,10 +555,43 @@ async function handleReviewBranch(
       }
     }
 
+    // Adjudicate before drafting. A worker told to fix N issues will fix N
+    // issues, including the ones that are wrong.
+    let fixableVerdict = verdict;
+    if (!forceFixAll) {
+      stream.progress(`Worker \`${triager.modelId}\` checking whether the findings are real\u2026`);
+      let triage: Triage | undefined;
+      try {
+        triage = await triager.triage(
+          buildTriageInput({ verdict, fileContextBlock, diffDescription }),
+          { signal },
+        );
+      } catch (err) {
+        if (err instanceof ReviewCancelledError) {
+          outcome = "cancelled";
+          break;
+        }
+        // Triage is an extra safety net, not a gate: if it fails, fall through
+        // to the old behaviour rather than losing the run.
+        stream.markdown(`\u26a0\ufe0f Triage unavailable (\`${(err as Error).message}\`); drafting fixes for all findings.\n\n`);
+      }
+
+      if (triage) {
+        transcript.write({ event: "review-branch-triage", iteration: iter, triagerId: triager.modelId, entries: triage.entries });
+        const confirmed = renderTriage(stream, verdict, triage);
+        if (confirmed.length === 0) {
+          outcome = "defended";
+          verdict = { verdict: "approve", issues: [] };
+          break;
+        }
+        fixableVerdict = { verdict: verdict.verdict, issues: confirmed };
+      }
+    }
+
     const fixerInput = buildFixerInput({
       taskHeader,
       diffBlock,
-      currentVerdict: verdict,
+      currentVerdict: fixableVerdict,
       priorFixProposal: lastFixProposal,
       round: iter - 1,
       fileContextBlock,
@@ -590,10 +627,14 @@ async function handleReviewBranch(
 
     stream.markdown(`#### Reviewer re-judging\n\n`);
     stream.progress(`Reviewer \`${reviewer.modelId}\` checking fixes\u2026`);
+    // The reviewer is judging a proposal, not re-reading the branch: send only
+    // the files its own findings cited.
+    const scoped = scopePatchToPaths(diff, Array.from(harvested));
     const reviewArtifact = buildRereviewInput({
       taskHeader,
       diffDescription,
-      diffBody,
+      diffBody: `\`\`\`diff\n${scoped.patch}\n\`\`\``,
+      omittedFiles: scoped.omitted,
       priorVerdict: verdict,
       fixProposal: lastFixProposal,
     });
@@ -620,7 +661,17 @@ async function handleReviewBranch(
     }
 
     renderVerdict(stream, verdict);
-    transcript.write({ event: "review-branch-iter", iteration: iter, role: "reviewer", reviewerId: reviewer.modelId, verdict });
+    transcript.write({
+      event: "review-branch-iter",
+      iteration: iter,
+      role: "reviewer",
+      reviewerId: reviewer.modelId,
+      verdict,
+      diffScoped: scoped.scoped,
+      diffChars: scoped.patch.length,
+      filesIncluded: scoped.included,
+      filesOmitted: scoped.omitted,
+    });
 
     if (filtered.emptiedBySuppression) {
       // Every remaining finding was suppressed by a rebuttal. The reviewer did
@@ -649,6 +700,14 @@ async function handleReviewBranch(
         `Read the ${cumulativeDisagreements.length} rebuttal(s) below and either accept them or ` +
         `re-run with \`force-fix-all\`.\n\n`,
     );
+  } else if (outcome === "defended") {
+    stream.markdown(
+      `\ud83d\udee1\ufe0f **Findings did not survive triage** after ${iter} iteration(s) in ${elapsedSec}s. ` +
+        `The worker examined every remaining finding against the current source and could not ` +
+        `confirm any of them, so nothing was drafted and nothing is proposed for application. ` +
+        `The evidence for each rejection is above \u2014 read it rather than trusting it. ` +
+        `If you disagree, re-run with \`force-fix-all\` to draft fixes regardless.\n\n`,
+    );
   } else if (outcome === "cancelled") {
     stream.markdown(`\u23f9\ufe0f **Cancelled** after ${iter} iteration(s) in ${elapsedSec}s. Partial output below.\n\n`);
   } else {
@@ -665,12 +724,14 @@ async function handleReviewBranch(
       `**Next:** apply the patches in the fix proposal below. ` +
         (outcome === "approved"
           ? `The reviewer is satisfied; once applied, run \`git diff\` and commit.\n\n`
-          : `Then re-run \`/review-branch\` to address any residual findings, raise \`codecrosscheck.maxIters\` for more rounds, or scope the prompt down.\n\n`),
+          : outcome === "defended"
+            ? `It addresses findings confirmed in an earlier round; the findings raised since were rejected.\n\n`
+            : `Then re-run \`/review-branch\` to address any residual findings, raise \`codecrosscheck.maxIters\` for more rounds, or scope the prompt down.\n\n`),
     );
     stream.button({ command: APPLY_COMMAND, title: "Apply this fix proposal", arguments: [] });
     stream.markdown(`### Final fix proposal\n\n<details${outcome === "approved" ? " open" : ""}><summary>${lastFixProposal.length} chars</summary>\n\n`);
     stream.markdown(`\`\`\`markdown\n${lastFixProposal}\n\`\`\`\n\n</details>\n\n`);
-  } else if (outcome !== "approved") {
+  } else if (outcome !== "approved" && outcome !== "defended") {
     stream.markdown(
       `**Next steps:** raise \`codecrosscheck.maxIters\`, scope the prompt, or address the findings manually.\n\n`,
     );
@@ -721,6 +782,7 @@ async function handleReviewBranch(
     iterations: iter,
     elapsedMs: Date.now() - startedAt,
   });
+  await flushTranscript(stream, transcript);
   linkTranscript(stream, transcript.path);
   return {
     metadata: {
@@ -1033,6 +1095,52 @@ function buildFixerInput(args: {
   ].join("\n");
 }
 
+function buildTriageInput(args: {
+  verdict: Verdict;
+  fileContextBlock: string;
+  diffDescription: string;
+}): string {
+  const findings = args.verdict.issues
+    .map(
+      (it, idx) =>
+        `## Finding ${idx + 1}\n- severity: ${it.severity}\n- where: ${it.where}\n- claim: ${it.why}\n- proposed remedy: ${it.suggestion}`,
+    )
+    .join("\n\n");
+  return [
+    "# Findings to judge",
+    "",
+    `A reviewer produced these findings against ${args.diffDescription}.`,
+    "Judge each one. You are judging the CLAIM, not the proposed remedy.",
+    "",
+    findings,
+    "",
+    args.fileContextBlock ||
+      "_No repository file context was available. Any finding that needs source you were not given is `uncertain`._",
+  ].join("\n");
+}
+
+/** Renders each triage entry and returns the findings that survived. */
+function renderTriage(stream: vscode.ChatResponseStream, verdict: Verdict, triage: Triage): Issue[] {
+  const { confirmed, statuses } = selectConfirmedFindings(verdict, triage);
+  const icons = { confirmed: "\u2705", rejected: "\u274c", uncertain: "\u2753" } as const;
+
+  stream.markdown(`#### Triage \u2014 are these findings real?\n\n`);
+  statuses.forEach((s, idx) => {
+    stream.markdown(
+      `${icons[s.status]} **${idx + 1}. ${s.status}** — \`${escapeHtml(s.issue.where)}\`\n\n` +
+        `> ${escapeHtml(s.evidence).replace(/\n/g, "\n> ")}\n\n`,
+    );
+  });
+
+  const dropped = verdict.issues.length - confirmed.length;
+  stream.markdown(
+    dropped > 0
+      ? `_${confirmed.length} of ${verdict.issues.length} finding(s) confirmed; ${dropped} not drafted against. Re-run with \`force-fix-all\` to override._\n\n`
+      : `_All ${confirmed.length} finding(s) confirmed._\n\n`,
+  );
+  return confirmed;
+}
+
 function formatVerdictForRereview(v: Verdict): string {
   return v.issues
     .map(
@@ -1047,9 +1155,14 @@ function buildRereviewInput(args: {
   taskHeader: string;
   diffDescription: string;
   diffBody: string;
+  omittedFiles: number;
   priorVerdict: Verdict;
   fixProposal: string;
 }): string {
+  const scopeNote =
+    args.omittedFiles > 0
+      ? ` \u2014 scoped to the files your findings cited; ${args.omittedFiles} further changed file(s) are omitted and are not under review`
+      : "";
   return [
     "# Re-review: judge a proposed fix",
     "",
@@ -1066,7 +1179,7 @@ function buildRereviewInput(args: {
     "",
     args.taskHeader,
     "",
-    `# Branch diff — BEFORE state (${args.diffDescription})`,
+    `# Branch diff — BEFORE state (${args.diffDescription})${scopeNote}`,
     "",
     args.diffBody,
     "",
@@ -1384,6 +1497,7 @@ async function handleOpenSpecReview(
   if (codeIter > 0) {
     stream.button({ command: APPLY_COMMAND, title: "Apply the drafted edits", arguments: [] });
   }
+  await flushTranscript(stream, transcript);
   linkTranscript(stream, transcript.path);
   return {
     metadata: { outcome, command: "openspec-review", hasFixProposal: codeIter > 0, iterations: codeIter },
@@ -1415,12 +1529,6 @@ function nodeFsLike(): FsLike & { remove(p: string): Promise<void> } {
   };
 }
 
-interface Transcript {
-  path: string;
-  /** Queued append; never blocks the extension host. */
-  write(event: Record<string, unknown>): void;
-}
-
 /**
  * Open a run transcript, ensuring the directory ignores itself in git and
  * pruning older runs. Transcripts hold full source diffs, so leaving them
@@ -1444,22 +1552,27 @@ async function openTranscript(cfg: ResolvedConfig): Promise<Transcript> {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const file = path.join(dir, `${stamp}.jsonl`);
 
-  // Serialise appends behind a promise chain so events keep their order
-  // without blocking the extension host on synchronous I/O.
-  let queue: Promise<unknown> = fsp.writeFile(file, "", "utf8");
-  return {
-    path: file,
-    write(event) {
-      queue = queue
-        .then(() => fsp.appendFile(file, JSON.stringify(event) + "\n", "utf8"))
-        .catch(() => undefined);
-    },
-  };
+  return createTranscriptWriter(file, {
+    writeFile: (p, c) => fsp.writeFile(p, c, "utf8"),
+    appendFile: (p, c) => fsp.appendFile(p, c, "utf8"),
+  });
 }
 
 function linkTranscript(stream: vscode.ChatResponseStream, transcriptPath: string): void {
   const uri = vscode.Uri.file(transcriptPath);
   stream.markdown(`Transcript: [${path.basename(transcriptPath)}](${uri.toString()})\n`);
+}
+
+/** A transcript failure must not fail a review that produced a verdict. */
+async function flushTranscript(stream: vscode.ChatResponseStream, transcript: Transcript): Promise<void> {
+  try {
+    await transcript.flush();
+  } catch (err) {
+    stream.markdown(
+      `\u26a0\ufe0f Transcript may be incomplete: \`${(err as Error).message}\`. ` +
+        `\`/apply-review\` may not find this run.\n\n`,
+    );
+  }
 }
 
 function escapeHtml(s: string): string {
