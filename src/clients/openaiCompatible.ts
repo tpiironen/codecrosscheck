@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { z } from "zod";
 import {
   ReviewCancelledError,
@@ -10,46 +9,67 @@ import {
 import { ModelRefusalError, assertNotRefusal, assertNotOversized } from "./vscodeLm.js";
 import { explainFailure, satisfiesStrictMode, toProviderJsonSchema } from "./schemaText.js";
 
-const DEFAULT_ENDPOINT = "https://models.github.ai/inference/chat/completions";
+export const BASE_URL_ENV = "CODECROSSCHECK_BASE_URL";
+export const API_KEY_ENVS = ["CODECROSSCHECK_API_KEY", "OPENAI_API_KEY"] as const;
 
-export interface GithubModelsOptions {
+export interface OpenAiCompatibleOptions {
   modelId: string;
-  token?: string;
-  endpoint?: string;
+  /** API root, e.g. "https://api.openai.com/v1". `/chat/completions` is appended. */
+  baseUrl?: string;
+  apiKey?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
-/** Resolve a GitHub token from explicit option → GITHUB_TOKEN → `gh auth token`. */
-export function resolveGithubToken(explicit?: string): string | null {
-  if (explicit) return explicit;
-  const env = process.env.GITHUB_TOKEN;
-  if (env) return env;
-  try {
-    const r = spawnSync("gh", ["auth", "token"], { encoding: "utf8" });
-    if (r.status === 0) {
-      const t = r.stdout.trim();
-      if (t) return t;
-    }
-  } catch {
-    // gh not installed or not authenticated; fall through
+/**
+ * There is deliberately no default provider. The previous client hard-coded
+ * one, and when that service was retired every CLI invocation broke.
+ */
+export function resolveBaseUrl(explicit?: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  return explicit?.trim() || env[BASE_URL_ENV]?.trim() || null;
+}
+
+/** Optional by design: endpoints such as a local Ollama server take no key. */
+export function resolveApiKey(explicit?: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  if (explicit?.trim()) return explicit.trim();
+  for (const name of API_KEY_ENVS) {
+    const v = env[name]?.trim();
+    if (v) return v;
   }
   return null;
 }
 
-export class GithubModelsClient implements ChatClient {
-  readonly modelId: string;
-  private readonly token: string;
-  private readonly endpoint: string;
+export function chatCompletionsUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
+}
 
-  constructor(opts: GithubModelsOptions) {
-    this.modelId = opts.modelId;
-    this.endpoint = opts.endpoint ?? DEFAULT_ENDPOINT;
-    const token = resolveGithubToken(opts.token);
-    if (!token) {
+/** Adapter for any endpoint speaking the OpenAI `/chat/completions` protocol. */
+export class OpenAiCompatibleClient implements ChatClient {
+  readonly modelId: string;
+  readonly endpoint: string;
+  private readonly apiKey: string | null;
+
+  constructor(opts: OpenAiCompatibleOptions) {
+    const env = opts.env ?? process.env;
+    const baseUrl = resolveBaseUrl(opts.baseUrl, env);
+    if (!baseUrl) {
       throw new Error(
-        "No GitHub token available. Set GITHUB_TOKEN or run `gh auth login` first. The token needs the 'models:read' scope.",
+        `No model endpoint configured. Set ${BASE_URL_ENV} (or pass --base-url) to an ` +
+          `OpenAI-compatible API root, e.g. "https://api.openai.com/v1", an Azure AI Foundry ` +
+          `deployment URL, or "http://localhost:11434/v1" for a local server. ` +
+          `Authentication is optional: set ${API_KEY_ENVS.join(" or ")} if your endpoint needs one.`,
       );
     }
-    this.token = token;
+    this.modelId = opts.modelId;
+    this.endpoint = chatCompletionsUrl(baseUrl);
+    this.apiKey = resolveApiKey(opts.apiKey, env);
+  }
+
+  private headers(): Record<string, string> {
+    const h: Record<string, string> = { "content-type": "application/json" };
+    // Omit rather than send an empty credential, so keyless endpoints work.
+    if (this.apiKey) h.authorization = `Bearer ${this.apiKey}`;
+    return h;
   }
 
   private async post(body: unknown, signal: AbortSignal | undefined): Promise<string> {
@@ -58,10 +78,7 @@ export class GithubModelsClient implements ChatClient {
     try {
       res = await fetch(this.endpoint, {
         method: "POST",
-        headers: {
-          authorization: `Bearer ${this.token}`,
-          "content-type": "application/json",
-        },
+        headers: this.headers(),
         body: JSON.stringify(body),
         signal,
       });
@@ -70,12 +87,12 @@ export class GithubModelsClient implements ChatClient {
       throw err;
     }
     if (!res.ok) {
-      throw new Error(`GitHub Models request failed (${res.status}): ${await res.text()}`);
+      throw new Error(`Model request to ${this.endpoint} failed (${res.status}): ${await res.text()}`);
     }
     const parsed = (await res.json()) as { choices?: { message?: { content?: string } }[] };
     const content = parsed.choices?.[0]?.message?.content;
     if (!content) {
-      throw new Error("GitHub Models response did not contain message content.");
+      throw new Error(`Response from ${this.endpoint} did not contain message content.`);
     }
     return content;
   }

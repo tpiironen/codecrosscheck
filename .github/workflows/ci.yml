@@ -79,5 +79,6 @@ jobs:
       - name: Run planted-flaw corpus
         env:
           RUN_LIVE_TESTS: "1"
-          GITHUB_TOKEN: ${{ secrets.MODELS_TOKEN }}
+          CODECROSSCHECK_BASE_URL: ${{ vars.CCC_BASE_URL }}
+          CODECROSSCHECK_API_KEY: ${{ secrets.CCC_API_KEY }}
         run: npm run test:corpus

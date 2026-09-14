@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 /**
  * Self-test: runs the built CLI in PLAN-only mode against a small synthetic
- * task. Exercises CLI entry point, token resolution (GITHUB_TOKEN or `gh
- * auth token`), worker -> reviewer loop, JSON verdict parsing, JSONL
- * transcript, and process lifecycle / undici cleanup.
+ * task. Exercises CLI entry point, endpoint resolution, worker -> reviewer
+ * loop, JSON verdict parsing, JSONL transcript, and process lifecycle.
  *
  * This selftest does NOT exercise `--openspec` mode (loader, diff,
  * change-frame injection, validator pre-gate). For that, run
  * `npm run selftest:openspec`, which targets the small `add-sha256-cli`
- * fixture change that fits inside free-tier token budgets.
+ * fixture change.
  *
- *   GITHUB_TOKEN=ghp_xxx npm run selftest
+ *   CODECROSSCHECK_BASE_URL=https://api.openai.com/v1 npm run selftest
  *
- * Exits 0 iff the plan stage was approved within --max-iters.
+ * Skips (exit 0) when no endpoint is configured; exits 0 iff the plan stage
+ * was approved within --max-iters.
  */
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -22,17 +22,12 @@ import { fileURLToPath } from "node:url";
 const CHANGE_ID = "add-codecrosscheck";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-function hasToken() {
-  if (process.env.GITHUB_TOKEN) return true;
-  const r = spawnSync("gh", ["auth", "token"], { encoding: "utf8" });
-  return r.status === 0 && r.stdout.trim().length > 0;
-}
-
-if (!hasToken()) {
-  console.error(
-    "selftest: no GitHub token available. Set GITHUB_TOKEN or run `gh auth login` first.",
+if (!process.env.CODECROSSCHECK_BASE_URL) {
+  console.log(
+    "selftest: skipped — CODECROSSCHECK_BASE_URL is not set. " +
+      "Point it at an OpenAI-compatible API root to run this live harness.",
   );
-  process.exit(2);
+  process.exit(0);
 }
 
 const cliPath = path.join(repoRoot, "dist", "cli.js");

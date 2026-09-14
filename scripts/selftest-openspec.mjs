@@ -6,9 +6,10 @@
  * `openspec validate --strict` pre-gate, worker, reviewer, and JSONL
  * transcript on a target we have ground truth for.
  *
- *   GITHUB_TOKEN=ghp_xxx npm run selftest:openspec
+ *   CODECROSSCHECK_BASE_URL=https://api.openai.com/v1 npm run selftest:openspec
  *
- * Exits 0 iff the plan stage was approved within --max-iters.
+ * Skips (exit 0) when no endpoint is configured; exits 0 iff the plan stage
+ * was approved within --max-iters.
  */
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -18,17 +19,12 @@ import { fileURLToPath } from "node:url";
 const CHANGE_ID = "add-sha256-cli";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-function hasToken() {
-  if (process.env.GITHUB_TOKEN) return true;
-  const r = spawnSync("gh", ["auth", "token"], { encoding: "utf8" });
-  return r.status === 0 && r.stdout.trim().length > 0;
-}
-
-if (!hasToken()) {
-  console.error(
-    "selftest:openspec: no GitHub token available. Set GITHUB_TOKEN or run `gh auth login` first.",
+if (!process.env.CODECROSSCHECK_BASE_URL) {
+  console.log(
+    "selftest:openspec: skipped — CODECROSSCHECK_BASE_URL is not set. " +
+      "Point it at an OpenAI-compatible API root to run this live harness.",
   );
-  process.exit(2);
+  process.exit(0);
 }
 
 const cliPath = path.join(repoRoot, "dist", "cli.js");

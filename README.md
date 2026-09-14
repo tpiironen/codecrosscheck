@@ -74,11 +74,16 @@ works from anywhere too.
 ## CLI usage
 
 ```bash
-# Default plan→code→execute loop, GitHub Models endpoint
-GITHUB_TOKEN=ghp_xxx codecrosscheck "write a script that prints the SHA-256 of stdin"
+# Point at any OpenAI-compatible endpoint, then run the default loop
+export CODECROSSCHECK_BASE_URL=https://api.openai.com/v1
+export CODECROSSCHECK_API_KEY=sk-xxx
+codecrosscheck "write a script that prints the SHA-256 of stdin"
 
 # Run a single stage with a custom reviewer
 ccc "draft a migration plan" --stages plan --reviewer-model anthropic/claude-opus-5
+
+# A local server needs no key
+ccc "…" --base-url http://localhost:11434/v1
 
 # OpenSpec mode — reviewer is pre-gated by `openspec validate --strict`
 ccc "implement add-foo" --openspec add-foo
@@ -90,9 +95,9 @@ ccc "implement add-foo" --openspec add-foo
 |---|---|---|
 | `--stages` | `plan,code,execute` | Comma-separated subset |
 | `--max-iters` | `6` | Per-stage iteration budget |
-| `--worker-model` | `anthropic/claude-opus-5` | GitHub Models id |
+| `--worker-model` | `anthropic/claude-opus-5` | Model id as your endpoint names it |
 | `--reviewer-model` | `openai/gpt-5.3-codex` | Different vendor from the worker, for cross-vendor review |
-| `--allow-network` | off | EXECUTE sandbox network access |
+| `--base-url <url>` | `$CODECROSSCHECK_BASE_URL` | OpenAI-compatible API root |
 | `--timeout-ms` | `30000` | Sandbox per-run timeout |
 | `--openspec <id>` | — | Inject change frame + validator pre-gate |
 | `--diff` | off | Append current branch diff (vs `origin/main` merge-base) to the task prompt |
@@ -100,7 +105,16 @@ ccc "implement add-foo" --openspec add-foo
 
 ### Environment
 
-- `GITHUB_TOKEN` — required for the GitHub Models endpoint, scope `models:read`.
+The CLI has **no default provider** — you supply the endpoint.
+
+- `CODECROSSCHECK_BASE_URL` — required. An OpenAI-compatible API root, e.g.
+  `https://api.openai.com/v1`, an Azure AI Foundry deployment URL, or
+  `http://localhost:11434/v1` for Ollama. `/chat/completions` is appended.
+- `CODECROSSCHECK_API_KEY`, or `OPENAI_API_KEY` — **optional**. When neither is
+  set the `Authorization` header is omitted, so keyless local servers work.
+
+The VS Code extension does not use these; it runs on the Copilot models exposed
+through `vscode.lm`.
 
 ### Transcripts
 
@@ -223,8 +237,8 @@ nvm use            # Node 20
 npm install
 npm run build      # tsc + copy prompts + skills
 npm test           # vitest, no network
-RUN_LIVE_TESTS=1 npm test    # opt-in live integration via GITHUB_TOKEN
-npm run selftest             # end-to-end PLAN→CODE→EXECUTE against GitHub Models
+RUN_LIVE_TESTS=1 npm test    # opt-in live integration; needs CODECROSSCHECK_BASE_URL
+npm run selftest             # end-to-end PLAN→CODE→EXECUTE; skips without an endpoint
 npm run selftest:openspec    # end-to-end with --openspec add-sha256-cli fixture
 ```
 
@@ -242,7 +256,7 @@ src/
   schemas.ts           # zod Issue / Verdict / Stage
   clients/
     ChatClient.ts          # interface
-    githubModels.ts        # CLI client (global fetch + json_schema)
+    openaiCompatible.ts    # CLI client (global fetch + json_schema)
     vscodeLm.ts            # extension client (vscode.lm + extractJson)
   openspec/
     loader.ts              # findOpenSpecRoot / loadChange / renderChangeFrame

@@ -19,7 +19,7 @@ The same engine ships as both a Node CLI (`codecrosscheck`, alias `ccc`) and a V
 ## Models
 
 - **In-editor**: VS Code Language Model API (`vscode.lm`) — uses Copilot-tier models with no extra API keys.
-- **CLI**: GitHub Models OpenAI-compatible endpoint at `https://models.github.ai/inference`, auth via `GITHUB_TOKEN` with `models:read` scope.
+- **CLI**: any OpenAI-compatible `/chat/completions` endpoint. The API root comes from `CODECROSSCHECK_BASE_URL` (or `--base-url`); there is no default provider. Auth is optional via `CODECROSSCHECK_API_KEY` / `OPENAI_API_KEY`.
 - **Default model pair**: worker `anthropic/claude-opus-5`, reviewer `openai/gpt-5.3-codex`. Cross-vendor by design.
 - **Model selection (extension)**: `workerModel` and `reviewerModel` are
   free-text settings. The **CodeCrossCheck: Pick Worker and Reviewer Models**

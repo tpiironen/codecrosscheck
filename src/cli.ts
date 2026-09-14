@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { GithubModelsClient } from "./clients/githubModels.js";
+import { OpenAiCompatibleClient } from "./clients/openaiCompatible.js";
 import { runPipeline, type PipelineEvent } from "./pipeline.js";
 import { loadChange, renderChangeFrame } from "./openspec/loader.js";
 import { validateStrict } from "./openspec/validate.js";
@@ -18,8 +18,12 @@ program
   .argument("<task>", "The task description")
   .option("--stages <list>", "Comma-separated stages: plan,code,execute", "plan,code,execute")
   .option("--max-iters <n>", "Maximum loop iterations per stage", "3")
-  .option("--worker-model <id>", "Worker model id (GitHub Models)", "anthropic/claude-opus-5")
-  .option("--reviewer-model <id>", "Reviewer model id (GitHub Models)", "openai/gpt-5.3-codex")
+  .option("--worker-model <id>", "Worker model id", "anthropic/claude-opus-5")
+  .option("--reviewer-model <id>", "Reviewer model id", "openai/gpt-5.3-codex")
+  .option(
+    "--base-url <url>",
+    "OpenAI-compatible API root (default: $CODECROSSCHECK_BASE_URL), e.g. https://api.openai.com/v1",
+  )
   .option("--timeout-ms <n>", "Sandbox timeout in milliseconds", "30000")
   .option("--openspec <changeId>", "Run with OpenSpec change frame and validator pre-gate")
   .option("--diff", "Append the current branch diff to the task prompt", false)
@@ -31,8 +35,9 @@ program
       .map((s) => s.trim())
       .filter(Boolean) as Stage[];
 
-    const workerClient = new GithubModelsClient({ modelId: String(opts.workerModel) });
-    const reviewerClient = new GithubModelsClient({ modelId: String(opts.reviewerModel) });
+    const baseUrl = typeof opts.baseUrl === "string" ? opts.baseUrl : undefined;
+    const workerClient = new OpenAiCompatibleClient({ modelId: String(opts.workerModel), baseUrl });
+    const reviewerClient = new OpenAiCompatibleClient({ modelId: String(opts.reviewerModel), baseUrl });
 
     const transcriptPath = openTranscript();
     const writeEvent = (event: Record<string, unknown>) => {
