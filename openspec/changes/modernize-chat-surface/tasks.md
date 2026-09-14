@@ -42,6 +42,12 @@
        available at the declared `^1.93.0` floor, so raising it would only
        shrink the supported range for no gain. The bump belongs with
        `replace-context-harvest-with-tools`, which needs the tool-calling API.
+       **CORRECTION (2026-09-14, see `pin-vscode-api-floor`): this outcome was
+       wrong.** The list above is accurate but omits `ChatRequest.model`, which
+       this same change introduced and which only exists from VS Code 1.95.0.
+       The floor is now `^1.95.0`. The check was done by reading an API list
+       instead of compiling against the pinned floor, which is why it missed a
+       call site in its own diff.
 - [x] E2. Return `ChatResult` with `metadata` and `errorDetails` from every
        handler.
 - [x] E3. Register a followup provider (apply, force-fix-all, raise cap).
