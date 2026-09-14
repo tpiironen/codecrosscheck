@@ -20,8 +20,11 @@
   ],
   "scripts": {
     "build": "tsc && node scripts/copy-assets.mjs && node scripts/bundle-extension.mjs",
+    "lint": "eslint src test scripts eslint.config.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run",
-    "verify": "npm ci && npm run build && npm test",
+    "test:corpus": "vitest run test/corpus.test.ts",
+    "verify": "npm ci && npm run lint && npm run typecheck && npm run build && npm test",
     "selftest": "npm run build && node scripts/selftest.mjs",
     "selftest:openspec": "npm run build && node scripts/selftest-openspec.mjs",
     "publish:npm": "npm publish",
@@ -29,18 +32,19 @@
     "release": "node scripts/release.mjs"
   },
   "dependencies": {
-    "commander": "^12.1.0",
-    "undici": "^6.19.8",
-    "zod": "^3.23.8",
-    "zod-to-json-schema": "^3.23.5"
+    "commander": "^15.0.0",
+    "zod": "^4.6.2"
   },
   "devDependencies": {
-    "@types/node": "^20.14.0",
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^22.20.2",
     "@types/vscode": "^1.93.0",
-    "@vscode/vsce": "^3.1.0",
-    "esbuild": "^0.28.0",
-    "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
+    "eslint": "^9.39.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^5.0.0"
   },
   "peerDependencies": {
     "vscode": "^1.93.0"
@@ -84,8 +88,15 @@
     "onChatParticipant:codecrosscheck",
     "onCommand:codecrosscheck.reviewSelection",
     "onCommand:codecrosscheck.reviewActiveFile",
-    "onCommand:codecrosscheck.installSkill"
+    "onCommand:codecrosscheck.installSkill",
+    "onCommand:codecrosscheck.pickModels"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "CodeCrossCheck runs configured build and test commands, executes model-authored code in the EXECUTE sandbox, and writes model-proposed edits into the workspace. All three require trust in the workspace contents."
+    }
+  },
   "contributes": {
     "chatParticipants": [
       {
@@ -150,6 +161,10 @@
       {
         "command": "codecrosscheck.installSkill",
         "title": "CodeCrossCheck: Install Delegation Skill"
+      },
+      {
+        "command": "codecrosscheck.pickModels",
+        "title": "CodeCrossCheck: Pick Worker and Reviewer Models"
       }
     ],
     "configuration": {
@@ -157,57 +172,25 @@
       "properties": {
         "codecrosscheck.workerModel": {
           "type": "string",
-          "default": "openai/gpt-5.4",
-          "enum": [
-            "anthropic/claude-opus-4.6",
-            "anthropic/claude-opus-4.7",
-            "anthropic/claude-sonnet-4.6",
-            "anthropic/claude-sonnet-4.5",
-            "anthropic/claude-haiku-4.5",
-            "openai/gpt-5.5",
-            "openai/gpt-5.4",
-            "openai/gpt-5.4-mini",
-            "openai/gpt-5.3-codex",
-            "openai/gpt-5.2",
-            "openai/gpt-4.1",
-            "openai/gpt-4o",
-            "google/gemini-3.1-pro",
-            "google/gemini-3-flash",
-            "xai/grok-code-fast-1"
-          ],
-          "description": "Model family used by the worker (the producing LLM)."
+          "default": "anthropic/claude-opus-5",
+          "description": "Model family used by the worker (the producing LLM), e.g. 'anthropic/claude-opus-5'. Only used as a fallback when codecrosscheck.useChatPickerWorker is false or the Copilot Chat picker supplies no model. Run 'CodeCrossCheck: Pick Worker and Reviewer Models' to choose from the families this VS Code session can actually reach."
         },
         "codecrosscheck.reviewerModel": {
           "type": "string",
-          "default": "anthropic/claude-opus-4.6",
-          "enum": [
-            "anthropic/claude-opus-4.6",
-            "anthropic/claude-opus-4.7",
-            "anthropic/claude-sonnet-4.6",
-            "anthropic/claude-sonnet-4.5",
-            "anthropic/claude-haiku-4.5",
-            "openai/gpt-5.5",
-            "openai/gpt-5.4",
-            "openai/gpt-5.4-mini",
-            "openai/gpt-5.3-codex",
-            "openai/gpt-5.2",
-            "openai/gpt-4.1",
-            "openai/gpt-4o",
-            "google/gemini-3.1-pro",
-            "google/gemini-3-flash",
-            "xai/grok-code-fast-1"
-          ],
+          "default": "openai/gpt-5.3-codex",
           "description": "Model family used by the reviewer (the judging LLM). Should differ from the worker for cross-vendor review."
         },
         "codecrosscheck.workerModelOverride": {
           "type": "string",
           "default": "",
-          "description": "Free-text model family override for the worker. If non-empty, takes precedence over the workerModel dropdown (e.g. 'openai/gpt-6' or 'anthropic/claude-opus-5')."
+          "deprecationMessage": "Deprecated: codecrosscheck.workerModel is now free text. Set it directly. This setting is still honoured and still takes precedence.",
+          "description": "Deprecated. Free-text model family override for the worker."
         },
         "codecrosscheck.reviewerModelOverride": {
           "type": "string",
           "default": "",
-          "description": "Free-text model family override for the reviewer. If non-empty, takes precedence over the reviewerModel dropdown."
+          "deprecationMessage": "Deprecated: codecrosscheck.reviewerModel is now free text. Set it directly. This setting is still honoured and still takes precedence.",
+          "description": "Deprecated. Free-text model family override for the reviewer."
         },
         "codecrosscheck.useChatPickerWorker": {
           "type": "boolean",
@@ -222,29 +205,32 @@
         },
         "codecrosscheck.reviewBranch.maxDiffChars": {
           "type": "integer",
-          "default": 200000,
+          "default": 1100000,
           "minimum": 0,
-          "description": "Hard char-budget cap for /review-branch. If the assembled branch diff exceeds this many characters, the command aborts with guidance to pass a closer diff-base or split the branch, instead of letting the reviewer LM return 'Message exceeds token limit'. Set to 0 to disable the guard."
+          "description": "Hard char-budget cap for /review-branch, counting the branch diff plus any files attached to the request. If the assembled prompt exceeds this many characters, the command aborts with guidance to pass a closer diff-base or split the branch, instead of letting the reviewer LM return 'Message exceeds token limit'. Set to 0 to disable the guard."
+        },
+        "codecrosscheck.reviewBranch.keepTranscripts": {
+          "type": "integer",
+          "default": 50,
+          "minimum": 0,
+          "description": "How many run transcripts to retain in .codecrosscheck/runs. Older transcripts are deleted on each run. Transcripts contain full source diffs, so this bounds both disk use and how much source history is left lying in the workspace."
         },
         "codecrosscheck.execute.timeoutMs": {
           "type": "integer",
           "default": 30000,
-          "description": "Hard timeout (milliseconds) for sandboxed code execution."
-        },
-        "codecrosscheck.execute.allowNetwork": {
-          "type": "boolean",
-          "default": false,
-          "description": "If true, sandboxed execution may access the network. Best-effort only — not adversarial-grade."
+          "description": "Hard timeout (milliseconds) for sandboxed code execution. Note: the sandbox isolates only the working directory and environment — generated code runs with your filesystem privileges and unrestricted network access."
         },
         "codecrosscheck.applyReview.testCommand": {
           "type": "string",
           "default": "",
-          "description": "Optional shell command run in a dedicated VS Code terminal after /apply-review writes edits (e.g. 'npm test'). Empty disables the test step."
+          "scope": "machine",
+          "description": "Optional shell command run in a dedicated VS Code terminal after /apply-review writes edits (e.g. 'npm test'). Empty disables the test step. Machine-scoped: a workspace cannot set this, and it runs only in a trusted workspace."
         },
         "codecrosscheck.applyReview.buildCommand": {
           "type": "string",
           "default": "",
-          "description": "Optional shell command run synchronously after /apply-review writes edits (e.g. 'dotnet build -nologo' or 'npm run build'). Unlike testCommand, the result is captured: exit code and tail of output are surfaced in chat, and a non-zero exit code is reported as a build-gate failure so /review-branch can be re-run with the build error as input. Empty disables the gate."
+          "scope": "machine",
+          "description": "Optional shell command run synchronously after /apply-review writes edits (e.g. 'dotnet build -nologo' or 'npm run build'). Unlike testCommand, the result is captured: exit code and tail of output are surfaced in chat, and a non-zero exit code is reported as a build-gate failure so /review-branch can be re-run with the build error as input. Empty disables the gate. Machine-scoped: a workspace cannot set this, and it runs only in a trusted workspace."
         },
         "codecrosscheck.applyReview.buildTimeoutMs": {
           "type": "integer",

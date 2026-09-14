@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly reviewer-corpus run; prompt regressions are otherwise uncaught.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 jobs:
   build-test:
@@ -26,8 +30,54 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck (src and test)
+        run: npm run typecheck
+
       - name: Build
         run: npm run build
 
       - name: Test
         run: npm test
+
+      # The bundle smoke test guards a dependency-inlining regression, but the
+      # failure it was written for was a packaging failure. Exercise packaging.
+      - name: Package VSIX
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          npx vsce package --allow-missing-repository
+          --baseContentUrl https://example.invalid/
+          --baseImagesUrl https://example.invalid/
+          --out codecrosscheck-ci.vsix
+
+      - name: Upload VSIX
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codecrosscheck-vsix
+          path: codecrosscheck-ci.vsix
+
+  corpus:
+    name: Reviewer corpus (live models)
+    # Only on a schedule or by hand: it spends model tokens and needs a secret.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run planted-flaw corpus
+        env:
+          RUN_LIVE_TESTS: "1"
+          GITHUB_TOKEN: ${{ secrets.MODELS_TOKEN }}
+        run: npm run test:corpus
