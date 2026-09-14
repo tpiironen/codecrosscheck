@@ -13,7 +13,153 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
-_No unreleased changes — promote the next batch of work here as it lands._
+OpenSpec changes:
+[`fix-edit-application-and-verdict-honesty`](openspec/changes/fix-edit-application-and-verdict-honesty/proposal.md),
+[`harden-trust-and-sandbox`](openspec/changes/harden-trust-and-sandbox/proposal.md),
+[`add-cancellation-and-worktree-diff`](openspec/changes/add-cancellation-and-worktree-diff/proposal.md),
+[`modernize-chat-surface`](openspec/changes/modernize-chat-surface/proposal.md),
+[`modernize-toolchain`](openspec/changes/modernize-toolchain/proposal.md),
+[`update-default-model-pair`](openspec/changes/update-default-model-pair/proposal.md),
+[`raise-review-branch-diff-budget`](openspec/changes/raise-review-branch-diff-budget/proposal.md).
+
+### Changed
+
+- **`codecrosscheck.reviewBranch.maxDiffChars` now defaults to `1100000`**
+  (was `200000`). The old cap aborted `/review-branch` on ordinary working
+  trees before any model call — a 65-file change set on this repository
+  measures over 500,000 chars — so the first thing a user had to do was find
+  and raise the setting. The char cap was always a cheap pre-filter; the
+  accurate gate is the token preflight that follows it, which asks the
+  reviewer model for its own `maxInputTokens`. Note the trade-off: at this
+  size the cap no longer catches anything the preflight would not, and the
+  preflight is best-effort — it permits the call when a model reports no
+  `maxInputTokens`. Lower the setting to restore the stricter behaviour.
+
+- **Default model pair is now worker `anthropic/claude-opus-5`, reviewer
+  `openai/gpt-5.3-codex`** (was worker `openai/gpt-5.4`, reviewer
+  `anthropic/claude-opus-4.6`). The pair remains cross-vendor; the direction
+  flips, so the OpenAI model is now the judge. Note that
+  `codecrosscheck.useChatPickerWorker` defaults to `true`, so in the chat
+  participant the worker follows the Copilot Chat picker and
+  `codecrosscheck.workerModel` only applies as a fallback. The reviewer is
+  always taken from `codecrosscheck.reviewerModel`.
+
+### Fixed
+
+- **The CLI shipped a same-model pair.** `--worker-model` and
+  `--reviewer-model` both defaulted to `openai/gpt-5.4`, so a plain
+  `codecrosscheck "..."` invocation ran the worker and the reviewer on one
+  model — defeating the cross-vendor premise and contradicting the `chat-loop`
+  requirement that the reviewer default not share the worker's family. The two
+  flags now default to different vendors. This restores spec conformance but
+  does not make the CLI usable: its backend, GitHub Models, was retired by
+  GitHub on 2026-07-30 and the endpoint returns HTTP 410.
+
+- **`/apply-review` corrupted any replacement containing `$&`, `` $` ``, `$'`
+  or `$$`.** `applyEdit` wrote the new content with
+  `original.replace(matchedOld, repairedNew)`; `String.prototype.replace` runs
+  `GetSubstitution` on the replacement even for a string search value, so those
+  patterns were expanded instead of written literally — and the edit was still
+  reported as `applied`. Replacements are now spliced by index. Common triggers
+  were Makefile/shell `$$`, bash `$'…'`, and source that itself calls
+  `.replace(…, "$&")`.
+- **`/review-branch` claimed the reviewer approved when it had not.** When the
+  worker rebutted every outstanding finding, `filterRejectedIssues` flipped the
+  verdict to `approve` and the summary printed "Approved — reviewer is
+  satisfied". The reviewer never approved; the worker suppressed the findings.
+  There is now an explicit outcome (`approved`, `rebutted`, `exhausted`,
+  `cancelled`, `failed`), and `rebutted` is rendered as a stalled disagreement
+  pointing at the rebuttal list.
+- **`/review-branch` did not review uncommitted work.** `getChangeDiff` ran
+  `git diff <base>...HEAD`, so staged and unstaged edits were invisible even
+  though the documented workflow says to review the working tree. The default
+  comparison now includes the working tree; pass `committed-only` for the old
+  behaviour. Untracked files stay excluded. The chat header now names the
+  comparison that was made.
+- **Stopping a chat response did not stop the loop.** The request
+  `CancellationToken` was discarded and `VscodeLmClient` created a token source
+  nobody could trigger and nobody disposed. Cancellation is now threaded
+  through the clients, `reviewLoop` and `runPipeline`.
+- The structured-output retry now shows the model its own failed response and
+  the validation error. The previous reminder named a schema without stating
+  it, and fell back to the sentence "the previously stated structured-verdict
+  schema" for every schema in the codebase.
+- Transcript discovery matched the substring `"review-branch-done"` anywhere in
+  a file, so a stored worker artifact quoting the event name read as a
+  completed run. It now matches a parsed terminating event near the tail.
+- Files attached to a chat request were silently discarded; they are now read
+  into the prompt, listed in the response, and counted against the diff budget.
+
+### Security
+
+- `codecrosscheck.applyReview.buildCommand` and `.testCommand` are now
+  `scope: "machine"`. They previously had no scope, so a repository's
+  `.vscode/settings.json` could choose the command `/apply-review` executes.
+- The manifest now declares `capabilities.untrustedWorkspaces` explicitly
+  instead of relying on the absence of the field, and `/apply-review` refuses
+  to run build or test commands unless the workspace is trusted.
+- `.codecrosscheck/` now self-ignores in git on creation, and transcripts are
+  pruned to `codecrosscheck.reviewBranch.keepTranscripts` (default 50).
+  Transcripts contain full source diffs.
+- The verdict webview declares `localResourceRoots: []` and a
+  `default-src 'none'` Content Security Policy.
+
+### Changed
+
+- **`/apply-review` applies its batch through `vscode.workspace.applyEdit`**, so
+  a run is a single undo step and files with unsaved changes are edited in the
+  document rather than overwritten on disk. Edits are also computed in full
+  before anything is written, so a mid-batch failure leaves the tree untouched.
+- **Worker prompts no longer use a `{"artifact": "…"}` JSON envelope.** Workers
+  produce documents and now reply with plain text; reviewers remain structured
+  and zod-validated.
+- **The CODE reviewer checklist moved from OWASP Top 10:2021 to Top 10:2025**
+  (verified against owasp.org — 2021 is now listed as a previous version). A03
+  is Software Supply Chain Failures, A10 is Mishandling of Exceptional
+  Conditions, and SSRF is no longer a standalone category, so an explicit note
+  keeps it covered. The edition is read back out of the prompt and recorded in
+  the transcript, so a past review can be audited against the list that was
+  actually applied.
+- All settings are resolved through `src/config.ts` with one declared default
+  each, asserted against the manifest by `test/config.test.ts`. This fixes the
+  reviewer default falling back to the worker's vendor in `/review-branch` and
+  the `maxIters` default disagreeing across manifest, code, CLI and docs.
+- `codecrosscheck.workerModel` / `reviewerModel` are free text instead of a
+  hand-maintained enum of 15 families. New command **CodeCrossCheck: Pick
+  Worker and Reviewer Models** lists what `vscode.lm` actually offers.
+  `workerModelOverride` / `reviewerModelOverride` are deprecated but honoured.
+- Chat handlers return a `ChatResult` with `errorDetails`, offer followups, and
+  expose the recommended next step as a button.
+- Compiler strictness raised (`noUncheckedIndexedAccess`, `noUnusedLocals`,
+  `noUnusedParameters`, `noImplicitOverride`,
+  `noFallthroughCasesInSwitch`); the four `void x;` suppression statements are
+  gone, and `test/hygiene.test.ts` keeps them gone.
+
+### Added
+
+- ESLint with `typescript-eslint` (`npm run lint`) and a type-check gate that
+  covers `test/` for the first time (`npm run typecheck`). CI runs both, and
+  now also packages a VSIX.
+- The planted-flaw reviewer corpus runs as a scheduled/dispatchable CI job, and
+  states its reason when skipped instead of looking like a passing gate.
+- `codecrosscheck.reviewBranch.keepTranscripts` setting.
+
+### Removed
+
+- **`codecrosscheck.execute.allowNetwork` and the CLI `--allow-network` flag.**
+  The option was implemented as `NO_PROXY=*`, which tells clients to *bypass* a
+  proxy and denies nothing. Rather than keep a control that does not work, it
+  is removed and the sandbox's actual containment (temp cwd, allowlisted
+  environment, hard timeout) is documented plainly.
+- Dependencies `undici` and `zod-to-json-schema`. zod 4 generates JSON Schema
+  natively and Node 20 has a global `fetch`; dropping `undici` also removed the
+  `closeUndici()` libuv shutdown workaround in the CLI.
+
+### Notes
+
+- `typescript` stays on `^5.9.3`: `typescript-eslint` does not support TS 7.0
+  ([typescript-eslint#10940](https://github.com/typescript-eslint/typescript-eslint/issues/10940)).
+  See the deferral note in the `modernize-toolchain` proposal.
 
 ## [0.4.0] — 2026-05-29
 

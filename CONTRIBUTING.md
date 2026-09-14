@@ -7,22 +7,39 @@ auditable — please keep changes focused.
 
 ```powershell
 npm ci
+npm run lint
+npm run typecheck
 npm run build
 npm test
 ```
+
+`npm run verify` runs all of the above from a clean install.
 
 - **Node**: 20+
 - **VS Code**: 1.93+ (only needed for extension work)
 - Press **F5** in VS Code to launch an Extension Development Host with
   the chat participant loaded.
 
+### Gates
+
+| Command | What it covers |
+|---|---|
+| `npm run lint` | ESLint + `typescript-eslint` over `src/`, `test/`, `scripts/` |
+| `npm run typecheck` | `src/` **and** `test/` — tests were previously never type-checked |
+| `npm test` | Vitest unit suite |
+| `npm run test:corpus` | Planted-flaw reviewer corpus. Needs `RUN_LIVE_TESTS=1` and a `GITHUB_TOKEN` with `models:read`; it spends model tokens, so CI runs it nightly rather than per-PR |
+
+`typescript` is pinned to `^5.9` on purpose: `typescript-eslint` does not
+support TS 7.0 yet. Do not bump it until that lands, or the lint gate stops
+working.
+
 ## Workflow
 
 1. Fork the repo and create a topic branch off `main`.
 2. Make your change. Keep diffs focused — see the dogfood rule below.
-3. Run `npm run build && npm test` locally.
-4. Open a PR against `main`. The CI workflow runs build + tests on
-   Windows and Linux.
+3. Run `npm run verify` locally.
+4. Open a PR against `main`. CI runs lint, typecheck, build, tests, and
+   VSIX packaging on Windows and Linux.
 5. Reviewers may run `@codecrosscheck /review-branch` against your PR
    diff (see below).
 

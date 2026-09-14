@@ -40,7 +40,7 @@ flowchart TB
 
   subgraph Adapters["ChatClient adapters"]
     IFACE["src/clients/ChatClient.ts<br/>sendStructured&lt;T&gt;"]
-    GH["src/clients/githubModels.ts<br/>undici + json_schema strict"]
+    GH["src/clients/githubModels.ts<br/>global fetch + json_schema"]
     VLM["src/clients/vscodeLm.ts<br/>vscode.lm + extractJson"]
   end
 
@@ -146,10 +146,13 @@ Key behaviours encoded in [src/loop.ts](../src/loop.ts):
   blocks and rethrown as a typed `OversizedPromptError` *without*
   triggering the schema-reminder retry. `/review-branch` adds two
   upstream guards: a hard char-budget cap
-  (`codecrosscheck.reviewBranch.maxDiffChars`, default 200 KB) and a
+  (`codecrosscheck.reviewBranch.maxDiffChars`, default 1.1 M chars) and a
   best-effort `countTokens` preflight against the reviewer model's
-  `maxInputTokens` (with a 10% response reserve). See OpenSpec change
-  `guard-oversized-review-prompts`.
+  `maxInputTokens` (with a 10% response reserve). The cap now sits above
+  every reachable model's context window, so the preflight is normally the
+  gate that fires; the cap still covers models reporting no
+  `maxInputTokens`. See OpenSpec changes
+  `guard-oversized-review-prompts` and `raise-review-branch-diff-budget`.
 - **Revision prompts include structured issues, not raw reviewer prose.**
   `buildRevisionInput` formats `severity / where / why / suggestion` so the
   worker sees machine-actionable feedback.
@@ -180,6 +183,33 @@ flowchart LR
   expected stdout markers, suspicious stderr signals.
 
 `opts.stages` lets callers run a subset (`--stages plan` or `/plan`).
+
+### 4.1 How a `/review-branch` dialogue ends
+
+`/review-branch` does not use `runPipeline`; it drives its own
+reviewer→worker→reviewer dialogue and classifies the ending into exactly one
+`ReviewOutcome`. The distinction matters because two of these look like
+success and only one is:
+
+| Outcome | Meaning | Rendered as |
+|---|---|---|
+| `approved` | The reviewer returned `verdict: "approve"` on its own. | ✅ Approved |
+| `rebutted` | Every outstanding finding matched a fingerprint the worker had rebutted with `**Fix:** Disagree:`, so the filter emptied the list. **The reviewer never approved.** | 🤝 Stalled on disagreement, with the rebuttals listed for the user to adjudicate |
+| `exhausted` | `maxIters` reached with findings still open. | ⚠️ Did not converge |
+| `cancelled` | The request's `CancellationToken` fired. | ⏹️ Cancelled |
+| `failed` | Diff could not be computed, budget exceeded, or a model call failed. | ❌ with `ChatResult.errorDetails` |
+
+`rebutted` exists because of a real defect: `filterRejectedIssues` used to flip
+the verdict to `approve` when suppression emptied the issue list, and the
+summary then printed "Approved — reviewer is satisfied". That let the *worker*
+self-certify by disagreeing, in a tool whose entire premise is that a second
+model judges the first. The helper is now side-effect free and reports
+`emptiedBySuppression`; the handler decides the outcome and the renderer never
+shows an approval the reviewer did not give.
+
+The outcome is written to the terminating `review-branch-done` transcript
+event and returned in `ChatResult.metadata`, which is what drives the
+followups (`apply`, `force-fix-all`, `raise the cap`).
 
 ## 5. Sandbox
 
@@ -225,26 +255,38 @@ classDiagram
 ```
 
 - **`githubModels.ts`** is what the CLI uses. It sends OpenAI-style
-  `response_format: { type: "json_schema", strict: true }` derived from the
-  zod schema via `zod-to-json-schema`. Single retry on parse failure with a
-  stricter system message.
+  `response_format: { type: "json_schema" }` derived from the zod schema via
+  zod 4's native `z.toJSONSchema()`. `strict` is declared only when the
+  generated schema actually satisfies strict mode (every property required,
+  `additionalProperties: false`), because declaring it otherwise makes the
+  provider reject the request. HTTP goes through the platform `fetch`.
 - **`vscodeLm.ts`** is what the extension uses. `vscode.lm` wants a `family`
-  string (`"gpt-5.4"`), not a vendor-prefixed id (`"openai/gpt-5.4"`); the
+  string (`"claude-opus-5"`), not a vendor-prefixed id
+  (`"anthropic/claude-opus-5"`); the
   client strips the vendor with `stripVendor()`. It also accepts a
   pre-resolved `LmChat` so the extension can pass `request.model` (the
   Copilot Chat picker selection) without re-resolving.
+- Both retry **once** on a parse or schema failure, and the retry includes the
+  model's own failed response as an assistant turn plus the validation error.
+  A reminder that names a schema without stating it gives the model nothing to
+  correct against.
+- Both accept an `AbortSignal`. `VscodeLmClient` creates one
+  `CancellationTokenSource` per call, cancels it from the signal, and disposes
+  it in a `finally`.
 
 The two model-id formats are why the extension surfaces both
 `codecrosscheck.workerModel` (full id, for fallback resolution) and
 `codecrosscheck.useChatPickerWorker` (boolean, for picker passthrough).
-Both `workerModel` and `reviewerModel` are enum-typed for a dropdown in
-Settings UI; free-text `workerModelOverride` / `reviewerModelOverride`
-fields allow arbitrary families without needing an enum update.
+Both `workerModel` and `reviewerModel` are free-text settings; the
+**CodeCrossCheck: Pick Worker and Reviewer Models** command populates them
+from `vscode.lm.selectChatModels()` so the list cannot go stale. All settings
+are read through [src/config.ts](../src/config.ts), which holds exactly one
+default per setting; `test/config.test.ts` asserts those match the manifest.
 
 ## 7. OpenSpec mode
 
 When `--openspec <change-id>` is set (CLI) or
-`/openspec-implement <change-id>` is invoked (chat), three things happen:
+`/openspec-review <change-id>` is invoked (chat), three things happen:
 
 1. **Change frame injection.** [src/openspec/loader.ts](../src/openspec/loader.ts)
    reads `proposal.md`, `tasks.md`, and `specs/**/spec.md` for the change
@@ -259,10 +301,13 @@ When `--openspec <change-id>` is set (CLI) or
    the call uses `shell: true` (required on Windows for `.cmd` shims after
    Node 22's CVE-2024-27980 hardening).
 3. **Diff scoping.** [src/openspec/diff.ts](../src/openspec/diff.ts)
-   computes `git diff` against the merge-base with `origin/main`, chunks it
-   per-file with overlap to stay under context limits, and feeds it into
-   the CODE reviewer. The same helper backs the CLI's `--diff` flag and
-   the extension's `/review-branch` slash command.
+   computes `git diff` against the merge-base with `origin/main` **and the
+   working tree**, so staged and unstaged edits to tracked files are reviewed;
+   untracked files are excluded. Pass `committedOnly` (CLI `--committed-only`,
+   chat `committed-only`) to compare commits alone. It returns the patch plus a
+   description of what was compared, which `/review-branch` prints in its
+   header. The helper chunks per-file with overlap to stay under context
+   limits, and backs the CLI's `--diff` flag and the `/review-branch` command.
 
 ## 8. Surfaces
 
@@ -273,16 +318,16 @@ When `--openspec <change-id>` is set (CLI) or
   `.codecrosscheck/runs/<ISO-timestamp>.jsonl`. Includes worker drafts,
   verdicts (with `source: "model" | "validator"`), sandbox results, and
   the final `completed` record.
-- Exit 0 if final stage `approved`, else 1. Honours `process.exitCode`
-  rather than calling `process.exit` so async cleanup (undici dispatcher
-  close) can run.
+- Exit 0 if final stage `approved`, else 1. There is no dispatcher teardown
+  step: the client uses the platform `fetch`, so the `undici` keep-alive pool
+  that used to need closing on Windows is gone.
 
 ### 8.2 VS Code extension ([src/extension.ts](../src/extension.ts))
 
 ```mermaid
 flowchart TB
   Activate[activate] --> RegPart[createChatParticipant id=codecrosscheck]
-  Activate --> RegCmd[registerCommand × 3]
+  Activate --> RegCmd[registerCommand × 5]
   RegCmd --> RS[reviewSelection]
   RegCmd --> RA[reviewActiveFile]
   RegCmd --> IS[installSkill]
@@ -458,7 +503,7 @@ doesn't ship. End users can ignore them.
 ## 12. Self-hosting
 
 From `0.1.0` onward, changes in this repo are reviewed by `@codecrosscheck`
-itself in OpenSpec mode (`/openspec-implement <change-id>` or
+itself in OpenSpec mode (`/openspec-review <change-id>` or
 `/review-branch`). The genesis change (`add-codecrosscheck`) and this
 session's change (`add-chat-picker-and-delegation`) both live under
 [openspec/changes/](../openspec/changes/) and validate clean against

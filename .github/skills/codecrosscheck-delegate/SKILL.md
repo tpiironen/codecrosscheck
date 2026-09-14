@@ -14,8 +14,8 @@ Trigger this skill when the user wants a **review, second opinion, or spec-drive
 | "review my branch / PR / changes / diff" | `@codecrosscheck /review-branch` |
 | "review this plan" / "is my plan complete?" | `@codecrosscheck /plan <task>` |
 | "review this code" / "check for OWASP / security / bugs" | `@codecrosscheck /code <task>` |
-| "implement OpenSpec change `<id>`" / "work on the `<id>` change" | `@codecrosscheck /openspec-implement <id>` |
-| "validate that `<id>` matches its spec" | `@codecrosscheck /openspec-implement <id>` |
+| "implement OpenSpec change `<id>`" / "work on the `<id>` change" | `@codecrosscheck /openspec-review <id>` |
+| "validate that `<id>` matches its spec" | `@codecrosscheck /openspec-review <id>` |
 | "scaffold a new OpenSpec change `<id>`" | `@codecrosscheck /openspec-new <id>` |
 | "double-check / sanity-check / second opinion on X" | `@codecrosscheck <restate X>` |
 
@@ -46,11 +46,14 @@ If the user is asking for a review, you are the wrong model to do it. Hand off.
 
 4. **Suggest prompt phrasing** that helps the reviewer cite issues precisely:
    - For `/review-branch`: `"focus on <area>; cite file:line for each issue"`.
-   - For `/openspec-implement <id>`: `"implement <id>; respect every scenario in spec deltas"`.
-   - For `/code`: include the artifact inline if small, or a path if not.
+     The diff covers the **working tree** by default, so uncommitted edits are
+     reviewed; add `committed-only` to compare commits alone.
+   - For `/openspec-review <id>`: `"respect every scenario in spec deltas"`.
+   - For `/code`: attach the file to the chat request, or include it inline.
 5. **Do not also review the artifact yourself** — that defeats the purpose of cross-vendor review and confuses the user about which verdict to trust. Make the delegation explicit and stop.
 6. **CLI fallback**: if the user is outside VS Code or wants headless review, suggest:
-   - `ccc "<task>" --diff --stages plan` — branch review
+   - `ccc "<task>" --diff --stages plan` — branch review (working tree by
+     default; add `--committed-only` to exclude it)
    - `ccc "<task>" --openspec <id>` — spec-bound implementation
    - Auth: `GITHUB_TOKEN` env var, or `gh auth login` (auto-detected via `gh auth token`).
 
@@ -58,19 +61,24 @@ If the user is asking for a review, you are the wrong model to do it. Hand off.
 
 - **Reviewing alongside delegation.** Don't add your own "I also noticed…" critique. The user wants a different model's view, not a duplicate of yours.
 - **Delegating production work.** `@codecrosscheck` produces drafts only as part of its loop; it is not a primary code generator. For "write me X", do it yourself.
-- **Skipping `/openspec-implement` when a change ID is in scope.** When the user mentions an OpenSpec change ID (`add-foo`, `update-bar`, `remove-baz`), prefer the OpenSpec command — it adds the validate pre-gate and ground-truth spec deltas.
+- **Skipping `/openspec-review` when a change ID is in scope.** When the user
+  mentions an OpenSpec change ID (`add-foo`, `update-bar`, `remove-baz`), prefer
+  the OpenSpec command — it adds the validate pre-gate and ground-truth spec
+  deltas.
 - **Forgetting cross-vendor.** If the user has set `codecrosscheck.useChatPickerWorker: true` (the default) and selected the same model in the chat picker that's configured as the reviewer, the loop collapses to single-model. The participant warns inline; relay that warning to the user if they ignore it.
 
 ## Quick reference: settings the user may need to know
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `codecrosscheck.workerModel` | `openai/gpt-5.4` | Worker fallback when chat picker is unavailable or disabled |
-| `codecrosscheck.reviewerModel` | `anthropic/claude-opus-4.6` | Reviewer (always config-driven, never picker-driven) |
+| `codecrosscheck.workerModel` | `anthropic/claude-opus-5` | Worker fallback when chat picker is unavailable or disabled (free text; use **CodeCrossCheck: Pick Worker and Reviewer Models**) |
+| `codecrosscheck.reviewerModel` | `openai/gpt-5.3-codex` | Reviewer (always config-driven, never picker-driven) |
 | `codecrosscheck.useChatPickerWorker` | `true` | When true, the chat picker's model becomes the worker |
-| `codecrosscheck.maxIters` | `3` | Loop iteration cap before returning unapproved |
+| `codecrosscheck.maxIters` | `6` | Loop iteration cap before returning unapproved |
+| `codecrosscheck.reviewBranch.maxDiffChars` | `1100000` | Aborts before the model rejects an oversized prompt; the token preflight is normally the gate that fires first |
+| `codecrosscheck.reviewBranch.keepTranscripts` | `50` | Transcript retention in `.codecrosscheck/runs` |
 | `codecrosscheck.execute.timeoutMs` | `30000` | Sandbox hard timeout |
-| `codecrosscheck.execute.allowNetwork` | `false` | Sandbox network policy |
+| `codecrosscheck.applyReview.buildCommand` | `""` | Post-apply build gate (machine-scoped; trusted workspaces only) |
 
 ## Example invocations
 
@@ -80,7 +88,7 @@ If the user is asking for a review, you are the wrong model to do it. Hand off.
 
 **OpenSpec change:**
 > User: "Implement the `add-rate-limit` change."
-> You: "For spec-bound implementation with the OpenSpec validate pre-gate, run: `@codecrosscheck /openspec-implement add-rate-limit`. The reviewer treats `proposal.md`, `tasks.md`, and the spec deltas as ground truth, and `openspec validate add-rate-limit --strict` runs as a pre-gate before each reviewer call."
+> You: "For spec-bound implementation with the OpenSpec validate pre-gate, run: `@codecrosscheck /openspec-review add-rate-limit`. The reviewer treats `proposal.md`, `tasks.md`, and the spec deltas as ground truth, and `openspec validate add-rate-limit --strict` runs as a pre-gate before each reviewer call."
 
 **Quick code review:**
 > User: "Sanity-check this regex: `^(\\d{4})-(\\d{2})-(\\d{2})$`"

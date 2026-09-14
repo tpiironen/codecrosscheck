@@ -6,23 +6,30 @@ The same engine ships as both a Node CLI (`codecrosscheck`, alias `ccc`) and a V
 
 ## Stack
 
-- Language: **TypeScript** (≥ 5.4), Node.js **≥ 20**.
+- Language: **TypeScript** (≥ 5.9), Node.js **≥ 20**.
 - No Python anywhere.
-- Runtime deps: `zod` (schema validation), `undici` (HTTP), `commander` (CLI).
-- Dev deps: `vitest`, `@vscode/vsce`, `@types/vscode`, `typescript`.
+- Runtime deps: `zod` (schema validation + JSON Schema generation), `commander`
+  (CLI). HTTP uses the platform `fetch`.
+- Dev deps: `vitest`, `eslint` + `typescript-eslint`, `@vscode/vsce`,
+  `@types/vscode`, `typescript`, `esbuild`.
 - No agent framework dependency — the loop is small enough (~150 LOC) to maintain directly.
+- `typescript` is held at `^5.9`: `typescript-eslint` does not yet support
+  TS 7.0. Revisit when it supports TS >= 7.1.
 
 ## Models
 
 - **In-editor**: VS Code Language Model API (`vscode.lm`) — uses Copilot-tier models with no extra API keys.
 - **CLI**: GitHub Models OpenAI-compatible endpoint at `https://models.github.ai/inference`, auth via `GITHUB_TOKEN` with `models:read` scope.
-- **Default model pair**: worker `openai/gpt-5.4`, reviewer `anthropic/claude-opus-4.6`. Cross-vendor by design.
-- **Model selection (extension)**: `workerModel` and `reviewerModel` settings
-  are enum-typed dropdowns listing all Copilot-tier families. Free-text
-  `workerModelOverride` / `reviewerModelOverride` settings take precedence
-  when non-empty, allowing new models without an enum update.
+- **Default model pair**: worker `anthropic/claude-opus-5`, reviewer `openai/gpt-5.3-codex`. Cross-vendor by design.
+- **Model selection (extension)**: `workerModel` and `reviewerModel` are
+  free-text settings. The **CodeCrossCheck: Pick Worker and Reviewer Models**
+  command lists the families `vscode.lm` actually offers in the current
+  session. The `workerModelOverride` / `reviewerModelOverride` settings are
+  deprecated but still take precedence when non-empty.
 - **Iteration budget**: default `maxIters` = 6 (configurable per-invocation
   via `max-iters=N` in the prompt or the `codecrosscheck.maxIters` setting).
+  Every surface reads this from `src/config.ts`; the manifest default is
+  asserted against it in `test/config.test.ts`.
 
 ## Audience & distribution
 
@@ -59,10 +66,20 @@ The same engine ships as both a Node CLI (`codecrosscheck`, alias `ccc`) and a V
 ## Conventions
 
 - Reviewer output is **always** structured JSON validated by zod: `{ verdict: "approve"|"revise", issues: { severity, where, why, suggestion }[] }`.
-- Structured outputs are non-negotiable — they are what makes the loop deterministic.
+- Structured outputs are non-negotiable for **reviewers** — they are what makes
+  the loop deterministic. **Workers** produce documents and reply as plain
+  text; wrapping Markdown in a JSON envelope cost tokens and caused escaping
+  failures.
 - Three pipeline stages, each with its own reviewer prompt: `PLAN`, `CODE`, `EXECUTE`.
-- Default `maxIters = 3`. On exhaustion, return the last artifact with `approved: false` rather than throwing.
-- The `EXECUTE` sandbox uses Node `child_process` with `tempdir`, hard timeout, and scrubbed environment. It is best-effort, **not adversarial-grade**.
+- Default `maxIters = 6`. On exhaustion, return the last artifact with `approved: false` rather than throwing.
+- A `/review-branch` run ends in exactly one outcome: `approved` (the reviewer
+  said so), `rebutted` (the worker talked its way out of every finding — **not**
+  an approval), `exhausted`, `cancelled`, or `failed`.
+- The `EXECUTE` sandbox uses Node `child_process` with a temp working
+  directory, an allowlisted environment, and a hard timeout. It is
+  **containment, not a security boundary**: generated code runs as the invoking
+  user with full filesystem access and unrestricted network. There is no
+  network toggle, because none was ever implemented.
 
 ## OpenSpec usage
 

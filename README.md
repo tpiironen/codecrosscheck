@@ -78,7 +78,7 @@ works from anywhere too.
 GITHUB_TOKEN=ghp_xxx codecrosscheck "write a script that prints the SHA-256 of stdin"
 
 # Run a single stage with a custom reviewer
-ccc "draft a migration plan" --stages plan --reviewer-model anthropic/claude-opus-4.6
+ccc "draft a migration plan" --stages plan --reviewer-model anthropic/claude-opus-5
 
 # OpenSpec mode — reviewer is pre-gated by `openspec validate --strict`
 ccc "implement add-foo" --openspec add-foo
@@ -90,8 +90,8 @@ ccc "implement add-foo" --openspec add-foo
 |---|---|---|
 | `--stages` | `plan,code,execute` | Comma-separated subset |
 | `--max-iters` | `6` | Per-stage iteration budget |
-| `--worker-model` | `openai/gpt-5.4` | GitHub Models id |
-| `--reviewer-model` | `openai/gpt-5.4` | Override to a different vendor for cross-vendor review |
+| `--worker-model` | `anthropic/claude-opus-5` | GitHub Models id |
+| `--reviewer-model` | `openai/gpt-5.3-codex` | Different vendor from the worker, for cross-vendor review |
 | `--allow-network` | off | EXECUTE sandbox network access |
 | `--timeout-ms` | `30000` | Sandbox per-run timeout |
 | `--openspec <id>` | — | Inject change frame + validator pre-gate |
@@ -181,26 +181,33 @@ Editor commands (Command Palette):
 
 | Setting | Default |
 |---|---|
-| `codecrosscheck.workerModel` | `openai/gpt-5.4` (dropdown) |
-| `codecrosscheck.workerModelOverride` | `""` (free text, overrides dropdown) |
-| `codecrosscheck.reviewerModel` | `anthropic/claude-opus-4.6` (dropdown) |
-| `codecrosscheck.reviewerModelOverride` | `""` (free text, overrides dropdown) |
+| `codecrosscheck.workerModel` | `anthropic/claude-opus-5` (free text) |
+| `codecrosscheck.reviewerModel` | `openai/gpt-5.3-codex` (free text) |
+| `codecrosscheck.workerModelOverride` | `""` (deprecated, still honoured) |
+| `codecrosscheck.reviewerModelOverride` | `""` (deprecated, still honoured) |
 | `codecrosscheck.useChatPickerWorker` | `true` |
 | `codecrosscheck.maxIters` | `6` |
-| `codecrosscheck.applyReview.buildCommand` | `""` |
+| `codecrosscheck.reviewBranch.maxDiffChars` | `1100000` |
+| `codecrosscheck.reviewBranch.keepTranscripts` | `50` |
+| `codecrosscheck.applyReview.buildCommand` | `""` (machine-scoped) |
 | `codecrosscheck.applyReview.buildTimeoutMs` | `300000` |
-| `codecrosscheck.applyReview.testCommand` | `""` |
+| `codecrosscheck.applyReview.testCommand` | `""` (machine-scoped) |
 | `codecrosscheck.applyReview.dryRun` | `false` |
 | `codecrosscheck.execute.timeoutMs` | `30000` |
-| `codecrosscheck.execute.allowNetwork` | `false` |
+
+`buildCommand` and `testCommand` are **machine-scoped**: a workspace cannot set
+them, and `/apply-review` runs them only in a trusted workspace. Without that,
+cloning a repository and running `/apply-review` would execute a command the
+repository chose.
 
 The extension uses `vscode.lm` (Copilot subscription) — the `family` portion of
 each model id is passed to `selectChatModels({vendor:"copilot",family})`.
 
-The **workerModel** and **reviewerModel** dropdowns list all Copilot-tier models
-(Claude, GPT, Gemini, Grok). To use a model not yet in the list, type its
-`vendor/family` string into the corresponding **Override** field — when non-empty
-it takes precedence over the dropdown.
+Run **CodeCrossCheck: Pick Worker and Reviewer Models** from the command
+palette to choose from the families this VS Code session can actually reach.
+Both settings are plain strings, so a newly released model works immediately;
+the two `*Override` settings are deprecated leftovers from when the settings
+were dropdowns, and still take precedence when non-empty.
 
 When `useChatPickerWorker` is `true` (the default), the chat participant uses
 the model picked in the Copilot Chat **model picker** as the worker, so
@@ -235,7 +242,7 @@ src/
   schemas.ts           # zod Issue / Verdict / Stage
   clients/
     ChatClient.ts          # interface
-    githubModels.ts        # CLI client (undici + json_schema)
+    githubModels.ts        # CLI client (global fetch + json_schema)
     vscodeLm.ts            # extension client (vscode.lm + extractJson)
   openspec/
     loader.ts              # findOpenSpecRoot / loadChange / renderChangeFrame
