@@ -6,20 +6,50 @@ export interface DiffOptions {
   baseRef?: string;
   /** Only include hunks whose file path starts with one of these prefixes (the change's stated impact). */
   scopePaths?: string[];
+  /**
+   * Compare commits only, excluding the working tree. Default `false`: a
+   * review should cover what the author is looking at, not the previous commit.
+   */
+  committedOnly?: boolean;
 }
 
-export async function getChangeDiff(opts: DiffOptions = {}): Promise<string> {
+export interface ChangeDiff {
+  patch: string;
+  /** Human-readable account of what was compared, for the review header. */
+  description: string;
+}
+
+/**
+ * Diff the branch against its base.
+ *
+ * By default the comparison runs base..working tree, so staged and unstaged
+ * edits to tracked files are included. Untracked files are excluded: git does
+ * not track them, and sweeping them in risks pulling build output and secrets
+ * into a model prompt.
+ */
+export async function getChangeDiff(opts: DiffOptions = {}): Promise<ChangeDiff> {
   const cwd = opts.cwd ?? process.cwd();
   const base = opts.baseRef ?? (await resolveMergeBase(cwd));
-  // Three-dot (A...B) computes the merge-base automatically — great for
-  // branches that share history. Two-dot (A..B) works for orphan refs that
-  // have no common ancestor. Use two-dot when the caller supplied an
-  // explicit baseRef (they know what they want).
-  const range = opts.baseRef ? `${base}..HEAD` : `${base}...HEAD`;
 
-  const raw = await runGit(["diff", range], cwd);
-  if (!opts.scopePaths || opts.scopePaths.length === 0) return raw;
-  return filterPatchToScope(raw, opts.scopePaths);
+  // `base` is already a resolved commit, so a two-dot range is exact and also
+  // works for orphan refs that share no history.
+  const args = opts.committedOnly ? ["diff", `${base}..HEAD`] : ["diff", base];
+  const raw = await runGit(args, cwd);
+
+  const baseLabel = opts.baseRef ?? `merge-base ${short(base)}`;
+  const description = opts.committedOnly
+    ? `committed changes vs ${baseLabel}`
+    : `working tree vs ${baseLabel}, including staged and unstaged edits to tracked files`;
+
+  const patch =
+    !opts.scopePaths || opts.scopePaths.length === 0
+      ? raw
+      : filterPatchToScope(raw, opts.scopePaths);
+  return { patch, description };
+}
+
+function short(ref: string): string {
+  return /^[0-9a-f]{40}$/i.test(ref) ? ref.slice(0, 8) : ref;
 }
 
 async function resolveMergeBase(cwd: string): Promise<string> {

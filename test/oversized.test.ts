@@ -9,6 +9,8 @@ vi.mock("vscode", () => ({
   },
   CancellationTokenSource: class {
     token = {};
+    cancel() {}
+    dispose() {}
   },
   lm: {},
 }));
@@ -17,7 +19,7 @@ const { OversizedPromptError, VscodeLmClient, assertNotOversized } = await impor
   "../src/clients/vscodeLm.js"
 );
 
-function makeThrowingLm(message: string, sendSpy?: ReturnType<typeof vi.fn>) {
+function makeThrowingLm(message: string, sendSpy?: (...args: unknown[]) => void) {
   const model = {
     vendor: "stub",
     family: "stub-family",

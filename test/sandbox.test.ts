@@ -21,4 +21,27 @@ describe("sandbox", () => {
     const r = await runSandboxed("process.exit(7)", { language: "node", timeoutMs: 10_000 });
     expect(r.exitCode).toBe(7);
   });
+
+  it("injects no proxy-bypass variables", async () => {
+    // NO_PROXY tells clients to *bypass* a proxy; it denies nothing, so the
+    // sandbox must not set it and pretend it is a network control.
+    const r = await runSandboxed(
+      "console.log(JSON.stringify({ no: process.env.NO_PROXY ?? null, lower: process.env.no_proxy ?? null }))",
+      { language: "node", timeoutMs: 10_000 },
+    );
+    expect(JSON.parse(r.stdout.trim())).toEqual({ no: null, lower: null });
+  });
+
+  it("passes through only allowlisted environment variables", async () => {
+    process.env.CCC_SANDBOX_LEAK_PROBE = "should-not-appear";
+    try {
+      const r = await runSandboxed(
+        "console.log(process.env.CCC_SANDBOX_LEAK_PROBE ?? 'absent')",
+        { language: "node", timeoutMs: 10_000 },
+      );
+      expect(r.stdout.trim()).toBe("absent");
+    } finally {
+      delete process.env.CCC_SANDBOX_LEAK_PROBE;
+    }
+  });
 });

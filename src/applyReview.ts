@@ -1,6 +1,5 @@
 import * as path from "node:path";
-import { z } from "zod";
-import type { ChatClient, ChatMessage } from "./clients/ChatClient.js";
+import type { ChatClient, ChatMessage, SendOptions } from "./clients/ChatClient.js";
 import { ApplyReviewSchema, type ApplyEdit, type Verdict } from "./schemas.js";
 
 /**
@@ -33,7 +32,20 @@ export interface ApplyOutcome {
   why: string;
 }
 
-/** Returns the newest `*.jsonl` in `dir` containing a `review-branch-done` event, or null. */
+/** Marks a completed `/review-branch` or `/openspec-review` run. */
+const TERMINAL_EVENT = "review-branch-done";
+
+/** How many trailing records to inspect when looking for the terminal event. */
+const TAIL_RECORDS = 20;
+
+/**
+ * Returns the newest `*.jsonl` in `dir` whose run completed, or null.
+ *
+ * Matches a *parsed* terminal event near the tail rather than substring-testing
+ * the whole file: a stored worker artifact can quote the event name verbatim
+ * (a review of this codebase does), which a substring test reads as a
+ * completed run.
+ */
 export async function findLatestTranscript(dir: string, fs: FsLike): Promise<string | null> {
   if (!(await fs.exists(dir))) return null;
   const entries = await fs.readDir(dir);
@@ -53,11 +65,65 @@ export async function findLatestTranscript(dir: string, fs: FsLike): Promise<str
   for (const { name } of stamped) {
     const full = path.join(dir, name);
     const text = await fs.readFile(full);
-    if (text.includes("\"review-branch-done\"") || text.includes('"event":"review-branch-done"')) {
-      return full;
-    }
+    if (hasTerminalEvent(text)) return full;
   }
   return null;
+}
+
+function hasTerminalEvent(text: string): boolean {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  for (const line of lines.slice(-TAIL_RECORDS)) {
+    let obj: unknown;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (obj && typeof obj === "object" && (obj as { event?: unknown }).event === TERMINAL_EVENT) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Delete all but the newest `keep` transcripts (and their `-apply.json`
+ * siblings). Transcripts hold full source diffs, so an unbounded directory is
+ * both a disk and a disclosure problem.
+ */
+export async function pruneTranscripts(
+  dir: string,
+  keep: number,
+  fs: FsLike & { remove(p: string): Promise<void> },
+): Promise<string[]> {
+  if (keep < 0 || !(await fs.exists(dir))) return [];
+  const entries = await fs.readDir(dir);
+  const stamped: Array<{ name: string; mtimeMs: number }> = [];
+  for (const name of entries.filter((e) => e.endsWith(".jsonl"))) {
+    try {
+      const st = await fs.stat(path.join(dir, name));
+      stamped.push({ name, mtimeMs: st.mtimeMs });
+    } catch {
+      /* skip */
+    }
+  }
+  stamped.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const removed: string[] = [];
+  for (const { name } of stamped.slice(keep)) {
+    const full = path.join(dir, name);
+    for (const victim of [full, full.replace(/\.jsonl$/i, "-apply.json")]) {
+      try {
+        if (await fs.exists(victim)) {
+          await fs.remove(victim);
+          removed.push(victim);
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+  return removed;
 }
 
 /**
@@ -116,31 +182,38 @@ export interface Disagreement {
  * Parse `**Fix:** Disagree: ...` rebuttals out of a fixer proposal Markdown.
  * Returns one entry per Issue section whose Fix paragraph starts with "Disagree:".
  */
-export function parseDisagreements(proposal: string): Disagreement[] {
-  const out: Disagreement[] = [];
-  // Split on top-level "### Issue N: ..." headings.
+interface IssueSection {
+  id: number;
+  heading: string;
+  body: string;
+}
+
+/** Split a fix proposal into its `### Issue N: …` sections. */
+function parseIssueSections(proposal: string): IssueSection[] {
   const sectionRe = /^###\s+Issue\s+(\d+)[^\n]*$/gm;
-  const headings: { id: number; heading: string; start: number }[] = [];
+  const heads: Array<{ id: number; heading: string; start: number }> = [];
   let m: RegExpExecArray | null;
   while ((m = sectionRe.exec(proposal)) !== null) {
-    headings.push({
-      id: Number.parseInt(m[1], 10),
-      heading: m[0].replace(/^###\s+/, "").trim(),
-      start: m.index,
-    });
+    const id = Number.parseInt(m[1] ?? "", 10);
+    if (!Number.isFinite(id)) continue;
+    heads.push({ id, heading: m[0].replace(/^###\s+/, "").trim(), start: m.index });
   }
-  for (let i = 0; i < headings.length; i++) {
-    const start = headings[i].start;
-    const end = i + 1 < headings.length ? headings[i + 1].start : proposal.length;
-    const body = proposal.slice(start, end);
+  return heads.map((h, i) => ({
+    id: h.id,
+    heading: h.heading,
+    body: proposal.slice(h.start, heads[i + 1]?.start ?? proposal.length),
+  }));
+}
+
+export function parseDisagreements(proposal: string): Disagreement[] {
+  const out: Disagreement[] = [];
+  for (const section of parseIssueSections(proposal)) {
     // Look for "**Fix:** Disagree:" (allow whitespace variations).
-    const fixMatch = body.match(/\*\*Fix:\*\*\s*Disagree\s*:\s*([\s\S]*?)(?=\n\n\*\*|\n###|\n```|$)/i);
-    if (!fixMatch) continue;
-    out.push({
-      id: headings[i].id,
-      heading: headings[i].heading,
-      rebuttal: fixMatch[1].trim(),
-    });
+    const fixMatch = section.body.match(
+      /\*\*Fix:\*\*\s*Disagree\s*:\s*([\s\S]*?)(?=\n\n\*\*|\n###|\n```|$)/i,
+    );
+    if (!fixMatch?.[1]) continue;
+    out.push({ id: section.id, heading: section.heading, rebuttal: fixMatch[1].trim() });
   }
   return out;
 }
@@ -157,24 +230,26 @@ export function issueFingerprint(it: { severity: string; where: string; why: str
 }
 
 /**
- * Drop verdict issues whose fingerprint matches one in `rejected`. If the
- * filter empties the issues array, the returned verdict is auto-approved
- * because there is nothing left to revise. Returns the (possibly new)
- * verdict and the count of dropped issues.
+ * Drop verdict issues whose fingerprint matches one in `rejected`.
+ *
+ * This never decides the verdict. When filtering empties the issue list it
+ * reports `emptiedBySuppression` and leaves the verdict untouched, because
+ * "the worker rebutted everything" is not the same outcome as "the reviewer
+ * approved" and must not be presented as one.
  */
 export function filterRejectedIssues<V extends { verdict: string; issues: Array<{ severity: string; where: string; why: string }> }>(
   verdict: V,
   rejected: ReadonlySet<string>,
-): { verdict: V; dropped: number } {
-  if (rejected.size === 0) return { verdict, dropped: 0 };
+): { verdict: V; dropped: number; emptiedBySuppression: boolean } {
+  if (rejected.size === 0) return { verdict, dropped: 0, emptiedBySuppression: false };
   const kept = verdict.issues.filter((it) => !rejected.has(issueFingerprint(it)));
   const dropped = verdict.issues.length - kept.length;
-  if (dropped === 0) return { verdict, dropped: 0 };
-  const next = { ...verdict, issues: kept } as V;
-  if (kept.length === 0 && next.verdict !== "approve") {
-    (next as { verdict: string }).verdict = "approve";
-  }
-  return { verdict: next, dropped };
+  if (dropped === 0) return { verdict, dropped: 0, emptiedBySuppression: false };
+  return {
+    verdict: { ...verdict, issues: kept },
+    dropped,
+    emptiedBySuppression: kept.length === 0,
+  };
 }
 
 /** Result of running a post-apply build/verify command. */
@@ -194,12 +269,13 @@ export interface BuildGateResult {
 /**
  * Spawn a shell command in `cwd`, capture combined stdout+stderr, return the
  * exit code and (truncated) output. Used by `/apply-review` after successful
- * edits to verify the working tree still compiles/tests. Pure I/O, no
- * vscode dep — testable with a real subprocess.
+ * edits to verify the working tree still compiles/tests.
  *
- * Injects `child_process.exec` via `runner` so tests can stub it. Keeps a
- * hard timeout (default 5 min) and an output cap (default 16 KB) so a
- * runaway build can't hang the chat session or flood the log.
+ * This is the one place the repo's "never `exec` a string" rule is relaxed:
+ * the value is a user-authored command line (`npm run build`, `dotnet build
+ * -nologo`) that only a shell can interpret. The setting is contributed with
+ * `scope: "machine"` so a workspace cannot supply it, and `/apply-review`
+ * additionally requires a trusted workspace before calling this.
  */
 export interface RunBuildGateOptions {
   cwd: string;
@@ -277,30 +353,17 @@ export interface BlockedFinding {
 export function parseBlockedFindings(proposal: string): BlockedFinding[] {
   const out: BlockedFinding[] = [];
   const disagreedIds = new Set(parseDisagreements(proposal).map((d) => d.id));
-  const sectionRe = /^###\s+Issue\s+(\d+)[^\n]*$/gm;
-  const headings: { id: number; heading: string; start: number }[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = sectionRe.exec(proposal)) !== null) {
-    headings.push({
-      id: Number.parseInt(m[1], 10),
-      heading: m[0].replace(/^###\s+/, "").trim(),
-      start: m.index,
-    });
-  }
   const dodgePatterns: { re: RegExp; reason: string }[] = [
-    { re: /\*\*Data I need(?: to produce the patch)?[:\*]/i, reason: "asks for more source files" },
-    { re: /\(sketch\s*[\u2014\-]\s*pending current source/i, reason: "code block marked sketch / pending current source" },
+    { re: /\*\*Data I need(?: to produce the patch)?[:*]/i, reason: "asks for more source files" },
+    { re: /\(sketch\s*[\u2014-]\s*pending current source/i, reason: "code block marked sketch / pending current source" },
     { re: /I cannot produce (?:the |a )?(?:unified-diff hunk|patch|fix)/i, reason: "explicitly refuses to produce a patch" },
     { re: /pending (?:the )?(?:current )?source(?:\s+(?:of|for))?/i, reason: "deferred pending source" },
   ];
-  for (let i = 0; i < headings.length; i++) {
-    if (disagreedIds.has(headings[i].id)) continue;
-    const start = headings[i].start;
-    const end = i + 1 < headings.length ? headings[i + 1].start : proposal.length;
-    const body = proposal.slice(start, end);
+  for (const section of parseIssueSections(proposal)) {
+    if (disagreedIds.has(section.id)) continue;
     for (const { re, reason } of dodgePatterns) {
-      if (re.test(body)) {
-        out.push({ id: headings[i].id, heading: headings[i].heading, reason });
+      if (re.test(section.body)) {
+        out.push({ id: section.id, heading: section.heading, reason });
         break;
       }
     }
@@ -314,7 +377,7 @@ export function parseReferencedFiles(proposal: string): string[] {
   const found = new Set<string>();
   let m: RegExpExecArray | null;
   while ((m = re.exec(proposal)) !== null) {
-    const cleaned = normalizeReferencedPath(m[1]);
+    const cleaned = normalizeReferencedPath(m[1] ?? "");
     if (cleaned.length > 0) found.add(cleaned);
   }
   return Array.from(found);
@@ -331,7 +394,7 @@ export function parseReferencedFiles(proposal: string): string[] {
 export function harvestPathsFromText(text: string): string[] {
   const found = new Set<string>();
   // Match runs of non-whitespace, non-quote characters that look like a path.
-  const re = /([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)+\.(?:cs|ts|tsx|js|jsx|mjs|cjs|json|md|py|go|rs|java|kt|rb|sql|yml|yaml|bicep|csproj|sln|xml|cshtml|razor|css|scss))(?::\d+(?:-\d+)?)?/g;
+  const re = /([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+\.(?:cs|ts|tsx|js|jsx|mjs|cjs|json|md|py|go|rs|java|kt|rb|sql|yml|yaml|bicep|csproj|sln|xml|cshtml|razor|css|scss))(?::\d+(?:-\d+)?)?/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     // Reject when preceded by URL scheme `://`, drive prefix `:/` or `:\`,
@@ -347,7 +410,7 @@ export function harvestPathsFromText(text: string): string[] {
     // dot AND is followed by no further dot-extension before the slash, treat
     // as host. Simpler: reject if the captured path's first segment ends with
     // a known TLD-ish pattern AND is followed by `/`.
-    let p = m[1].replace(/\\/g, "/");
+    let p = (m[1] ?? "").replace(/\\/g, "/");
     const firstSlash = p.indexOf("/");
     if (firstSlash > 0) {
       const head = p.slice(0, firstSlash);
@@ -475,12 +538,13 @@ export async function deriveEdits(
   client: ChatClient,
   systemPrompt: string,
   userInput: string,
+  opts?: SendOptions,
 ): Promise<ApplyEdit[]> {
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userInput },
   ];
-  const result = await client.sendStructured(messages, ApplyReviewSchema, "ApplyReview");
+  const result = await client.sendStructured(messages, ApplyReviewSchema, "ApplyReview", opts);
   return result.edits;
 }
 
@@ -541,7 +605,10 @@ export async function applyEdit(
   if (options.dryRun) {
     return { path: edit.path, status: "dry-run", why: edit.why };
   }
-  const updated = original.replace(matchedOld, repairedNew);
+  // Splice by index rather than String.replace: GetSubstitution expands `$$`,
+  // `$&`, "$`" and `$'` in the replacement even for a string search value.
+  const at = original.indexOf(matchedOld);
+  const updated = original.slice(0, at) + repairedNew + original.slice(at + matchedOld.length);
   await fs.writeFile(safe.abs, updated);
   return { path: edit.path, status: "applied", why: edit.why };
 }
@@ -622,7 +689,7 @@ export function stripDiffMarkers(text: string, mode: "old" | "new"): string {
       continue;
     }
     const ch = line[0];
-    if (!keep.has(ch)) continue;
+    if (ch === undefined || !keep.has(ch)) continue;
     out.push(line.slice(1));
   }
   return out.join("\n");
@@ -639,16 +706,57 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-/** Apply many edits in order. */
+/** Destination for a committed batch of whole-file writes. */
+export interface EditHost {
+  commit(writes: Array<{ path: string; content: string }>): Promise<void>;
+}
+
+/**
+ * Buffers writes over a base filesystem so a batch can be inspected and
+ * committed as a unit, and so a later edit in the batch sees earlier ones.
+ */
+function overlayFs(base: FsLike): FsLike & { pending(): Array<{ path: string; content: string }> } {
+  const buffered = new Map<string, string>();
+  return {
+    readDir: (dir) => base.readDir(dir),
+    stat: (p) => base.stat(p),
+    async readFile(p) {
+      const held = buffered.get(p);
+      return held !== undefined ? held : base.readFile(p);
+    },
+    async writeFile(p, content) {
+      buffered.set(p, content);
+    },
+    async exists(p) {
+      return buffered.has(p) ? true : base.exists(p);
+    },
+    pending: () => Array.from(buffered, ([path, content]) => ({ path, content })),
+  };
+}
+
+/**
+ * Apply many edits in order, committing them only once every edit has been
+ * computed, so a failure partway leaves the tree untouched.
+ */
 export async function applyEdits(
   workspaceRoot: string,
   edits: ApplyEdit[],
   fs: FsLike,
-  options: { dryRun: boolean },
+  options: { dryRun: boolean; host?: EditHost },
 ): Promise<ApplyOutcome[]> {
+  const overlay = overlayFs(fs);
   const results: ApplyOutcome[] = [];
   for (const e of edits) {
-    results.push(await applyEdit(workspaceRoot, e, fs, options));
+    results.push(await applyEdit(workspaceRoot, e, overlay, options));
+  }
+  if (options.dryRun) return results;
+
+  const writes = overlay.pending();
+  if (writes.length === 0) return results;
+  if (options.host) {
+    await options.host.commit(writes);
+  } else {
+    for (const w of writes) await fs.writeFile(w.path, w.content);
   }
   return results;
 }
@@ -658,5 +766,3 @@ export const __test = { countOccurrences };
 
 // Re-export schema for convenience.
 export { ApplyReviewSchema };
-// Suppress unused-import warning when only types are re-exported in some callers.
-void z;

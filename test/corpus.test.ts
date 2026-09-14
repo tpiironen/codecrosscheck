@@ -19,9 +19,12 @@ import type { Stage, Verdict } from "../src/schemas.js";
 
 const RUN = process.env.RUN_LIVE_TESTS === "1";
 const HAS_TOKEN = Boolean(process.env.GITHUB_TOKEN);
-const REVIEWER_MODEL = process.env.CCC_REVIEWER_MODEL ?? "anthropic/claude-opus-4.6";
+const REVIEWER_MODEL = process.env.CCC_REVIEWER_MODEL ?? "openai/gpt-5.3-codex";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const CORPUS_ROOT = path.resolve(HERE, "corpus");
+
+const SEVERITY_RANK: Record<string, number> = { low: 0, medium: 1, high: 2 };
 
 interface ExpectedIssue {
   severityAtLeast: "low" | "medium" | "high";
@@ -34,10 +37,6 @@ interface Expected {
   sandboxResult?: { stdout: string; stderr: string; exitCode: number };
   issues: ExpectedIssue[];
 }
-HERE
-const SEVERITY_RANK: Record<string, number> = { low: 0, medium: 1, high: 2 };
-
-const CORPUS_ROOT = path.resolve(__dirname, "corpus");
 
 function discoverCases(): { dir: string; name: string; expected: Expected }[] {
   if (!fs.existsSync(CORPUS_ROOT)) return [];
@@ -84,6 +83,18 @@ function assertVerdictMatches(verdict: Verdict, expected: Expected): void {
 }
 
 const cases = discoverCases();
+
+// A permanently inert gate must not read as a passing one: say why it skipped.
+if (!RUN) {
+  const reason = HAS_TOKEN
+    ? "RUN_LIVE_TESTS is not 1"
+    : "RUN_LIVE_TESTS is not 1 and GITHUB_TOKEN is not set";
+  console.warn(
+    `[corpus] Skipping ${cases.length} planted-flaw case(s): ${reason}. ` +
+      `This is the only gate on reviewer prompt behaviour — run it with ` +
+      `RUN_LIVE_TESTS=1 GITHUB_TOKEN=<token> npx vitest run test/corpus.test.ts`,
+  );
+}
 
 describe.skipIf(!RUN)("planted-flaw corpus", () => {
   for (const c of cases) {

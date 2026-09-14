@@ -9,7 +9,6 @@ export type SandboxLanguage = "node" | "python" | "bash";
 export interface SandboxOptions {
   language?: SandboxLanguage;
   timeoutMs?: number;
-  allowNetwork?: boolean;
 }
 
 export interface SandboxResult {
@@ -22,13 +21,21 @@ export interface SandboxResult {
 
 const ENV_ALLOWLIST = ["PATH", "LANG", "LC_ALL", "TMPDIR", "TEMP", "TMP", "HOME", "USERPROFILE", "SystemRoot", "SYSTEMROOT"];
 
+/**
+ * Runs `code` in a temp directory with an allowlisted environment and a hard
+ * timeout.
+ *
+ * This is containment, not a security boundary: the child runs as the invoking
+ * user with full filesystem access and unrestricted network. There is
+ * deliberately no `allowNetwork` option — the previous implementation set
+ * `NO_PROXY=*`, which tells clients to *bypass* a proxy and denies nothing.
+ */
 export async function runSandboxed(
   code: string,
   opts: SandboxOptions = {},
 ): Promise<SandboxResult> {
   const language = opts.language ?? "node";
   const timeoutMs = opts.timeoutMs ?? 30_000;
-  const allowNetwork = opts.allowNetwork ?? false;
 
   const tmpRoot = path.join(os.tmpdir(), `ccc-${crypto.randomUUID()}`);
   fs.mkdirSync(tmpRoot, { recursive: true });
@@ -41,10 +48,6 @@ export async function runSandboxed(
   for (const key of ENV_ALLOWLIST) {
     const v = process.env[key];
     if (v !== undefined) env[key] = v;
-  }
-  if (!allowNetwork) {
-    env.NO_PROXY = "*";
-    env.no_proxy = "*";
   }
 
   const start = Date.now();
@@ -70,7 +73,7 @@ export async function runSandboxed(
     const timer = setTimeout(() => {
       timedOut = true;
       try {
-        if (process.platform === "win32") {
+        if (process.platform === "win32" && child.pid !== undefined) {
           spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
         } else {
           child.kill("SIGKILL");

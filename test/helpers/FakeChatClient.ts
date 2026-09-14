@@ -1,5 +1,10 @@
 import type { z } from "zod";
-import type { ChatClient, ChatMessage } from "../../src/clients/ChatClient.js";
+import {
+  ReviewCancelledError,
+  type ChatClient,
+  type ChatMessage,
+  type SendOptions,
+} from "../../src/clients/ChatClient.js";
 
 /**
  * Test double: returns scripted responses in FIFO order. Each enqueued value
@@ -28,10 +33,12 @@ export class FakeChatClient implements ChatClient {
 
   async sendStructured<T>(
     messages: ChatMessage[],
-    schema: z.ZodSchema<T>,
+    schema: z.ZodType<T>,
     _schemaName: string,
+    opts?: SendOptions,
   ): Promise<T> {
     this.calls.push(messages);
+    if (opts?.signal?.aborted) throw new ReviewCancelledError(this.modelId);
     if (this.queue.length === 0) {
       throw new Error("FakeChatClient: response queue is empty");
     }
@@ -52,8 +59,9 @@ export class FakeChatClient implements ChatClient {
     return parsed.data;
   }
 
-  async sendText(messages: ChatMessage[]): Promise<string> {
+  async sendText(messages: ChatMessage[], opts?: SendOptions): Promise<string> {
     this.calls.push(messages);
+    if (opts?.signal?.aborted) throw new ReviewCancelledError(this.modelId);
     if (this.queue.length === 0) {
       throw new Error("FakeChatClient: response queue is empty");
     }

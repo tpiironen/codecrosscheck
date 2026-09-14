@@ -29,6 +29,8 @@ export interface LoopOptions {
   onWorkerEnd?: (iteration: number, artifact: string) => void;
   onReviewerStart?: (iteration: number) => void;
   onReviewerEnd?: (iteration: number, verdict: Verdict, source: string) => void;
+  /** Aborts the run between iterations and cancels the in-flight model call. */
+  signal?: AbortSignal;
 }
 
 export interface LoopResult {
@@ -36,6 +38,8 @@ export interface LoopResult {
   history: LoopEvent[];
   approved: boolean;
   iterations: number;
+  /** True when the run stopped because the signal aborted, not because it finished. */
+  cancelled: boolean;
 }
 
 export async function reviewLoop(
@@ -44,15 +48,24 @@ export async function reviewLoop(
 ): Promise<LoopResult> {
   const maxIters = opts.maxIters ?? 3;
   const history: LoopEvent[] = [];
+  const signal = opts.signal;
   let input = initialInput;
   let lastArtifact = "";
+  let completed = 0;
 
   for (let i = 1; i <= maxIters; i++) {
+    if (signal?.aborted) {
+      return { artifact: lastArtifact, history, approved: false, iterations: completed, cancelled: true };
+    }
     opts.onIterationStart?.(i);
     opts.onWorkerStart?.(i);
-    const artifact = await opts.worker.produce(input);
+    const artifact = await opts.worker.produce(input, { signal });
     lastArtifact = artifact;
     opts.onWorkerEnd?.(i, artifact);
+
+    if (signal?.aborted) {
+      return { artifact: lastArtifact, history, approved: false, iterations: completed, cancelled: true };
+    }
 
     let verdict: Verdict | null = null;
     let source = "model";
@@ -65,20 +78,21 @@ export async function reviewLoop(
     }
     if (!verdict) {
       opts.onReviewerStart?.(i);
-      verdict = await opts.reviewer.judge(artifact);
+      verdict = await opts.reviewer.judge(artifact, { signal });
     }
     opts.onReviewerEnd?.(i, verdict, source);
 
     history.push({ iteration: i, artifact, verdict, source });
+    completed = i;
 
     if (verdict.verdict === "approve") {
-      return { artifact, history, approved: true, iterations: i };
+      return { artifact, history, approved: true, iterations: i, cancelled: false };
     }
 
     input = buildRevisionInput(initialInput, artifact, verdict);
   }
 
-  return { artifact: lastArtifact, history, approved: false, iterations: maxIters };
+  return { artifact: lastArtifact, history, approved: false, iterations: maxIters, cancelled: false };
 }
 
 function buildRevisionInput(originalTask: string, priorArtifact: string, verdict: Verdict): string {

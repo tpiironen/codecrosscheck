@@ -1,9 +1,14 @@
-import { request } from "undici";
 import { spawnSync } from "node:child_process";
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
-import type { ChatClient, ChatMessage } from "./ChatClient.js";
+import {
+  ReviewCancelledError,
+  throwIfAborted,
+  type ChatClient,
+  type ChatMessage,
+  type SendOptions,
+} from "./ChatClient.js";
 import { ModelRefusalError, assertNotRefusal, assertNotOversized } from "./vscodeLm.js";
+import { explainFailure, satisfiesStrictMode, toProviderJsonSchema } from "./schemaText.js";
 
 const DEFAULT_ENDPOINT = "https://models.github.ai/inference/chat/completions";
 
@@ -47,107 +52,100 @@ export class GithubModelsClient implements ChatClient {
     this.token = token;
   }
 
-  async sendStructured<T>(
-    messages: ChatMessage[],
-    schema: z.ZodSchema<T>,
-    schemaName: string,
-  ): Promise<T> {
-    const jsonSchema = zodToJsonSchema(schema, { name: schemaName });
-    const response_format = {
-      type: "json_schema" as const,
-      json_schema: {
-        name: schemaName,
-        // zod-to-json-schema places the actual schema under definitions[name]
-        schema:
-          (jsonSchema as { definitions?: Record<string, unknown> }).definitions?.[schemaName] ??
-          jsonSchema,
-        strict: true,
-      },
-    };
-
-    const attempt = async (msgs: ChatMessage[]): Promise<string> => {
-      const res = await request(this.endpoint, {
+  private async post(body: unknown, signal: AbortSignal | undefined): Promise<string> {
+    throwIfAborted(signal, this.modelId);
+    let res: Response;
+    try {
+      res = await fetch(this.endpoint, {
         method: "POST",
         headers: {
           authorization: `Bearer ${this.token}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({
-          model: this.modelId,
-          messages: msgs,
-          response_format,
-        }),
+        body: JSON.stringify(body),
+        signal,
       });
-      if (res.statusCode >= 400) {
-        const text = await res.body.text();
-        throw new Error(`GitHub Models request failed (${res.statusCode}): ${text}`);
-      }
-      const body = (await res.body.json()) as {
-        choices?: { message?: { content?: string } }[];
-      };
-      const content = body.choices?.[0]?.message?.content;
-      if (!content) {
-        throw new Error("GitHub Models response did not contain message content.");
-      }
-      return content;
+    } catch (err) {
+      if (signal?.aborted) throw new ReviewCancelledError(this.modelId);
+      throw err;
+    }
+    if (!res.ok) {
+      throw new Error(`GitHub Models request failed (${res.status}): ${await res.text()}`);
+    }
+    const parsed = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    const content = parsed.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error("GitHub Models response did not contain message content.");
+    }
+    return content;
+  }
+
+  async sendStructured<T>(
+    messages: ChatMessage[],
+    schema: z.ZodType<T>,
+    schemaName: string,
+    opts?: SendOptions,
+  ): Promise<T> {
+    const jsonSchema = toProviderJsonSchema(schema as z.ZodType<unknown>, schemaName);
+    const response_format = {
+      type: "json_schema" as const,
+      json_schema: {
+        name: schemaName,
+        schema: jsonSchema,
+        // Only claim strict mode when the generated schema actually satisfies
+        // it, or the provider rejects the request outright.
+        strict: satisfiesStrictMode(jsonSchema),
+      },
     };
+
+    const attempt = (msgs: ChatMessage[]) =>
+      this.post({ model: this.modelId, messages: msgs, response_format }, opts?.signal);
 
     const tryParse = (raw: string): T => {
       assertNotRefusal(raw, this.modelId);
-      const parsed = JSON.parse(raw) as unknown;
-      return schema.parse(parsed);
+      return schema.parse(JSON.parse(raw) as unknown);
     };
 
+    let firstRaw = "";
     let firstError: unknown;
     try {
-      const content = await attempt(messages);
-      return tryParse(content);
+      firstRaw = await attempt(messages);
+      return tryParse(firstRaw);
     } catch (err) {
+      if (err instanceof ReviewCancelledError) throw err;
       if (err instanceof ModelRefusalError) throw err;
       assertNotOversized(err, this.modelId);
       firstError = err;
     }
 
+    throwIfAborted(opts?.signal, this.modelId);
+
+    // Echo the failed response back so the model can see what it produced.
     const retryMessages: ChatMessage[] = [
       ...messages,
+      { role: "assistant", content: firstRaw },
       {
         role: "system",
         content:
-          `Your previous response was not valid JSON for schema "${schemaName}". ` +
-          `Reply with ONLY a JSON object matching this schema and nothing else: ${JSON.stringify(
-            response_format.json_schema.schema,
-          )}`,
+          `That response is not valid JSON for schema "${schemaName}". ` +
+          `It failed with: ${explainFailure(firstError)}. ` +
+          `Reply with ONLY a JSON object matching this schema and nothing else: ${JSON.stringify(jsonSchema)}`,
       },
     ];
     try {
-      const content = await attempt(retryMessages);
-      return tryParse(content);
+      return tryParse(await attempt(retryMessages));
     } catch (err) {
+      if (err instanceof ReviewCancelledError) throw err;
       if (err instanceof ModelRefusalError) throw err;
       assertNotOversized(err, this.modelId);
       throw new Error(
         `Reviewer response failed schema "${schemaName}" twice. ` +
-          `First error: ${(firstError as Error)?.message}. Retry error: ${(err as Error)?.message}`,
+          `First error: ${explainFailure(firstError)}. Retry error: ${explainFailure(err)}.`,
       );
     }
   }
 
-  async sendText(messages: ChatMessage[]): Promise<string> {
-    const res = await request(this.endpoint, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ model: this.modelId, messages }),
-    });
-    if (res.statusCode >= 400) {
-      const text = await res.body.text();
-      throw new Error(`GitHub Models request failed (${res.statusCode}): ${text}`);
-    }
-    const body = (await res.body.json()) as { choices?: { message?: { content?: string } }[] };
-    const content = body.choices?.[0]?.message?.content;
-    if (!content) throw new Error("GitHub Models response did not contain message content.");
-    return content;
+  async sendText(messages: ChatMessage[], opts?: SendOptions): Promise<string> {
+    return this.post({ model: this.modelId, messages }, opts?.signal);
   }
 }

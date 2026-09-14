@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
-import { VscodeLmClient } from "./clients/vscodeLm.js";
-import { buildReviewer, buildWorkerWithPrompt, loadPromptByName } from "./agents.js";
+import { buildReviewer, buildWorkerWithPrompt, loadPromptByName, reviewerOwaspEdition } from "./agents.js";
+import { readConfig, resolveClients, stripVendor, type ResolvedConfig } from "./config.js";
 import { runPipeline, type PipelineEvent } from "./pipeline.js";
 import { loadChange, renderChangeFrame } from "./openspec/loader.js";
 import { validateStrict } from "./openspec/validate.js";
 import { getChangeDiff } from "./openspec/diff.js";
 import type { Stage, Verdict } from "./schemas.js";
 import type { LoopOptions } from "./loop.js";
+import { ReviewCancelledError } from "./clients/ChatClient.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,134 +25,70 @@ import {
   parseBlockedFindings,
   parseDisagreements,
   parseReferencedFiles,
+  pruneTranscripts,
   runBuildGate,
   type ApplyOutcome,
   type BlockedFinding,
   type Disagreement,
+  type EditHost,
   type FsLike,
 } from "./applyReview.js";
 
 const PARTICIPANT_ID = "codecrosscheck";
+/** Command backing the "apply" buttons; opens chat pre-filled with the slash command. */
+const APPLY_COMMAND = "codecrosscheck.runApplyReview";
 const SLASH_TO_STAGE: Record<string, Stage[]> = {
   plan: ["plan"],
   code: ["code"],
   execute: ["execute"],
-  "review-branch": ["plan"],
 };
+
+/**
+ * How a review dialogue ended. `rebutted` is distinct from `approved` on
+ * purpose: the reviewer never approved, the worker merely talked its way out
+ * of every finding, and only the user can adjudicate that.
+ */
+type ReviewOutcome = "approved" | "rebutted" | "exhausted" | "cancelled" | "failed";
+
+interface CccResultMetadata {
+  outcome: ReviewOutcome;
+  command: string;
+  hasFixProposal: boolean;
+  iterations: number;
+  [key: string]: unknown;
+}
+
+/** Bridge VS Code's CancellationToken to the AbortSignal the engine speaks. */
+function toAbortSignal(token: vscode.CancellationToken): { signal: AbortSignal; dispose(): void } {
+  const controller = new AbortController();
+  if (token.isCancellationRequested) controller.abort();
+  const sub = token.onCancellationRequested(() => controller.abort());
+  return { signal: controller.signal, dispose: () => sub.dispose() };
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const handler: vscode.ChatRequestHandler = async (request, _ctx, stream, token) => {
-    void token;
-    const cmd = request.command ?? "";
-
-    if (cmd.startsWith("openspec-")) {
-      await handleOpenSpecCommand(cmd, request, stream);
-      return;
+    const cancellation = toAbortSignal(token);
+    try {
+      return await routeRequest(request, stream, cancellation.signal);
+    } catch (err) {
+      if (err instanceof ReviewCancelledError) {
+        stream.markdown(`\n\u23f9\ufe0f Cancelled.\n`);
+        return { metadata: { outcome: "cancelled", command: request.command ?? "", hasFixProposal: false, iterations: 0 } };
+      }
+      const message = (err as Error)?.message ?? String(err);
+      stream.markdown(`\n\u274c CodeCrossCheck failed: \`${message}\`\n`);
+      return {
+        errorDetails: { message },
+        metadata: { outcome: "failed", command: request.command ?? "", hasFixProposal: false, iterations: 0 },
+      };
+    } finally {
+      cancellation.dispose();
     }
-
-    const cfg = vscode.workspace.getConfiguration("codecrosscheck");
-    const workerFamily = (cfg.get<string>("workerModelOverride") ?? "").trim() || (cfg.get<string>("workerModel") ?? "gpt-5.4");
-    const reviewerFamily = (cfg.get<string>("reviewerModelOverride") ?? "").trim() || (cfg.get<string>("reviewerModel") ?? "claude-opus-4.6");
-    const useChatPickerWorker = cfg.get<boolean>("useChatPickerWorker") ?? true;
-    const maxIters = cfg.get<number>("maxIters") ?? 3;
-    const timeoutMs = cfg.get<number>("execute.timeoutMs") ?? 30_000;
-    const allowNetwork = cfg.get<boolean>("execute.allowNetwork") ?? false;
-
-    const stages = SLASH_TO_STAGE[cmd] ?? (["plan", "code", "execute"] as Stage[]);
-
-    // /review-branch: single CODE-reviewer pass on the diff. No worker, no loop —
-    // the reviewer's verdict IS the review. Iterating would just have the worker
-    // rewrite plans about reviewing instead of producing a review.
-    if (cmd === "review-branch") {
-      await handleReviewBranch(request, stream, cfg);
-      return;
-    }
-
-    if (cmd === "apply-review") {
-      await handleApplyReview(request, stream, cfg);
-      return;
-    }
-
-    const resolvedPrompt = request.prompt;
-
-    // Worker: prefer the model the user picked in the Copilot Chat picker
-    // (request.model) so the participant respects their selection. Fall back
-    // to the configured workerModel family. Reviewer stays config-driven so
-    // it remains cross-vendor.
-    const workerClient = useChatPickerWorker && request.model
-      ? new VscodeLmClient({ family: request.model.family, model: request.model })
-      : new VscodeLmClient({ family: stripVendor(workerFamily) });
-    const reviewerClient = new VscodeLmClient({ family: stripVendor(reviewerFamily) });
-
-    if (workerClient.modelId === reviewerClient.modelId) {
-      stream.markdown(
-        `> **Note:** worker and reviewer resolved to the same model (\`${workerClient.modelId}\`). ` +
-          `Cross-vendor review is disabled. Pick a different model in the chat picker, ` +
-          `or set \`codecrosscheck.useChatPickerWorker\` to \`false\`.\n\n`,
-      );
-    }
-
-    stream.markdown(
-      `Running CodeCrossCheck — worker \`${workerClient.modelId}\`, reviewer \`${reviewerClient.modelId}\`.\n\n`,
-    );
-
-    const transcriptPath = openTranscript();
-    const writeEvent = (event: Record<string, unknown>) => {
-      fs.appendFileSync(transcriptPath, JSON.stringify(event) + "\n", "utf8");
-    };
-
-    const onEvent = createPipelineEventHandler(stream, writeEvent);
-
-    const startedAt = Date.now();
-    const result = await runPipeline(resolvedPrompt, {
-      workerClient,
-      reviewerClient,
-      stages,
-      maxIters,
-      sandbox: { timeoutMs, allowNetwork },
-      onEvent,
-    });
-    const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-
-    writeEvent({ event: "completed", approved: result.approved });
-    const uri = vscode.Uri.file(transcriptPath);
-
-    // Final summary card. Always show the last verdict's outstanding issues and the
-    // last artifact so the user has actionable output even when the cap is hit.
-    const lastStage = result.stages[result.stages.length - 1];
-    const lastIter = lastStage?.result.history[lastStage.result.history.length - 1];
-    const lastVerdict = lastIter?.verdict;
-    const lastArtifact = lastStage?.result.artifact ?? "";
-    const totalIters = result.stages.reduce((n, s) => n + s.result.iterations, 0);
-
-    stream.markdown(`\n---\n\n## Summary\n\n`);
-    if (result.approved) {
-      stream.markdown(
-        `\u2705 **Approved** after ${totalIters} iteration(s) across ${result.stages.length} stage(s) in ${elapsedSec}s.\n\n`,
-      );
-    } else {
-      const counts = countSeverities(lastVerdict);
-      stream.markdown(
-        `\u26a0\ufe0f **Did not converge** — iteration cap hit on stage \`${lastStage?.stage}\` after ${totalIters} iteration(s) in ${elapsedSec}s.\n\n` +
-          `The last reviewer verdict still flagged ${lastVerdict?.issues.length ?? 0} issue(s) ` +
-          `(\ud83d\udd34 ${counts.high} high, \ud83d\udfe1 ${counts.medium} medium, \ud83d\udd35 ${counts.low} low). ` +
-          `The best-effort artifact below is the worker's last attempt; treat it as a draft, not an approved result.\n\n` +
-          `**Next steps:** raise \`codecrosscheck.maxIters\`, refine the prompt to scope down, or accept the draft and address the remaining issues manually.\n\n`,
-      );
-    }
-
-    if (lastArtifact) {
-      stream.markdown(`### Final artifact (\`${lastStage?.stage}\`)\n\n`);
-      stream.markdown(`<details open><summary>${lastArtifact.length} chars</summary>\n\n`);
-      stream.markdown(`\`\`\`\n${lastArtifact}\n\`\`\`\n\n</details>\n\n`);
-    }
-
-    stream.markdown(
-      `Transcript: [${path.basename(transcriptPath)}](${uri.toString()})\n`,
-    );
   };
 
   const participant = vscode.chat.createChatParticipant(PARTICIPANT_ID, handler);
+  participant.followupProvider = { provideFollowups };
   context.subscriptions.push(participant);
 
   context.subscriptions.push(
@@ -164,11 +101,172 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("codecrosscheck.installSkill", () =>
       installDelegationSkill(context),
     ),
+    vscode.commands.registerCommand("codecrosscheck.pickModels", () => pickModels()),
+    vscode.commands.registerCommand(APPLY_COMMAND, () =>
+      vscode.commands.executeCommand("workbench.action.chat.open", {
+        query: `@${PARTICIPANT_ID} /apply-review`,
+      }),
+    ),
   );
+}
+
+function provideFollowups(result: vscode.ChatResult): vscode.ChatFollowup[] {
+  const meta = result.metadata as CccResultMetadata | undefined;
+  if (!meta) return [];
+  const followups: vscode.ChatFollowup[] = [];
+  if (meta.hasFixProposal) {
+    followups.push({ command: "apply-review", prompt: "", label: "Apply the fix proposal" });
+  }
+  if (meta.outcome === "exhausted") {
+    followups.push({
+      command: "review-branch",
+      prompt: `max-iters=${Math.min(20, meta.iterations + 4)}`,
+      label: "Re-run with more iterations",
+    });
+  }
+  if (meta.outcome === "rebutted") {
+    followups.push({
+      command: "review-branch",
+      prompt: "force-fix-all",
+      label: "Override the rebuttals and fix everything",
+    });
+  }
+  return followups;
+}
+
+async function routeRequest(
+  request: vscode.ChatRequest,
+  stream: vscode.ChatResponseStream,
+  signal: AbortSignal,
+): Promise<vscode.ChatResult> {
+  const cmd = request.command ?? "";
+
+  if (cmd.startsWith("openspec-")) {
+    return handleOpenSpecCommand(cmd, request, stream, signal);
+  }
+  const cfg = readConfig(vscode.workspace.getConfiguration("codecrosscheck"));
+
+  if (cmd === "review-branch") {
+    return handleReviewBranch(request, stream, cfg, signal);
+  }
+  if (cmd === "apply-review") {
+    return handleApplyReview(request, stream, cfg, signal);
+  }
+
+  const stages = SLASH_TO_STAGE[cmd] ?? (["plan", "code", "execute"] as Stage[]);
+  const { worker: workerClient, reviewer: reviewerClient, sameModel } = resolveClients(cfg, request.model);
+
+  if (sameModel) {
+    stream.markdown(
+      `> **Note:** worker and reviewer resolved to the same model (\`${workerClient.modelId}\`). ` +
+        `Cross-vendor review is disabled. Pick a different model in the chat picker, ` +
+        `or set \`codecrosscheck.useChatPickerWorker\` to \`false\`.\n\n`,
+    );
+  }
+
+  stream.markdown(
+    `Running CodeCrossCheck — worker \`${workerClient.modelId}\`, reviewer \`${reviewerClient.modelId}\`.\n\n`,
+  );
+
+  const attached = await readAttachments(request, stream);
+  const resolvedPrompt = attached ? `${request.prompt}\n\n${attached}` : request.prompt;
+
+  const transcript = await openTranscript(cfg);
+  const onEvent = createPipelineEventHandler(stream, transcript.write);
+
+  const startedAt = Date.now();
+  const result = await runPipeline(resolvedPrompt, {
+    workerClient,
+    reviewerClient,
+    stages,
+    maxIters: cfg.maxIters,
+    sandbox: { timeoutMs: cfg.executeTimeoutMs },
+    signal,
+    onEvent,
+  });
+  const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+  const lastStage = result.stages[result.stages.length - 1];
+  const lastIter = lastStage?.result.history[lastStage.result.history.length - 1];
+  const lastVerdict = lastIter?.verdict;
+  const lastArtifact = lastStage?.result.artifact ?? "";
+  const totalIters = result.stages.reduce((n, s) => n + s.result.iterations, 0);
+  const outcome: ReviewOutcome = result.cancelled
+    ? "cancelled"
+    : result.approved
+      ? "approved"
+      : "exhausted";
+
+  transcript.write({ event: "completed", approved: result.approved, cancelled: result.cancelled });
+
+  stream.markdown(`\n---\n\n## Summary\n\n`);
+  if (outcome === "cancelled") {
+    stream.markdown(
+      `\u23f9\ufe0f **Cancelled** after ${totalIters} iteration(s) in ${elapsedSec}s. Partial output below.\n\n`,
+    );
+  } else if (outcome === "approved") {
+    stream.markdown(
+      `\u2705 **Approved** after ${totalIters} iteration(s) across ${result.stages.length} stage(s) in ${elapsedSec}s.\n\n`,
+    );
+  } else {
+    const counts = countSeverities(lastVerdict);
+    stream.markdown(
+      `\u26a0\ufe0f **Did not converge** — iteration cap hit on stage \`${lastStage?.stage}\` after ${totalIters} iteration(s) in ${elapsedSec}s.\n\n` +
+        `The last reviewer verdict still flagged ${lastVerdict?.issues.length ?? 0} issue(s) ` +
+        `(\ud83d\udd34 ${counts.high} high, \ud83d\udfe1 ${counts.medium} medium, \ud83d\udd35 ${counts.low} low). ` +
+        `The best-effort artifact below is the worker's last attempt; treat it as a draft, not an approved result.\n\n` +
+        `**Next steps:** raise \`codecrosscheck.maxIters\`, refine the prompt to scope down, or accept the draft and address the remaining issues manually.\n\n`,
+    );
+  }
+
+  if (lastArtifact) {
+    stream.markdown(`### Final artifact (\`${lastStage?.stage}\`)\n\n`);
+    stream.markdown(`<details open><summary>${lastArtifact.length} chars</summary>\n\n`);
+    stream.markdown(`\`\`\`\n${lastArtifact}\n\`\`\`\n\n</details>\n\n`);
+  }
+
+  linkTranscript(stream, transcript.path);
+  return {
+    metadata: { outcome, command: cmd, hasFixProposal: false, iterations: totalIters },
+  };
 }
 
 export function deactivate(): void {
   // no-op
+}
+
+/** Read files the user attached to the chat request so they are not discarded. */
+async function readAttachments(
+  request: vscode.ChatRequest,
+  stream: vscode.ChatResponseStream,
+): Promise<string> {
+  const parts: string[] = [];
+  const named: string[] = [];
+  for (const ref of request.references ?? []) {
+    const value = ref.value as unknown;
+    let uri: vscode.Uri | undefined;
+    let range: vscode.Range | undefined;
+    if (value instanceof vscode.Uri) {
+      uri = value;
+    } else if (value && typeof value === "object" && "uri" in value) {
+      uri = (value as { uri: vscode.Uri }).uri;
+      range = (value as { range?: vscode.Range }).range;
+    }
+    if (!uri) continue;
+    try {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const text = range ? doc.getText(range) : doc.getText();
+      const label = vscode.workspace.asRelativePath(uri) + (range ? `:${range.start.line + 1}-${range.end.line + 1}` : "");
+      parts.push(`## Attached: ${label}\n\n\`\`\`\n${text}\n\`\`\``);
+      named.push(label);
+      stream.reference(uri);
+    } catch {
+      // Unreadable attachment; skip rather than fail the run.
+    }
+  }
+  if (parts.length === 0) return "";
+  stream.markdown(`_Using ${named.length} attached file(s): ${named.map((n) => `\`${n}\``).join(", ")}._\n\n`);
+  return ["# Attached context", "", ...parts].join("\n");
 }
 
 async function reviewEditorRange(useSelection: boolean): Promise<void> {
@@ -181,14 +279,61 @@ async function reviewEditorRange(useSelection: boolean): Promise<void> {
     ? editor.document.getText(editor.selection)
     : editor.document.getText();
 
+  const cfg = readConfig(vscode.workspace.getConfiguration("codecrosscheck"));
+  const { reviewer: reviewerClient } = resolveClients(cfg, undefined);
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: `CodeCrossCheck: reviewing with ${reviewerClient.modelId}…`, cancellable: true },
+    async (_progress, token) => {
+      const cancellation = toAbortSignal(token);
+      try {
+        const verdict = await buildReviewer("code", reviewerClient).judge(text, {
+          signal: cancellation.signal,
+        });
+        showVerdictWebview(verdict);
+      } catch (err) {
+        if (err instanceof ReviewCancelledError) return;
+        void vscode.window.showErrorMessage(`CodeCrossCheck review failed: ${(err as Error).message}`);
+      } finally {
+        cancellation.dispose();
+      }
+    },
+  );
+}
+
+/** Offer the model families this session can actually reach, and store the choice. */
+async function pickModels(): Promise<void> {
+  const models = await vscode.lm.selectChatModels({});
+  if (models.length === 0) {
+    void vscode.window.showErrorMessage(
+      "No language models are available in this VS Code session. Sign in to Copilot and try again.",
+    );
+    return;
+  }
+  const items = Array.from(
+    new Map(models.map((m) => [`${m.vendor}/${m.family}`, m])).values(),
+  ).map((m) => ({ label: `${m.vendor}/${m.family}`, description: m.name }));
+
+  const worker = await vscode.window.showQuickPick(items, {
+    title: "CodeCrossCheck: worker model (the producing LLM)",
+    ignoreFocusOut: true,
+  });
+  if (!worker) return;
+  const reviewer = await vscode.window.showQuickPick(
+    items.filter((i) => i.label !== worker.label),
+    {
+      title: "CodeCrossCheck: reviewer model (must differ for cross-vendor review)",
+      ignoreFocusOut: true,
+    },
+  );
+  if (!reviewer) return;
+
   const cfg = vscode.workspace.getConfiguration("codecrosscheck");
-  const reviewerFamily = stripVendor((cfg.get<string>("reviewerModelOverride") ?? "").trim() || (cfg.get<string>("reviewerModel") ?? "claude-opus-4.6"));
-  const reviewerClient = new VscodeLmClient({ family: reviewerFamily });
-
-  const reviewer = buildReviewer("code", reviewerClient);
-  const verdict = await reviewer.judge(text);
-
-  showVerdictWebview(verdict);
+  await cfg.update("workerModel", worker.label, vscode.ConfigurationTarget.Global);
+  await cfg.update("reviewerModel", reviewer.label, vscode.ConfigurationTarget.Global);
+  void vscode.window.showInformationMessage(
+    `CodeCrossCheck: worker ${worker.label}, reviewer ${reviewer.label}.`,
+  );
 }
 
 function showVerdictWebview(verdict: Verdict): void {
@@ -196,16 +341,19 @@ function showVerdictWebview(verdict: Verdict): void {
     "codecrosscheckReview",
     `CodeCrossCheck — ${verdict.verdict}`,
     vscode.ViewColumn.Beside,
-    {},
+    { localResourceRoots: [] },
   );
   const rows = verdict.issues
     .map(
       (it) =>
-        `<tr><td>${escape(it.severity)}</td><td>${escape(it.where)}</td><td>${escape(it.why)}</td><td>${escape(it.suggestion)}</td></tr>`,
+        `<tr><td>${escapeHtml(it.severity)}</td><td>${escapeHtml(it.where)}</td><td>${escapeHtml(it.why)}</td><td>${escapeHtml(it.suggestion)}</td></tr>`,
     )
     .join("");
-  panel.webview.html = `<!doctype html><html><body>
-    <h2>Verdict: ${escape(verdict.verdict)}</h2>
+  panel.webview.html = `<!doctype html><html><head>
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'none'; style-src 'unsafe-inline';">
+  </head><body>
+    <h2>Verdict: ${escapeHtml(verdict.verdict)}</h2>
     <table border="1" cellpadding="6" cellspacing="0">
       <tr><th>severity</th><th>where</th><th>why</th><th>suggestion</th></tr>
       ${rows || "<tr><td colspan='4'><em>No issues.</em></td></tr>"}
@@ -225,71 +373,70 @@ function countSeverities(v: Verdict | undefined): { high: number; medium: number
 }
 
 /**
- * /review-branch handler: produces an actual code review (not a meta-plan).
- * Single CODE-reviewer pass on the branch diff. The reviewer's verdict IS the
- * review report — no worker, no loop. Iterating would just have the worker
- * rewrite "how I will review" plans instead of producing the review.
+ * `/review-branch`: the reviewer judges the branch diff, the worker proposes
+ * fixes, and the reviewer re-judges the proposal until it approves, the
+ * iteration cap is hit, or every finding has been rebutted.
  */
 async function handleReviewBranch(
   request: vscode.ChatRequest,
   stream: vscode.ChatResponseStream,
-  cfg: vscode.WorkspaceConfiguration,
-): Promise<void> {
+  cfg: ResolvedConfig,
+  signal: AbortSignal,
+): Promise<vscode.ChatResult> {
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
 
   // Parse optional diff-base from prompt (e.g. "diff-base=empty" or "diff-base=origin/develop").
   const diffBaseMatch = request.prompt.match(/\bdiff-base=(\S+)/i);
   const diffBase = diffBaseMatch?.[1];
+  const committedOnly = /\bcommitted-only\b/i.test(request.prompt);
 
   stream.progress(`Computing branch diff${diffBase ? ` vs ${diffBase}` : ""}…`);
-  const diff = await getChangeDiff({ cwd, baseRef: diffBase }).catch((err: Error) => {
-    stream.markdown(`❌ Could not compute branch diff: \`${err.message}\`\n\n`);
-    return "";
-  });
-  if (!diff.trim()) {
-    stream.markdown(`⚠️ No diff found. Nothing to review.\n\n`);
-    return;
+  let diff: string;
+  let diffDescription: string;
+  try {
+    const computed = await getChangeDiff({ cwd, baseRef: diffBase, committedOnly });
+    diff = computed.patch;
+    diffDescription = computed.description;
+  } catch (err) {
+    const message = `Could not compute branch diff: ${(err as Error).message}`;
+    stream.markdown(`❌ ${message}\n\n`);
+    return failure(message, "review-branch");
   }
+  if (!diff.trim()) {
+    stream.markdown(`⚠️ No diff found (${diffDescription}). Nothing to review.\n\n`);
+    return failure(`No diff found (${diffDescription}).`, "review-branch");
+  }
+
+  const attached = await readAttachments(request, stream);
 
   // Hard char-budget guard: bail fast with a clear message instead of letting the LM return
   // "Message exceeds token limit" + an empty body that the schema-retry path cannot recover.
-  // ~200 KB is a conservative default that fits in even the smallest Copilot context windows;
-  // override via `codecrosscheck.reviewBranch.maxDiffChars` (0 disables the guard).
-  const maxDiffChars = cfg.get<number>("reviewBranch.maxDiffChars") ?? 200_000;
-  if (maxDiffChars > 0 && diff.length > maxDiffChars) {
+  const assembledChars = diff.length + attached.length;
+  if (cfg.maxDiffChars > 0 && assembledChars > cfg.maxDiffChars) {
+    const message =
+      `Branch diff is too large to review in one pass: ${assembledChars.toLocaleString()} chars ` +
+      `(cap ${cfg.maxDiffChars.toLocaleString()}).`;
     stream.markdown(
-      `❌ Branch diff is too large to review in one pass: \`${diff.length.toLocaleString()}\` chars ` +
-        `(cap \`${maxDiffChars.toLocaleString()}\`). The reviewer model will reject the prompt as ` +
+      `❌ ${message} The reviewer model will reject the prompt as ` +
         `exceeding its context window. Options: pass a closer base via \`diff-base=<ref>\` ` +
-        `(e.g. \`diff-base=origin/master\`), split the branch into smaller PRs, or raise ` +
+        `(e.g. \`diff-base=origin/master\`), detach large attachments, split the branch, or raise ` +
         `\`codecrosscheck.reviewBranch.maxDiffChars\` if you have confirmed the picked reviewer model ` +
         `can handle it.\n\n`,
     );
-    return;
+    return failure(message, "review-branch");
   }
 
-  // Worker = picker model if set, else configured worker. Reviewer = configured reviewer.
-  const workerFamilyCfg = (cfg.get<string>("workerModelOverride") ?? "").trim() || (cfg.get<string>("workerModel") ?? "gpt-5.4");
-  const reviewerFamilyCfg = (cfg.get<string>("reviewerModelOverride") ?? "").trim() || (cfg.get<string>("reviewerModel") ?? "openai/gpt-5.4");
-  const useChatPickerWorker = cfg.get<boolean>("useChatPickerWorker") ?? true;
-  let maxIters = cfg.get<number>("maxIters") ?? 3;
-
-  const workerClient = useChatPickerWorker && request.model
-    ? new VscodeLmClient({ family: request.model.family, model: request.model })
-    : new VscodeLmClient({ family: stripVendor(workerFamilyCfg) });
-  const reviewerClient = new VscodeLmClient({ family: stripVendor(reviewerFamilyCfg) });
-
-  const fixerPrompt = loadPromptByName("review_branch_fixer");
-  const fixer = buildWorkerWithPrompt(fixerPrompt, workerClient);
+  const { worker: workerClient, reviewer: reviewerClient } = resolveClients(cfg, request.model);
+  const fixer = buildWorkerWithPrompt(loadPromptByName("review_branch_fixer"), workerClient);
   const reviewer = buildReviewer("code", reviewerClient);
 
   const userTask = request.prompt.trim();
   // Recognise user adjudication directive that overrides any worker rebuttals.
   const forceFixAll = /\bforce-fix-all\b/i.test(userTask);
-  // Recognise per-invocation override of `codecrosscheck.maxIters`.
-  // Accepts `max-iters=N`, `maxiters=N`, or `iters=N` (whole-token, 1..20).
+  // Per-invocation override of `codecrosscheck.maxIters`: `max-iters=N`, `maxiters=N` or `iters=N`.
+  let maxIters = cfg.maxIters;
   const itersMatch = userTask.match(/\b(?:max-?iters|iters)\s*=\s*(\d{1,2})\b/i);
-  if (itersMatch) {
+  if (itersMatch?.[1]) {
     const parsed = Number.parseInt(itersMatch[1], 10);
     if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 20) {
       maxIters = parsed;
@@ -298,98 +445,82 @@ async function handleReviewBranch(
   const taskHeader = userTask
     ? `# Reviewer instructions\n${userTask}`
     : `# Reviewer instructions\nReview this branch diff for OWASP issues, dead code, missing tests, and OpenSpec drift. Cite file:line for each issue.`;
-  const diffBlock = `# Branch diff${diffBase ? ` (vs ${diffBase})` : " (vs merge-base)"}\n\n\`\`\`diff\n${diff}\n\`\`\``;
+  const diffBody = `\`\`\`diff\n${diff}\n\`\`\``;
+  const diffBlock = `# Branch diff (${diffDescription})\n\n${diffBody}`;
+  const attachedBlock = attached ? `\n\n${attached}` : "";
 
-  const transcriptPath = openTranscript();
-  const writeEvent = (e: object) => fs.appendFileSync(transcriptPath, JSON.stringify(e) + "\n", "utf8");
+  const transcript = await openTranscript(cfg);
+  transcript.write({
+    event: "review-branch-start",
+    reviewerId: reviewer.modelId,
+    workerId: fixer.modelId,
+    owaspEdition: reviewerOwaspEdition(),
+    diffDescription,
+    diffChars: diff.length,
+    maxIters,
+  });
 
   stream.markdown(
-    `\u23f3 Branch review: worker \`${fixer.modelId}\` \u2194 reviewer \`${reviewer.modelId}\` \u00b7 diff \`${diff.length}\` chars \u00b7 cap \`${maxIters}\` iterations\n\n`,
+    `\u23f3 Branch review: worker \`${fixer.modelId}\` \u2194 reviewer \`${reviewer.modelId}\`\n\n` +
+      `Comparing **${diffDescription}** \u00b7 diff \`${diff.length.toLocaleString()}\` chars \u00b7 cap \`${maxIters}\` iterations\n\n`,
   );
 
   const startedAt = Date.now();
   let verdict: Verdict | undefined;
   let lastFixProposal = "";
   let iter = 0;
+  let outcome: ReviewOutcome = "exhausted";
 
-  // Findings the worker has already rebutted with `**Fix:** Disagree: …` —
-  // fingerprinted by `${severity}|${where}|${why}` so a near-identical
-  // restatement of the same finding in a later round can be detected and
-  // dropped. Without this, the reviewer keeps re-flagging the disagreed
-  // finding, the worker keeps rebutting, and the loop burns iterations on
-  // a question only the user can adjudicate. `force-fix-all` bypasses
-  // this memory by user opt-in.
+  // Findings the worker has already rebutted with `**Fix:** Disagree: …`,
+  // fingerprinted so a restatement in a later round can be dropped. Without
+  // this the reviewer keeps re-flagging, the worker keeps rebutting, and the
+  // loop burns iterations on a question only the user can settle.
   const rejectedFingerprints = new Set<string>();
-  // Disagreements accumulated across all rounds (each entry seen once,
-  // keyed by fingerprint via the Set above) so the final summary shows
-  // every rebuttal, not just the ones from the last proposal.
   const cumulativeDisagreements: Array<Disagreement & { fingerprint: string }> = [];
 
-  // FsLike for buildFileInventory (only needs exists + readFile here).
-  const inventoryFs: FsLike = {
-    async readDir(dir) { return fsp.readdir(dir); },
-    async stat(p) { const st = await fsp.stat(p); return { mtimeMs: st.mtimeMs }; },
-    async readFile(p) { return fsp.readFile(p, "utf8"); },
-    async writeFile() { /* unused */ },
-    async exists(p) { try { await fsp.access(p); return true; } catch { return false; } },
-  };
+  const inventoryFs: FsLike = nodeFsLike();
   const fileContextCap = 60_000; // total chars budget for repo file context
 
   // ---- Iteration 1: reviewer reads the raw diff. ----
   iter = 1;
   stream.markdown(`---\n\n### Iteration ${iter} / ${maxIters} \u2014 initial review\n\n`);
 
-  // Best-effort token-budget preflight on the reviewer model. If the model exposes
-  // `countTokens` + `maxInputTokens` (vscode 1.93+ LanguageModelChat), measure the assembled
-  // prompt and bail before the call when it cannot fit. This catches cases where the diff is
-  // under `maxDiffChars` but still too large for a smaller reviewer model.
-  const reviewerPrompt = `${taskHeader}\n\n${diffBlock}`;
-  try {
-    const lmModule = await import("vscode").catch(() => undefined);
-    if (lmModule?.lm?.selectChatModels) {
-      const candidates = await lmModule.lm.selectChatModels({ family: stripVendor(reviewerFamilyCfg) });
-      const lmModel = candidates[0] as unknown as { countTokens?: (t: string) => Thenable<number>; maxInputTokens?: number } | undefined;
-      if (lmModel?.countTokens && typeof lmModel.maxInputTokens === "number" && lmModel.maxInputTokens > 0) {
-        const tokens = await lmModel.countTokens(reviewerPrompt);
-        // Reserve ~10% of the window for the response. If the prompt alone exceeds 90% of
-        // maxInputTokens the LM will reject it.
-        const budget = Math.floor(lmModel.maxInputTokens * 0.9);
-        if (tokens > budget) {
-          stream.markdown(
-            `\u274c Reviewer prompt is too large for \`${reviewer.modelId}\`: \`${tokens.toLocaleString()}\` tokens ` +
-              `vs budget \`${budget.toLocaleString()}\` (90% of maxInputTokens \`${lmModel.maxInputTokens.toLocaleString()}\`). ` +
-              `Pass a closer \`diff-base=<ref>\`, pick a larger reviewer model via \`codecrosscheck.reviewerModel\`, ` +
-              `or split the branch.\n\n`,
-          );
-          return;
-        }
-      }
-    }
-  } catch {
-    // countTokens is best-effort; if it throws (older VS Code, missing on this model), fall through.
+  const reviewerPrompt = `${taskHeader}\n\n${diffBlock}${attachedBlock}`;
+  const preflight = await tokenPreflight(cfg, reviewerPrompt);
+  if (preflight) {
+    stream.markdown(
+      `\u274c Reviewer prompt is too large for \`${reviewer.modelId}\`: \`${preflight.tokens.toLocaleString()}\` tokens ` +
+        `vs budget \`${preflight.budget.toLocaleString()}\` (90% of maxInputTokens \`${preflight.max.toLocaleString()}\`). ` +
+        `Pass a closer \`diff-base=<ref>\`, pick a larger reviewer model via \`codecrosscheck.reviewerModel\`, ` +
+        `or split the branch.\n\n`,
+    );
+    return failure(`Reviewer prompt exceeds the context budget for ${reviewer.modelId}.`, "review-branch");
   }
 
   stream.progress(`Reviewer \`${reviewer.modelId}\` reading diff\u2026`);
   try {
-    verdict = await reviewer.judge(reviewerPrompt);
+    verdict = await reviewer.judge(reviewerPrompt, { signal });
   } catch (err) {
-    stream.markdown(`\u274c Reviewer call failed: \`${(err as Error).message}\`\n\n`);
-    return;
+    if (err instanceof ReviewCancelledError) throw err;
+    const message = `Reviewer call failed: ${(err as Error).message}`;
+    stream.markdown(`\u274c ${message}\n\n`);
+    return failure(message, "review-branch");
   }
   renderVerdict(stream, verdict);
-  writeEvent({ event: "review-branch-iter", iteration: iter, role: "reviewer", reviewerId: reviewer.modelId, verdict });
+  transcript.write({ event: "review-branch-iter", iteration: iter, role: "reviewer", reviewerId: reviewer.modelId, verdict });
 
   // ---- Iterations 2..N: worker proposes fixes, reviewer re-judges. ----
   while (iter < maxIters && verdict.verdict !== "approve") {
+    if (signal.aborted) {
+      outcome = "cancelled";
+      break;
+    }
     iter++;
     stream.markdown(`---\n\n### Iteration ${iter} / ${maxIters} \u2014 worker proposes fixes\n\n`);
     stream.progress(`Worker \`${fixer.modelId}\` drafting fixes for ${verdict.issues.length} issue(s)\u2026`);
 
-    // Harvest workspace-relative paths the worker is likely to need:
-    //   1. file:line cited in each finding's `where`
-    //   2. paths in the worker's prior fix proposal (incl. "Data I need" sections)
-    // Read those files (cap total) and inject as a "Repository file context"
-    // block so the fixer can produce concrete patches instead of sketches.
+    // Harvest workspace-relative paths the worker is likely to need, read them,
+    // and inject as context so the fixer can produce concrete patches.
     const harvested = new Set<string>();
     for (const it of verdict.issues) {
       for (const p of harvestPathsFromText(it.where)) harvested.add(p);
@@ -430,23 +561,23 @@ async function handleReviewBranch(
       forceFixAll,
     });
     try {
-      lastFixProposal = await fixer.produce(fixerInput);
+      lastFixProposal = await fixer.produce(fixerInput, { signal });
     } catch (err) {
+      if (err instanceof ReviewCancelledError) {
+        outcome = "cancelled";
+        break;
+      }
       stream.markdown(`\u274c Worker call failed: \`${(err as Error).message}\`\n\n`);
       break;
     }
-    writeEvent({ event: "review-branch-iter", iteration: iter, role: "worker", workerId: fixer.modelId, artifact: lastFixProposal });
+    transcript.write({ event: "review-branch-iter", iteration: iter, role: "worker", workerId: fixer.modelId, artifact: lastFixProposal });
     renderWorkerArtifact(stream, lastFixProposal);
 
-    // Capture this round's worker rebuttals against the verdict that was
-    // fed in. Each `**Fix:** Disagree: …` section's id is 1-based and
-    // matches the order of `verdict.issues`. Mark every rebutted issue's
-    // fingerprint as "rejected" so the next reviewer pass cannot send it
-    // back through the loop. `force-fix-all` opts out: the user wants
-    // every finding fixed regardless of prior pushback.
+    // Capture this round's rebuttals against the verdict that was fed in, so
+    // the next reviewer pass cannot send the same finding back through the
+    // loop. `force-fix-all` opts out.
     if (!forceFixAll) {
-      const roundDisagreements = parseDisagreements(lastFixProposal);
-      for (const d of roundDisagreements) {
+      for (const d of parseDisagreements(lastFixProposal)) {
         const issue = verdict.issues[d.id - 1];
         if (!issue) continue;
         const fp = issueFingerprint(issue);
@@ -459,70 +590,67 @@ async function handleReviewBranch(
 
     stream.markdown(`#### Reviewer re-judging\n\n`);
     stream.progress(`Reviewer \`${reviewer.modelId}\` checking fixes\u2026`);
-    const reviewArtifact = [
-      "# Re-review: judge a proposed fix",
-      "",
-      "You previously reviewed this branch and produced findings. The author has responded with a fix proposal.",
-      "Your job is to judge **whether the proposal, IF APPLIED, would resolve every prior finding without introducing new issues**.",
-      "",
-      "# Critical instructions",
-      "",
-      "- The diff below is the **BEFORE** state \u2014 what is currently committed. The fix proposal describes what would change.",
-      "- Do **NOT** re-flag a finding just because the diff still shows the original problem. The diff is unchanged by design \u2014 the proposal is what would change. You are evaluating the proposal, not the diff.",
-      "- For each prior finding, decide: does the proposal address it adequately? If yes, do **not** list it again. If no (proposal missing, vague, or technically wrong), list it again and say specifically what is missing or wrong.",
-      "- You MAY raise new findings only if the **proposal itself** introduces them (e.g., proposed code contains a clear bug, breaks an API, or misnames something visible in the diff).",
-      "- `approve` when every prior finding is adequately addressed by the proposal.",
-      "",
+    const reviewArtifact = buildRereviewInput({
       taskHeader,
-      "",
-      "# Branch diff (BEFORE state)",
-      "",
-      diffBlock.replace(/^# .+\n\n/, ""),
-      "",
-      "# Prior findings",
-      "",
-      formatVerdictForRereview(verdict),
-      "",
-      "# Worker's fix proposal (proposed AFTER state)",
-      "",
-      lastFixProposal,
-    ].join("\n");
+      diffDescription,
+      diffBody,
+      priorVerdict: verdict,
+      fixProposal: lastFixProposal,
+    });
     try {
-      verdict = await reviewer.judge(reviewArtifact);
+      verdict = await reviewer.judge(reviewArtifact, { signal });
     } catch (err) {
+      if (err instanceof ReviewCancelledError) {
+        outcome = "cancelled";
+        break;
+      }
       stream.markdown(`\u274c Reviewer call failed: \`${(err as Error).message}\`\n\n`);
       break;
     }
 
-    // Drop any newly-listed findings that match a fingerprint the worker
-    // already rebutted in an earlier round. The reviewer is stateless and
-    // tends to restate the same concern; without this filter the loop
-    // ping-pongs forever. If filtering empties the issue list, the helper
-    // auto-flips the verdict to `approve` so the loop exits cleanly.
-    {
-      const filtered = filterRejectedIssues(verdict, rejectedFingerprints);
-      if (filtered.dropped > 0) {
-        verdict = filtered.verdict;
-        stream.markdown(
-          `_Skipped ${filtered.dropped} finding(s) the worker already rebutted in a prior round. ` +
-            `Use \`force-fix-all\` on a future run to override._\n\n`,
-        );
-      }
+    // Drop findings the worker already rebutted. The reviewer is stateless and
+    // tends to restate the same concern; without this the loop ping-pongs.
+    const filtered = filterRejectedIssues(verdict, rejectedFingerprints);
+    if (filtered.dropped > 0) {
+      verdict = filtered.verdict;
+      stream.markdown(
+        `_Skipped ${filtered.dropped} finding(s) the worker already rebutted in a prior round. ` +
+          `Use \`force-fix-all\` on a future run to override._\n\n`,
+      );
     }
 
     renderVerdict(stream, verdict);
-    writeEvent({ event: "review-branch-iter", iteration: iter, role: "reviewer", reviewerId: reviewer.modelId, verdict });
+    transcript.write({ event: "review-branch-iter", iteration: iter, role: "reviewer", reviewerId: reviewer.modelId, verdict });
+
+    if (filtered.emptiedBySuppression) {
+      // Every remaining finding was suppressed by a rebuttal. The reviewer did
+      // NOT approve — only the user can settle this — so stop here and say so.
+      outcome = "rebutted";
+      break;
+    }
   }
+
+  if (outcome === "exhausted" && verdict?.verdict === "approve") outcome = "approved";
+  if (signal.aborted) outcome = "cancelled";
 
   const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
   const counts = countSeverities(verdict);
-  const approved = verdict?.verdict === "approve";
 
   stream.markdown(`---\n\n## Summary\n\n`);
-  if (approved) {
+  if (outcome === "approved") {
     stream.markdown(
-      `\u2705 **Approved** after ${iter} iteration(s) in ${elapsedSec}s. Reviewer is satisfied with the worker's fix proposal.\n\n`,
+      `\u2705 **Approved** after ${iter} iteration(s) in ${elapsedSec}s. The reviewer is satisfied with the worker's fix proposal.\n\n`,
     );
+  } else if (outcome === "rebutted") {
+    stream.markdown(
+      `\ud83e\udd1d **Stalled on disagreement** after ${iter} iteration(s) in ${elapsedSec}s. ` +
+        `**The reviewer did not approve.** The loop stopped because the worker rebutted every ` +
+        `remaining finding, and a rebuttal is not a fix \u2014 only you can settle it. ` +
+        `Read the ${cumulativeDisagreements.length} rebuttal(s) below and either accept them or ` +
+        `re-run with \`force-fix-all\`.\n\n`,
+    );
+  } else if (outcome === "cancelled") {
+    stream.markdown(`\u23f9\ufe0f **Cancelled** after ${iter} iteration(s) in ${elapsedSec}s. Partial output below.\n\n`);
   } else {
     stream.markdown(
       `\u26a0\ufe0f **Did not converge** after ${iter} iteration(s) in ${elapsedSec}s. ` +
@@ -534,45 +662,42 @@ async function handleReviewBranch(
 
   if (lastFixProposal) {
     stream.markdown(
-      `**Next:** run \`/apply-review\` to apply the patches in the fix proposal below. ` +
-        (approved
+      `**Next:** apply the patches in the fix proposal below. ` +
+        (outcome === "approved"
           ? `The reviewer is satisfied; once applied, run \`git diff\` and commit.\n\n`
           : `Then re-run \`/review-branch\` to address any residual findings, raise \`codecrosscheck.maxIters\` for more rounds, or scope the prompt down.\n\n`),
     );
-    stream.markdown(`### Final fix proposal\n\n<details${approved ? " open" : ""}><summary>${lastFixProposal.length} chars</summary>\n\n`);
+    stream.button({ command: APPLY_COMMAND, title: "Apply this fix proposal", arguments: [] });
+    stream.markdown(`### Final fix proposal\n\n<details${outcome === "approved" ? " open" : ""}><summary>${lastFixProposal.length} chars</summary>\n\n`);
     stream.markdown(`\`\`\`markdown\n${lastFixProposal}\n\`\`\`\n\n</details>\n\n`);
-  } else if (!approved) {
+  } else if (outcome !== "approved") {
     stream.markdown(
       `**Next steps:** raise \`codecrosscheck.maxIters\`, scope the prompt, or address the findings manually.\n\n`,
     );
   }
 
-  // Surface worker rebuttals so the user can adjudicate. We use the
-  // cumulative list collected across all rounds (not just the last
-  // proposal) because the loop drops rebutted findings from later
-  // verdicts, so by the time we exit they may no longer appear in the
-  // final fix proposal at all.
-  const disagreements: Disagreement[] = cumulativeDisagreements;
-  if (disagreements.length > 0) {
-    stream.markdown(`### \ud83e\udd14 ${disagreements.length} worker disagreement(s) pending your decision\n\n`);
+  // Surface worker rebuttals so the user can adjudicate. We use the cumulative
+  // list because the loop drops rebutted findings from later verdicts, so by
+  // the time we exit they may not appear in the final fix proposal at all.
+  if (cumulativeDisagreements.length > 0) {
+    stream.markdown(`### \ud83e\udd14 ${cumulativeDisagreements.length} worker disagreement(s) pending your decision\n\n`);
     stream.markdown(
       "The worker rebutted the following reviewer finding(s) instead of fixing them. " +
         "**Review each rebuttal below and decide.**\n\n",
     );
-    for (const d of disagreements) {
+    for (const d of cumulativeDisagreements) {
       stream.markdown(`#### ${d.id}. ${d.heading}\n\n`);
       stream.markdown(`> ${d.rebuttal.replace(/\n/g, "\n> ")}\n\n`);
     }
     stream.markdown(
       "**To proceed:**\n\n" +
         "- **Accept the rebuttals** (you agree the worker is right): run `/apply-review` \u2014 the rebutted findings simply have no edits, so nothing is applied for them.\n" +
-        "- **Override the rebuttals** (force the worker to fix anyway): re-run `/review-branch` with `force-fix-all` in the prompt, e.g. `@codecrosscheck /review-branch force-fix-all`. The fixer will be told to produce concrete fixes for every finding and may not rebut.\n\n",
+        "- **Override the rebuttals** (force the worker to fix anyway): re-run `/review-branch` with `force-fix-all` in the prompt. The fixer will be told to produce concrete fixes for every finding and may not rebut.\n\n",
     );
   }
 
   // Surface dodge patterns (sketches, "Data I need", "I cannot produce") that
-  // look like fixes but produce nothing applicable. parseBlockedFindings
-  // already excludes any issue captured by parseDisagreements.
+  // look like fixes but produce nothing applicable.
   const blocked: BlockedFinding[] = lastFixProposal ? parseBlockedFindings(lastFixProposal) : [];
   if (blocked.length > 0) {
     stream.markdown(`### \ud83d\udeab ${blocked.length} finding(s) the worker did not produce a real patch for\n\n`);
@@ -589,9 +714,52 @@ async function handleReviewBranch(
     );
   }
 
-  writeEvent({ event: "review-branch-done", approved, iterations: iter, elapsedMs: Date.now() - startedAt });
-  const uri = vscode.Uri.file(transcriptPath);
-  stream.markdown(`Transcript: [${path.basename(transcriptPath)}](${uri.toString()})\n`);
+  transcript.write({
+    event: "review-branch-done",
+    approved: outcome === "approved",
+    outcome,
+    iterations: iter,
+    elapsedMs: Date.now() - startedAt,
+  });
+  linkTranscript(stream, transcript.path);
+  return {
+    metadata: {
+      outcome,
+      command: "review-branch",
+      hasFixProposal: lastFixProposal.length > 0,
+      iterations: iter,
+    },
+  };
+}
+
+function failure(message: string, command: string): vscode.ChatResult {
+  return {
+    errorDetails: { message },
+    metadata: { outcome: "failed", command, hasFixProposal: false, iterations: 0 },
+  };
+}
+
+/**
+ * Best-effort token preflight on the reviewer model. Catches a diff that is
+ * under `maxDiffChars` but still too large for a smaller reviewer. Returns
+ * null when the prompt fits or the model does not expose token counting.
+ */
+async function tokenPreflight(
+  cfg: ResolvedConfig,
+  prompt: string,
+): Promise<{ tokens: number; budget: number; max: number } | null> {
+  try {
+    const candidates = await vscode.lm.selectChatModels({ family: stripVendor(cfg.reviewerModel) });
+    const model = candidates[0];
+    if (!model || typeof model.maxInputTokens !== "number" || model.maxInputTokens <= 0) return null;
+    const tokens = await model.countTokens(prompt);
+    // Reserve ~10% of the window for the response.
+    const budget = Math.floor(model.maxInputTokens * 0.9);
+    return tokens > budget ? { tokens, budget, max: model.maxInputTokens } : null;
+  } catch {
+    // countTokens is best-effort; if it throws, let the call proceed.
+    return null;
+  }
 }
 
 /**
@@ -602,38 +770,16 @@ async function handleReviewBranch(
 async function handleApplyReview(
   request: vscode.ChatRequest,
   stream: vscode.ChatResponseStream,
-  cfg: vscode.WorkspaceConfiguration,
-): Promise<void> {
+  cfg: ResolvedConfig,
+  signal: AbortSignal,
+): Promise<vscode.ChatResult> {
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!ws) {
     stream.markdown("\u274c No workspace folder open.\n");
-    return;
+    return failure("No workspace folder open.", "apply-review");
   }
   const transcriptsDir = path.join(ws, ".codecrosscheck", "runs");
-  const nodeFs: FsLike = {
-    async readDir(dir) {
-      return fsp.readdir(dir);
-    },
-    async stat(p) {
-      const st = await fsp.stat(p);
-      return { mtimeMs: st.mtimeMs };
-    },
-    async readFile(p) {
-      return fsp.readFile(p, "utf8");
-    },
-    async writeFile(p, content) {
-      await fsp.mkdir(path.dirname(p), { recursive: true });
-      await fsp.writeFile(p, content, "utf8");
-    },
-    async exists(p) {
-      try {
-        await fsp.access(p);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-  };
+  const nodeFs = nodeFsLike();
 
   stream.progress("Locating latest review transcript\u2026");
   const transcriptPath = await findLatestTranscript(transcriptsDir, nodeFs);
@@ -641,7 +787,7 @@ async function handleApplyReview(
     stream.markdown(
       "\u274c No review transcript found. Run `@codecrosscheck /review-branch` first to produce a fix proposal, then run `/apply-review`.\n",
     );
-    return;
+    return failure("No review transcript found.", "apply-review");
   }
   const fixProposal = await extractFixProposal(transcriptPath, nodeFs);
   if (!fixProposal) {
@@ -649,7 +795,7 @@ async function handleApplyReview(
       `\u274c Transcript [${path.basename(transcriptPath)}](${vscode.Uri.file(transcriptPath).toString()}) ` +
         "has no worker fix proposal to apply. Re-run `/review-branch`.\n",
     );
-    return;
+    return failure("Transcript has no worker fix proposal.", "apply-review");
   }
 
   const referenced = parseReferencedFiles(fixProposal.proposal);
@@ -658,11 +804,6 @@ async function handleApplyReview(
       `(iter ${fixProposal.iteration}, ${referenced.length} file(s) referenced).\n\n`,
   );
 
-  const dryRun = cfg.get<boolean>("applyReview.dryRun") ?? false;
-  const testCommand = (cfg.get<string>("applyReview.testCommand") ?? "").trim();
-  const buildCommand = (cfg.get<string>("applyReview.buildCommand") ?? "").trim();
-  const buildTimeoutMs = cfg.get<number>("applyReview.buildTimeoutMs") ?? 300_000;
-
   const { inventory, missing } = await buildFileInventory(ws, referenced, nodeFs);
   if (missing.length > 0) {
     stream.markdown(
@@ -670,16 +811,14 @@ async function handleApplyReview(
     );
   }
 
-  // Worker for edit derivation: same selection logic as /review-branch worker.
-  const workerFamilyCfg = (cfg.get<string>("workerModelOverride") ?? "").trim() || (cfg.get<string>("workerModel") ?? "gpt-5.4");
-  const useChatPickerWorker = cfg.get<boolean>("useChatPickerWorker") ?? true;
-  const workerClient = useChatPickerWorker && request.model
-    ? new VscodeLmClient({ family: request.model.family, model: request.model })
-    : new VscodeLmClient({ family: stripVendor(workerFamilyCfg) });
+  const { worker: workerClient } = resolveClients(cfg, request.model);
 
   const userExtra = request.prompt.trim();
+  const attached = await readAttachments(request, stream);
   const composed = composeApplyInput(
-    userExtra ? `${fixProposal.proposal}\n\n# Additional instructions from user\n\n${userExtra}` : fixProposal.proposal,
+    [fixProposal.proposal, userExtra ? `# Additional instructions from user\n\n${userExtra}` : "", attached]
+      .filter(Boolean)
+      .join("\n\n"),
     inventory,
   );
 
@@ -687,17 +826,20 @@ async function handleApplyReview(
   try {
     systemPrompt = loadPromptByName("apply_review_worker");
   } catch (err) {
-    stream.markdown(`\u274c Could not load apply prompt: \`${(err as Error).message}\`\n`);
-    return;
+    const message = `Could not load apply prompt: ${(err as Error).message}`;
+    stream.markdown(`\u274c ${message}\n`);
+    return failure(message, "apply-review");
   }
 
   stream.progress(`Worker \`${workerClient.modelId}\` deriving edits\u2026`);
   let edits;
   try {
-    edits = await deriveEdits(workerClient, systemPrompt, composed);
+    edits = await deriveEdits(workerClient, systemPrompt, composed, { signal });
   } catch (err) {
-    stream.markdown(`\u274c Worker failed to produce structured edits: \`${(err as Error).message}\`\n`);
-    return;
+    if (err instanceof ReviewCancelledError) throw err;
+    const message = `Worker failed to produce structured edits: ${(err as Error).message}`;
+    stream.markdown(`\u274c ${message}\n`);
+    return failure(message, "apply-review");
   }
 
   // Persist a debug artifact next to the source transcript so failures are
@@ -716,12 +858,15 @@ async function handleApplyReview(
       ),
     );
     stream.markdown(`\ud83d\udcc4 Debug log: [${path.basename(applyLogPath)}](${vscode.Uri.file(applyLogPath).toString()})\n`);
-    return;
+    return { metadata: { outcome: "exhausted", command: "apply-review", hasFixProposal: true, iterations: 0 } };
   }
-  stream.markdown(`Worker proposed **${edits.length}** edit(s)${dryRun ? " (dry-run mode)" : ""}.\n\n`);
+  stream.markdown(`Worker proposed **${edits.length}** edit(s)${cfg.dryRun ? " (dry-run mode)" : ""}.\n\n`);
 
-  const outcomes: ApplyOutcome[] = await applyEdits(ws, edits, nodeFs, { dryRun });
-  renderApplyOutcomes(stream, outcomes, dryRun);
+  const outcomes: ApplyOutcome[] = await applyEdits(ws, edits, nodeFs, {
+    dryRun: cfg.dryRun,
+    host: workspaceEditHost(),
+  });
+  renderApplyOutcomes(stream, outcomes);
 
   await nodeFs.writeFile(
     applyLogPath,
@@ -737,63 +882,110 @@ async function handleApplyReview(
   const skippedCount = outcomes.filter((o) => o.status === "skipped").length;
 
   stream.markdown(`---\n\n## Summary\n\n`);
-  if (dryRun) {
+  if (cfg.dryRun) {
     stream.markdown(
       `\ud83d\udd0d **Dry run** \u2014 would apply ${dryCount} edit(s), skip ${skippedCount}. ` +
         "Set `codecrosscheck.applyReview.dryRun` to `false` to write changes.\n\n",
     );
   } else {
     stream.markdown(
-      `\u2705 Applied **${appliedCount}** edit(s); skipped **${skippedCount}**.\n\n` +
+      `\u2705 Applied **${appliedCount}** edit(s); skipped **${skippedCount}**. Undo reverts the whole batch.\n\n` +
         "**Next steps:** run `git diff` to inspect, then commit. Re-run `/review-branch` to verify findings are closed.\n\n",
     );
   }
   stream.markdown(`\ud83d\udcc4 Debug log: [${path.basename(applyLogPath)}](${vscode.Uri.file(applyLogPath).toString()})\n\n`);
 
-  if (!dryRun && appliedCount > 0 && testCommand) {
-    const terminalName = "CodeCrossCheck: apply-review tests";
-    let term = vscode.window.terminals.find((t) => t.name === terminalName);
-    if (!term) term = vscode.window.createTerminal({ name: terminalName, cwd: ws });
-    term.show(false);
-    term.sendText(testCommand, true);
-    stream.markdown(`\u25b6\ufe0f Started \`${testCommand}\` in terminal **${terminalName}**.\n`);
-  }
+  const wantsCommands = !cfg.dryRun && appliedCount > 0 && (cfg.testCommand || cfg.buildCommand);
+  if (wantsCommands && !vscode.workspace.isTrusted) {
+    stream.markdown(
+      "\u26a0\ufe0f Skipped the configured build and test commands: running commands requires a trusted workspace. " +
+        "Use **Workspaces: Manage Workspace Trust** if you trust this folder.\n\n",
+    );
+  } else if (wantsCommands) {
+    if (cfg.testCommand) {
+      const terminalName = "CodeCrossCheck: apply-review tests";
+      let term = vscode.window.terminals.find((t) => t.name === terminalName);
+      if (!term) term = vscode.window.createTerminal({ name: terminalName, cwd: ws });
+      term.show(false);
+      term.sendText(cfg.testCommand, true);
+      stream.markdown(`\u25b6\ufe0f Started \`${cfg.testCommand}\` in terminal **${terminalName}**.\n`);
+    }
 
-  // Build gate: run synchronously, capture exit code + tail of output, and
-  // surface a clear pass/fail block in chat. On failure, point the user at
-  // /review-branch with the build output so the next round can see what
-  // broke. The gate runs only when edits actually landed (dry-run or
-  // zero-edit invocations skip it).
-  if (!dryRun && appliedCount > 0 && buildCommand) {
-    stream.markdown(`---\n\n## Build gate\n\n`);
-    stream.progress(`Running \`${buildCommand}\`\u2026`);
-    const result = await runBuildGate({ cwd: ws, command: buildCommand, timeoutMs: buildTimeoutMs });
-    const elapsedSec = (result.durationMs / 1000).toFixed(1);
-    if (result.exitCode === 0) {
-      stream.markdown(
-        `\u2705 \`${buildCommand}\` exited 0 in ${elapsedSec}s. Edits compile.\n\n`,
-      );
-    } else {
-      const reason = result.timedOut
-        ? `timed out after ${elapsedSec}s`
-        : `exited with code ${result.exitCode ?? "unknown"} in ${elapsedSec}s`;
-      stream.markdown(
-        `\u274c \`${buildCommand}\` ${reason}. The applied edits do not build.\n\n` +
-          "**Likely cause:** the worker referenced symbols (types, methods, overloads) " +
-          "that aren't in the current source \u2014 e.g. a helper class that was supposed " +
-          "to come from an earlier round but wasn't applied. Re-run `/review-branch` " +
-          "with the build output below pasted as additional reviewer instructions, " +
-          "or revert with `git restore .` if the diff is unsalvageable.\n\n",
-      );
-      stream.markdown(
-        `<details open><summary>Build output (${result.output.length} chars${result.truncated ? ", truncated" : ""})</summary>\n\n` +
-          "```\n" + result.output + "\n```\n\n</details>\n\n",
-      );
+    // Build gate: run synchronously, capture exit code + tail of output, and
+    // surface a clear pass/fail block so the next /review-branch round can see
+    // what broke.
+    if (cfg.buildCommand) {
+      stream.markdown(`---\n\n## Build gate\n\n`);
+      stream.progress(`Running \`${cfg.buildCommand}\`\u2026`);
+      const result = await runBuildGate({ cwd: ws, command: cfg.buildCommand, timeoutMs: cfg.buildTimeoutMs });
+      const elapsedSec = (result.durationMs / 1000).toFixed(1);
+      if (result.exitCode === 0) {
+        stream.markdown(`\u2705 \`${cfg.buildCommand}\` exited 0 in ${elapsedSec}s. Edits compile.\n\n`);
+      } else {
+        const reason = result.timedOut
+          ? `timed out after ${elapsedSec}s`
+          : `exited with code ${result.exitCode ?? "unknown"} in ${elapsedSec}s`;
+        stream.markdown(
+          `\u274c \`${cfg.buildCommand}\` ${reason}. The applied edits do not build.\n\n` +
+            "**Likely cause:** the worker referenced symbols (types, methods, overloads) " +
+            "that aren't in the current source \u2014 e.g. a helper class that was supposed " +
+            "to come from an earlier round but wasn't applied. Re-run `/review-branch` " +
+            "with the build output below pasted as additional reviewer instructions, " +
+            "or undo to revert the batch.\n\n",
+        );
+        stream.markdown(
+          `<details open><summary>Build output (${result.output.length} chars${result.truncated ? ", truncated" : ""})</summary>\n\n` +
+            "```\n" + result.output + "\n```\n\n</details>\n\n",
+        );
+      }
     }
   }
+
+  return {
+    metadata: {
+      outcome: appliedCount > 0 || cfg.dryRun ? "approved" : "exhausted",
+      command: "apply-review",
+      hasFixProposal: false,
+      iterations: 0,
+    },
+  };
 }
 
-function renderApplyOutcomes(stream: vscode.ChatResponseStream, outcomes: ApplyOutcome[], dryRun: boolean): void {
+/**
+ * Applies the batch through `vscode.workspace.applyEdit`, so it lands as a
+ * single undo step and files with unsaved changes are edited in the document
+ * rather than overwritten on disk.
+ */
+function workspaceEditHost(): EditHost {
+  return {
+    async commit(writes) {
+      const edit = new vscode.WorkspaceEdit();
+      for (const w of writes) {
+        const uri = vscode.Uri.file(w.path);
+        let exists = true;
+        try {
+          await vscode.workspace.fs.stat(uri);
+        } catch {
+          exists = false;
+        }
+        if (!exists) {
+          edit.createFile(uri, { contents: Buffer.from(w.content, "utf8"), ignoreIfExists: true });
+          continue;
+        }
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const whole = new vscode.Range(
+          doc.positionAt(0),
+          doc.positionAt(doc.getText().length),
+        );
+        edit.replace(uri, whole, w.content);
+      }
+      const ok = await vscode.workspace.applyEdit(edit);
+      if (!ok) throw new Error("VS Code refused to apply the workspace edit.");
+    },
+  };
+}
+
+function renderApplyOutcomes(stream: vscode.ChatResponseStream, outcomes: ApplyOutcome[]): void {
   for (const o of outcomes) {
     const icon =
       o.status === "applied" ? "\u2705" : o.status === "dry-run" ? "\ud83d\udd0d" : "\u26a0\ufe0f";
@@ -801,7 +993,6 @@ function renderApplyOutcomes(stream: vscode.ChatResponseStream, outcomes: ApplyO
     const verb = o.status === "dry-run" ? "would apply" : o.status;
     stream.markdown(`- ${icon} \`${o.path}\` \u2014 ${verb}${tail}\n  - **why:** ${o.why}\n`);
   }
-  void dryRun;
   stream.markdown("\n");
 }
 
@@ -849,6 +1040,44 @@ function formatVerdictForRereview(v: Verdict): string {
         `${idx + 1}. [${it.severity}] ${it.where}\n   why: ${it.why}\n   suggestion: ${it.suggestion}`,
     )
     .join("\n");
+}
+
+/** The reviewer judges the *proposal*, not the diff — the diff is the before state. */
+function buildRereviewInput(args: {
+  taskHeader: string;
+  diffDescription: string;
+  diffBody: string;
+  priorVerdict: Verdict;
+  fixProposal: string;
+}): string {
+  return [
+    "# Re-review: judge a proposed fix",
+    "",
+    "You previously reviewed this branch and produced findings. The author has responded with a fix proposal.",
+    "Your job is to judge **whether the proposal, IF APPLIED, would resolve every prior finding without introducing new issues**.",
+    "",
+    "# Critical instructions",
+    "",
+    "- The diff below is the **BEFORE** state. The fix proposal describes what would change.",
+    "- Do **NOT** re-flag a finding just because the diff still shows the original problem. The diff is unchanged by design — the proposal is what would change. You are evaluating the proposal, not the diff.",
+    "- For each prior finding, decide: does the proposal address it adequately? If yes, do **not** list it again. If no (proposal missing, vague, or technically wrong), list it again and say specifically what is missing or wrong.",
+    "- You MAY raise new findings only if the **proposal itself** introduces them (e.g., proposed code contains a clear bug, breaks an API, or misnames something visible in the diff).",
+    "- `approve` when every prior finding is adequately addressed by the proposal.",
+    "",
+    args.taskHeader,
+    "",
+    `# Branch diff — BEFORE state (${args.diffDescription})`,
+    "",
+    args.diffBody,
+    "",
+    "# Prior findings",
+    "",
+    formatVerdictForRereview(args.priorVerdict),
+    "",
+    "# Worker's fix proposal (proposed AFTER state)",
+    "",
+    args.fixProposal,
+  ].join("\n");
 }
 
 function renderVerdict(stream: vscode.ChatResponseStream, v: Verdict): void {
@@ -948,29 +1177,33 @@ async function handleOpenSpecCommand(
   cmd: string,
   request: vscode.ChatRequest,
   stream: vscode.ChatResponseStream,
-): Promise<void> {
+  signal: AbortSignal,
+): Promise<vscode.ChatResult> {
   const verb = cmd.replace(/^openspec-/, "");
+  const done = (outcome: ReviewOutcome = "approved"): vscode.ChatResult => ({
+    metadata: { outcome, command: cmd, hasFixProposal: false, iterations: 0 },
+  });
   if (verb === "init") {
     stream.markdown("Run `openspec init` in a terminal at the workspace root.\n");
-    return;
+    return done();
   }
   if (verb === "new") {
     const id = request.prompt.trim();
     if (!id) {
       stream.markdown("Provide a change id, e.g. `@codecrosscheck /openspec-new add-foo`.\n");
-      return;
+      return failure("No change id supplied.", cmd);
     }
     const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!ws) {
       stream.markdown("No workspace folder open.\n");
-      return;
+      return failure("No workspace folder open.", cmd);
     }
     const dir = path.join(ws, "openspec", "changes", id);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "proposal.md"), `# ${id}\n\n## Why\n\n## What Changes\n\n## Impact\n`);
-    fs.writeFileSync(path.join(dir, "tasks.md"), `# Tasks: ${id}\n\n- [ ] 1.1 …\n`);
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, "proposal.md"), `# ${id}\n\n## Why\n\n## What Changes\n\n## Impact\n`);
+    await fsp.writeFile(path.join(dir, "tasks.md"), `# Tasks: ${id}\n\n- [ ] 1.1 …\n`);
     stream.markdown(`Scaffolded \`openspec/changes/${id}/\`.\n`);
-    return;
+    return done();
   }
   if (verb === "review" || verb === "implement") {
     if (verb === "implement") {
@@ -978,14 +1211,14 @@ async function handleOpenSpecCommand(
         "\u26a0\ufe0f `/openspec-implement` is deprecated — use `/openspec-review`. Running the equivalent now.\n\n",
       );
     }
-    await handleOpenSpecReview(request, stream);
-    return;
+    return handleOpenSpecReview(request, stream, signal);
   }
   if (verb === "archive") {
     stream.markdown(`Run \`openspec archive ${request.prompt.trim()}\` in a terminal.\n`);
-    return;
+    return done();
   }
   stream.markdown(`Unknown openspec command: \`${verb}\`.\n`);
+  return failure(`Unknown openspec command: ${verb}.`, cmd);
 }
 
 /**
@@ -1001,17 +1234,18 @@ async function handleOpenSpecCommand(
 async function handleOpenSpecReview(
   request: vscode.ChatRequest,
   stream: vscode.ChatResponseStream,
-): Promise<void> {
+  signal: AbortSignal,
+): Promise<vscode.ChatResult> {
   const id = request.prompt.trim().split(/\s+/)[0] ?? "";
   if (!id) {
     stream.markdown(
       "Provide a change id, e.g. `@codecrosscheck /openspec-review add-foo`.\n",
     );
-    return;
+    return failure("No change id supplied.", "openspec-review");
   }
 
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-  const cfg = vscode.workspace.getConfiguration("codecrosscheck");
+  const cfg = readConfig(vscode.workspace.getConfiguration("codecrosscheck"));
 
   // Load the change folder. Surface any error (missing folder, missing
   // proposal.md) in chat rather than letting it bubble past the participant.
@@ -1023,7 +1257,7 @@ async function handleOpenSpecReview(
       `\u274c Could not load OpenSpec change \`${id}\`: \`${(err as Error).message}\`\n\n` +
         `Expected layout: \`openspec/changes/${id}/proposal.md\` (and optional \`tasks.md\`, \`specs/<capability>/spec.md\`).\n`,
     );
-    return;
+    return failure(`Could not load OpenSpec change ${id}.`, "openspec-review");
   }
 
   // Stream the proposal summary as the first message (spec requires this).
@@ -1035,19 +1269,11 @@ async function handleOpenSpecReview(
       `### Proposal\n\n${proposalSummary}\n\n---\n\n`,
   );
 
-  // Model selection mirrors the main handler: respect overrides, prefer
-  // the chat-picker model for the worker, configured reviewer for cross-vendor.
-  const workerFamily = (cfg.get<string>("workerModelOverride") ?? "").trim() || (cfg.get<string>("workerModel") ?? "gpt-5.4");
-  const reviewerFamily = (cfg.get<string>("reviewerModelOverride") ?? "").trim() || (cfg.get<string>("reviewerModel") ?? "claude-opus-4.6");
-  const useChatPickerWorker = cfg.get<boolean>("useChatPickerWorker") ?? true;
-  const maxIters = cfg.get<number>("maxIters") ?? 3;
+  // Model selection mirrors the main handler: prefer the chat-picker model for
+  // the worker, configured reviewer for cross-vendor.
+  const { worker: workerClient, reviewer: reviewerClient, sameModel } = resolveClients(cfg, request.model);
 
-  const workerClient = useChatPickerWorker && request.model
-    ? new VscodeLmClient({ family: request.model.family, model: request.model })
-    : new VscodeLmClient({ family: stripVendor(workerFamily) });
-  const reviewerClient = new VscodeLmClient({ family: stripVendor(reviewerFamily) });
-
-  if (workerClient.modelId === reviewerClient.modelId) {
+  if (sameModel) {
     stream.markdown(
       `> **Note:** worker and reviewer resolved to the same model (\`${workerClient.modelId}\`). ` +
         `Cross-vendor review is disabled.\n\n`,
@@ -1077,23 +1303,20 @@ async function handleOpenSpecReview(
     };
   };
 
-  const transcriptPath = openTranscript();
-  const writeEvent = (event: Record<string, unknown>) => {
-    fs.appendFileSync(transcriptPath, JSON.stringify(event) + "\n", "utf8");
-  };
+  const transcript = await openTranscript(cfg);
 
   // Wrap the shared event handler with a translator that ALSO emits
   // `review-branch-iter` events for CODE-stage worker artifacts and reviewer
   // verdicts. That is the exact schema `/apply-review`'s
   // `findLatestTranscript` + `extractFixProposal` look for, so the user can
   // chain `/openspec-review` \u2192 `/apply-review` without any glue.
-  const baseHandler = createPipelineEventHandler(stream, writeEvent);
+  const baseHandler = createPipelineEventHandler(stream, transcript.write);
   let codeIter = 0;
   const onEvent = (ev: PipelineEvent) => {
     baseHandler(ev);
     if (ev.type === "worker" && ev.stage === "code") {
       codeIter = ev.iteration;
-      writeEvent({
+      transcript.write({
         event: "review-branch-iter",
         iteration: ev.iteration,
         role: "worker",
@@ -1101,7 +1324,7 @@ async function handleOpenSpecReview(
         artifact: ev.artifact,
       });
     } else if (ev.type === "verdict" && ev.stage === "code") {
-      writeEvent({
+      transcript.write({
         event: "review-branch-iter",
         iteration: ev.iteration,
         role: "reviewer",
@@ -1115,57 +1338,131 @@ async function handleOpenSpecReview(
 
   const frame = renderChangeFrame(change);
   const taskPrompt = request.prompt.replace(/^\s*\S+\s*/, "").trim();
-  const fullPrompt = `${taskPrompt || `Implement the OpenSpec change \`${id}\` exactly as specified.`}\n\n${frame}`;
+  const attached = await readAttachments(request, stream);
+  const fullPrompt = [
+    taskPrompt || `Implement the OpenSpec change \`${id}\` exactly as specified.`,
+    frame,
+    attached,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const startedAt = Date.now();
-  let approved = false;
+  let outcome: ReviewOutcome = "exhausted";
   try {
     const result = await runPipeline(fullPrompt, {
       workerClient,
       reviewerClient,
       stages: ["plan", "code"],
-      maxIters,
+      maxIters: cfg.maxIters,
       preReview: preReviewFactory,
+      signal,
       onEvent,
     });
-    approved = result.approved;
+    outcome = result.cancelled ? "cancelled" : result.approved ? "approved" : "exhausted";
   } catch (err) {
+    if (err instanceof ReviewCancelledError) throw err;
     stream.markdown(`\u274c Pipeline failed: \`${(err as Error).message}\`\n\n`);
+    outcome = "failed";
   }
 
-  writeEvent({
+  transcript.write({
     event: "review-branch-done",
-    approved,
+    approved: outcome === "approved",
+    outcome,
     iterations: codeIter,
     elapsedMs: Date.now() - startedAt,
     changeId: id,
   });
 
-  const uri = vscode.Uri.file(transcriptPath);
   stream.markdown(
     `\n---\n\n## Next step\n\n` +
       (codeIter > 0
         ? `Run \`/apply-review\` to write the drafted edits to your workspace.\n\n`
-        : `No CODE-stage artifact was produced. Fix the validator errors above or refine the prompt, then re-run.\n\n`) +
-      `Transcript: [${path.basename(transcriptPath)}](${uri.toString()})\n`,
+        : `No CODE-stage artifact was produced. Fix the validator errors above or refine the prompt, then re-run.\n\n`),
   );
+  if (codeIter > 0) {
+    stream.button({ command: APPLY_COMMAND, title: "Apply the drafted edits", arguments: [] });
+  }
+  linkTranscript(stream, transcript.path);
+  return {
+    metadata: { outcome, command: "openspec-review", hasFixProposal: codeIter > 0, iterations: codeIter },
+  };
 }
 
-function stripVendor(model: string): string {
-  // vscode.lm wants `family` only; convert "openai/gpt-5.4" -> "gpt-5.4".
-  const slash = model.indexOf("/");
-  return slash >= 0 ? model.slice(slash + 1) : model;
+/** Node-backed `FsLike`, with the extra `remove` that pruning needs. */
+function nodeFsLike(): FsLike & { remove(p: string): Promise<void> } {
+  return {
+    readDir: (dir) => fsp.readdir(dir),
+    async stat(p) {
+      const st = await fsp.stat(p);
+      return { mtimeMs: st.mtimeMs };
+    },
+    readFile: (p) => fsp.readFile(p, "utf8"),
+    async writeFile(p, content) {
+      await fsp.mkdir(path.dirname(p), { recursive: true });
+      await fsp.writeFile(p, content, "utf8");
+    },
+    async exists(p) {
+      try {
+        await fsp.access(p);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    remove: (p) => fsp.rm(p, { force: true }),
+  };
 }
 
-function openTranscript(): string {
+interface Transcript {
+  path: string;
+  /** Queued append; never blocks the extension host. */
+  write(event: Record<string, unknown>): void;
+}
+
+/**
+ * Open a run transcript, ensuring the directory ignores itself in git and
+ * pruning older runs. Transcripts hold full source diffs, so leaving them
+ * committable and unbounded is both a disk and a disclosure problem.
+ */
+async function openTranscript(cfg: ResolvedConfig): Promise<Transcript> {
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-  const dir = path.join(ws, ".codecrosscheck", "runs");
-  fs.mkdirSync(dir, { recursive: true });
+  const root = path.join(ws, ".codecrosscheck");
+  const dir = path.join(root, "runs");
+  await fsp.mkdir(dir, { recursive: true });
+
+  const ignorePath = path.join(root, ".gitignore");
+  try {
+    await fsp.access(ignorePath);
+  } catch {
+    await fsp.writeFile(ignorePath, "# CodeCrossCheck run transcripts contain full source diffs.\n*\n", "utf8");
+  }
+
+  await pruneTranscripts(dir, Math.max(0, cfg.keepTranscripts - 1), nodeFsLike()).catch(() => []);
+
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return path.join(dir, `${stamp}.jsonl`);
+  const file = path.join(dir, `${stamp}.jsonl`);
+
+  // Serialise appends behind a promise chain so events keep their order
+  // without blocking the extension host on synchronous I/O.
+  let queue: Promise<unknown> = fsp.writeFile(file, "", "utf8");
+  return {
+    path: file,
+    write(event) {
+      queue = queue
+        .then(() => fsp.appendFile(file, JSON.stringify(event) + "\n", "utf8"))
+        .catch(() => undefined);
+    },
+  };
 }
 
-function escape(s: string): string {
+function linkTranscript(stream: vscode.ChatResponseStream, transcriptPath: string): void {
+  const uri = vscode.Uri.file(transcriptPath);
+  stream.markdown(`Transcript: [${path.basename(transcriptPath)}](${uri.toString()})\n`);
+}
+
+function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
     c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;",
   );

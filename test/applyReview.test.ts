@@ -467,7 +467,7 @@ describe("applyReview.issueFingerprint + filterRejectedIssues", () => {
     expect(out.verdict.verdict).toBe("revise"); // not auto-approved; one issue remains
   });
 
-  it("auto-approves when filtering empties the issue list", () => {
+  it("reports an emptied issue list without asserting approval", () => {
     const v = {
       verdict: "revise" as const,
       issues: [issue("high", "src/a.ts:1", "issue A")],
@@ -476,7 +476,20 @@ describe("applyReview.issueFingerprint + filterRejectedIssues", () => {
     const out = filterRejectedIssues(v, rejected);
     expect(out.dropped).toBe(1);
     expect(out.verdict.issues).toHaveLength(0);
-    expect(out.verdict.verdict).toBe("approve");
+    expect(out.emptiedBySuppression).toBe(true);
+    // The reviewer never approved — suppression is not approval.
+    expect(out.verdict.verdict).toBe("revise");
+  });
+
+  it("does not mutate the verdict it was given", () => {
+    const v = {
+      verdict: "revise" as const,
+      issues: [issue("high", "src/a.ts:1", "issue A"), issue("low", "src/b.ts:2", "issue B")],
+    };
+    const out = filterRejectedIssues(v, new Set([issueFingerprint(v.issues[0])]));
+    expect(v.issues).toHaveLength(2);
+    expect(out.verdict).not.toBe(v);
+    expect(out.emptiedBySuppression).toBe(false);
   });
 
   it("is a no-op when rejected set is empty", () => {
