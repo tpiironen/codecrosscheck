@@ -430,6 +430,7 @@ export function harvestPathsFromText(text: string): string[] {
  * Strip annotations the worker commonly tacks onto path directives:
  *  - trailing parenthetical comments: `foo.cs (excerpt)`, `foo.cs (new file)`
  *  - line-number suffixes: `foo.cs:21`, `foo.cs:21-30`
+ *  - symbol suffixes: `foo.ts:someFunction`
  *  - surrounding backticks
  */
 export function normalizeReferencedPath(raw: string): string {
@@ -440,6 +441,11 @@ export function normalizeReferencedPath(raw: string): string {
   p = p.replace(/\s*\([^)]*\)\s*$/, "").trim();
   // Strip a trailing :line or :line-line suffix.
   p = p.replace(/:\d+(?:-\d+)?$/, "").trim();
+  // Strip a trailing :symbol suffix, including call syntax as reviewers write
+  // it (`src/extension.ts:workspaceEditHost().commit`). Anchored on a known
+  // source extension so a Windows drive letter or a URL scheme is left intact
+  // for `resolveSafePath` to reject.
+  p = p.replace(/(\.[A-Za-z0-9]{1,10}):[A-Za-z_$][\w$.()]*$/, "$1").trim();
   return p;
 }
 
@@ -497,6 +503,13 @@ export async function buildFileInventory(
   const missing: string[] = [];
   const resolved = new Map<string, string>();
   for (const rel of paths) {
+    // A colon survives normalisation only when the reference is not a
+    // workspace path. Treating it as a file to create invites a phantom file
+    // and hides the malformed reference behind a plausible-looking note.
+    if (rel.includes(":")) {
+      missing.push(`${rel} (not a workspace-relative path)`);
+      continue;
+    }
     // Try to resolve repo-prefixed paths to actual workspace-relative paths.
     const effective = await resolveReferencedPath(workspaceRoot, rel, fs);
     resolved.set(rel, effective);

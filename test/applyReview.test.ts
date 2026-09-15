@@ -9,6 +9,7 @@ import {
   findLatestTranscript,
   harvestPathsFromText,
   issueFingerprint,
+  normalizeReferencedPath,
   parseDisagreements,
   parseBlockedFindings,
   parseReferencedFiles,
@@ -294,6 +295,45 @@ describe("applyReview.buildFileInventory", () => {
     expect(result.inventory).toContain("resolved path");
     expect(result.resolved.get("repo/sub/src/a.ts")).toBe("src/a.ts");
     expect(result.missing).toEqual([]);
+  });
+
+  it("reports a colon-bearing reference instead of offering to create it", async () => {
+    // Observed live: six such references produced six phantom creation notes,
+    // an empty `missing`, and zero edits.
+    const { fs } = makeFakeFs({ files: { [r("src/a.ts")]: "BODY" } });
+    const result = await buildFileInventory(WS, ["src/a.ts:someFunction"], fs);
+    expect(result.missing[0]).toContain("not a workspace-relative path");
+    expect(result.inventory).not.toContain("does not exist yet");
+  });
+});
+
+describe("applyReview.normalizeReferencedPath — symbol suffixes", () => {
+  it("strips a trailing :symbol", () => {
+    expect(normalizeReferencedPath("src/extension.ts:workspaceEditHost")).toBe("src/extension.ts");
+    expect(normalizeReferencedPath("src/a.ts:Transcript")).toBe("src/a.ts");
+    expect(normalizeReferencedPath("a/b/c.cs:Foo.Bar")).toBe("a/b/c.cs");
+  });
+
+  it("strips a symbol written with call syntax", () => {
+    // Verbatim from the 2026-09-14 transcript's verdict `where` field; the
+    // first version of this fix could not match it.
+    expect(normalizeReferencedPath("src/extension.ts:workspaceEditHost().commit")).toBe(
+      "src/extension.ts",
+    );
+  });
+
+  it("still strips line and range suffixes", () => {
+    expect(normalizeReferencedPath("src/a.ts:21")).toBe("src/a.ts");
+    expect(normalizeReferencedPath("src/a.ts:21-30")).toBe("src/a.ts");
+  });
+
+  it("leaves a bare path untouched", () => {
+    expect(normalizeReferencedPath("src/a.ts")).toBe("src/a.ts");
+  });
+
+  it("leaves a drive-qualified path for the safety check to reject", () => {
+    // Stripping here would turn an absolute path into a plausible relative one.
+    expect(normalizeReferencedPath("C:/tmp/a.ts")).toBe("C:/tmp/a.ts");
   });
 });
 

@@ -25,7 +25,28 @@ OpenSpec changes:
 [`flush-transcript-before-return`](openspec/changes/flush-transcript-before-return/proposal.md),
 [`pin-vscode-api-floor`](openspec/changes/pin-vscode-api-floor/proposal.md),
 [`add-finding-triage`](openspec/changes/add-finding-triage/proposal.md),
-[`replace-github-models-with-openai-compatible`](openspec/changes/replace-github-models-with-openai-compatible/proposal.md).
+[`replace-github-models-with-openai-compatible`](openspec/changes/replace-github-models-with-openai-compatible/proposal.md),
+[`fix-referenced-path-normalisation`](openspec/changes/fix-referenced-path-normalisation/proposal.md).
+
+### Fixed
+
+- **`/apply-review` silently produced zero edits when a path directive named a
+  symbol.** Workers commonly write `// path: src/extension.ts:someFunction`,
+  and reviewers cite locations with call syntax such as
+  `src/extension.ts:workspaceEditHost().commit`.
+  `normalizeReferencedPath` stripped backticks, parentheticals and `:line`
+  suffixes but not `:symbol`, so the malformed path reached
+  `buildFileInventory` — which found it did not exist and offered it to the
+  worker as *a file to create*. Six such references became six invitations to
+  create phantom files, `missing` stayed empty, the existing "unreadable
+  path(s)" warning never fired, and the worker was never shown a line of real
+  source. It correctly returned no edits.
+
+  Symbol suffixes are now stripped, including symbols written with call syntax,
+  a reference that cannot denote a workspace
+  file is reported as unresolvable rather than offered for creation, and the
+  handler says so when the inventory yields no source at all. Observed live:
+  the same transcript that produced 0 edits now produces 6.
 
 ### Removed
 

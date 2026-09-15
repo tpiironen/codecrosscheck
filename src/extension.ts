@@ -872,6 +872,13 @@ async function handleApplyReview(
       `\u26a0\ufe0f Skipped ${missing.length} unreadable path(s): ${missing.map((m) => `\`${m}\``).join(", ")}.\n\n`,
     );
   }
+  if (referenced.length > 0 && !inventory.includes("```")) {
+    stream.markdown(
+      `\u26a0\ufe0f None of the ${referenced.length} referenced path(s) yielded any source. ` +
+        `The worker has nothing to anchor edits against and will likely return none. ` +
+        `Check the path directives in the fix proposal.\n\n`,
+    );
+  }
 
   const { worker: workerClient } = resolveClients(cfg, request.model);
 
