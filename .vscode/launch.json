@@ -25,6 +25,21 @@
         "${workspaceFolder}/dist/**/*.js"
       ],
       "preLaunchTask": "npm: build"
+    },
+    {
+      // Dogfood target: a worktree of this repo, so the host folder is never
+      // the one already open in the developing window.
+      "name": "Run Extension on AI-review worktree",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "C:\\src\\AI-review"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/dist/**/*.js"
+      ],
+      "preLaunchTask": "npm: build"
     }
   ]
 }
