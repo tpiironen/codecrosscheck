@@ -195,7 +195,7 @@ success and only one is an approval of a fix:
 |---|---|---|
 | `approved` | The reviewer returned `verdict: "approve"` on its own. | ✅ Approved |
 | `defended` | Triage could not confirm a single remaining finding, so nothing was drafted. **The code was defended against the findings** — a different claim from "the fix is good". | 🛡️ Findings did not survive triage, with the evidence for each rejection |
-| `rebutted` | Every outstanding finding matched a fingerprint the worker had rebutted with `**Fix:** Disagree:`, so the filter emptied the list. **The reviewer never approved.** | 🤝 Stalled on disagreement, with the rebuttals listed for the user to adjudicate |
+| `rebutted` | Every outstanding finding matched a fingerprint the worker had rebutted with `status: "disagree"`, so the filter emptied the list. **The reviewer never approved.** | 🤝 Stalled on disagreement, with the rebuttals listed for the user to adjudicate |
 | `exhausted` | `maxIters` reached with findings still open. | ⚠️ Did not converge |
 | `cancelled` | The request's `CancellationToken` fired. | ⏹️ Cancelled |
 | `failed` | Diff could not be computed, budget exceeded, or a model call failed. | ❌ with `ChatResult.errorDetails` |

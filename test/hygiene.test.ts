@@ -59,6 +59,28 @@ describe("source hygiene", () => {
   });
 });
 
+describe("contributed settings are documented", () => {
+  it("gives every codecrosscheck.* setting a row in the README settings table", () => {
+    // The tools.* settings shipped in 0.5.0 undocumented; this is that gap pinned.
+    // Scoped to the table because prose elsewhere mentions some keys in passing,
+    // which would satisfy a whole-file search without documenting the default.
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as {
+      contributes?: { configuration?: { properties?: Record<string, unknown> } };
+    };
+    const settings = Object.keys(pkg.contributes?.configuration?.properties ?? {});
+    expect(settings.length).toBeGreaterThan(5);
+
+    const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+    const table = /^### Settings$([\s\S]*?)^#{2,3} /m.exec(readme)?.[1];
+    expect(table, "README must have a `### Settings` section").toBeTruthy();
+
+    const rows = new Set(
+      [...table!.matchAll(/^\|\s*`([^`]+)`\s*\|/gm)].map((m) => m[1]),
+    );
+    expect(settings.filter((key) => !rows.has(key))).toEqual([]);
+  });
+});
+
 describe("reviewer prompt edition", () => {
   it("names an OWASP edition the helper can read back", async () => {
     const { reviewerOwaspEdition } = await import("../src/agents.js");
