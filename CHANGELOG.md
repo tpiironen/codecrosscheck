@@ -67,10 +67,13 @@ OpenSpec changes:
   so the prose and the edits cannot disagree. `/apply-review` reads those edits
   from the transcript and applies them — it is now purely the user-confirmation
   checkpoint, with dry-run, path validation and the build gate intact.
-- **Edits apply verbatim or not at all.** With the Markdown round trip gone,
-  the CRLF-normalisation and unified-diff-marker repair candidates are gone
-  too: a near-miss now means the edit is wrong, and repairing it would hide
-  that. A non-matching edit is skipped with a reason and the file is untouched.
+- **Edits repair line endings and nothing else.** The unified-diff-marker
+  stripping and the general repair-candidate sequence are gone: with the
+  Markdown round trip removed, a near-miss there means the edit is wrong and
+  repairing it would hide that. Line-ending pairing stays, because dogfooding
+  showed the model reads a CRLF file through `read_file` and emits LF in its
+  JSON anyway — 11 of 12 edits were skipped before this was fixed. Any other
+  mismatch is skipped with a reason and the file left untouched.
 - **Worker push-back and dodges are structural, not textual.** A rebuttal is
   `status: "disagree"` rather than the string `**Fix:** Disagree:`, and a
   finding the worker could not patch is `status: "unaddressed"` rather than a

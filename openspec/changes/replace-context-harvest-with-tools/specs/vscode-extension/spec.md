@@ -60,15 +60,36 @@ each such finding with the worker's own stated reason.
 - **WHEN** every fix in the proposal has status `fixed` or `disagree`
 - **THEN** no unaddressed block is rendered
 
-### Requirement: Edits SHALL apply verbatim or not at all
+### Requirement: Edits SHALL repair line endings and nothing else
 
 An edit SHALL be applied only when its `oldString` occurs in the target file
-exactly once, byte for byte. The handler SHALL NOT normalise line endings,
-strip unified-diff markers, or try repaired variants: the worker reads the file
-through the toolset and returns the edit as structured data, so a near-miss
-means the edit is wrong and guessing would conceal that.
+exactly once, after normalising line endings and no other difference. The
+replacement SHALL be written with the line endings of the form that matched, so
+the patched region agrees with the surrounding file.
+
+Line endings are the one difference the model cannot be held to: it reads the
+file through the toolset, which preserves CRLF exactly, but emits LF in its
+JSON regardless. Every other mismatch SHALL be a hard failure — the handler
+SHALL NOT strip unified-diff markers or try any other repaired variant, because
+a near-miss there means the edit is wrong and repairing it would conceal that.
 
 A non-matching edit SHALL be skipped with a reason and the file left unchanged.
+
+#### Scenario: Model emits LF against a CRLF file
+
+- **GIVEN** a target file with CRLF line endings
+- **AND** an edit whose `oldString` carries the same text with LF
+- **WHEN** the handler applies it
+- **THEN** the edit is applied
+- **AND** the patched region is written with CRLF, matching the file
+
+#### Scenario: Model emits CRLF against an LF file
+
+- **GIVEN** a target file with LF line endings
+- **AND** an edit whose `oldString` carries the same text with CRLF
+- **WHEN** the handler applies it
+- **THEN** the edit is applied
+- **AND** no CR is introduced into the file
 
 #### Scenario: oldString carries unified-diff markers
 
@@ -77,20 +98,12 @@ A non-matching edit SHALL be skipped with a reason and the file left unchanged.
 - **THEN** the edit is skipped with reason `oldString not found`
 - **AND** the file is unchanged
 
-#### Scenario: Line endings differ from the file
+#### Scenario: Content differs by more than line endings
 
-- **GIVEN** a target file with LF line endings and an edit whose `oldString`
-  uses CRLF
+- **GIVEN** an edit whose `oldString` differs from the file in any character
+  other than a line terminator
 - **WHEN** the handler applies it
-- **THEN** the edit is skipped and the file's line endings are untouched
-
-#### Scenario: Verbatim content applies
-
-- **GIVEN** an edit whose `oldString` matches the file exactly once, including
-  its line endings
-- **WHEN** the handler applies it
-- **THEN** the replacement is spliced in and the rest of the file is
-  byte-identical
+- **THEN** the edit is skipped and the file is unchanged
 
 #### Scenario: Empty oldString creates a new file
 
@@ -294,10 +307,12 @@ unaddressed findings structurally".
 
 ### Requirement: oldString safety-net repairs
 
-**Reason**: The repairs compensated for a lossy Markdown round trip between
-`/review-branch` and `/apply-review`. That round trip is gone — edits travel as
-structured data — so a near-miss now indicates a wrong edit rather than a
-transport artefact, and repairing it would hide the defect.
+**Reason**: The diff-marker and general repair candidates compensated for a
+lossy Markdown round trip between `/review-branch` and `/apply-review`. That
+round trip is gone — edits travel as structured data — so a near-miss there now
+indicates a wrong edit rather than a transport artefact.
 
-**Migration**: None required. Superseded by "Edits SHALL apply verbatim or not
-at all", which retains the file-creation scenarios.
+**Migration**: None required. Superseded by "Edits SHALL repair line endings and
+nothing else", which keeps the line-ending pairing (dogfooding on 2026-09-16
+showed the model still emits LF against a CRLF file) and the file-creation
+scenarios, but drops diff-marker stripping.

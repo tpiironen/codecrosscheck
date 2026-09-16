@@ -471,10 +471,79 @@ describe("applyReview.runBuildGate", () => {
   });
 });
 
+describe("applyReview.applyEdit — line-ending drift", () => {
+  // Verbatim from the 2026-09-16 dogfood apply log
+  // (.codecrosscheck/runs/2026-09-16T10-21-13-468Z-apply.json, edits[0]), where
+  // 11 of 12 edits were skipped as "oldString not found". The model read a CRLF
+  // file through read_file and emitted LF in its JSON anyway.
+  const OLD_LF =
+    '  edits: z\n    .array(ApplyEditSchema)\n    .describe("Exact edits that resolve the finding. MUST be empty unless status is `fixed`."),\n});';
+  const NEW_LF =
+    '  edits: z\n    .array(ApplyEditSchema)\n    .describe("Exact edits that resolve the finding. MUST be empty unless status is `fixed`."),\n})\n  .refine((f) => f.status === "fixed" || f.edits.length === 0);';
+  const crlf = (s: string): string => s.replace(/\n/g, "\r\n");
+
+  it("applies an LF oldString to the CRLF file it was read from", async () => {
+    const fileBody = `const FixSchema = z.object({\r\n${crlf(OLD_LF)}\r\n`;
+    const { fs, files } = makeFakeFs({ files: { [r("src/schemas.ts")]: fileBody } });
+
+    const result = await applyEdit(
+      WS,
+      { path: "src/schemas.ts", oldString: OLD_LF, newString: NEW_LF, why: "finding 1" },
+      fs,
+      { dryRun: false },
+    );
+
+    expect(result.status).toBe("applied");
+    const after = files.get(r("src/schemas.ts"))!;
+    expect(after).toContain(".refine((f) => f.status === \"fixed\"");
+    // The patched region must not smuggle LF into a CRLF file.
+    expect(after.split("\n").every((l, i, a) => i === a.length - 1 || l.endsWith("\r"))).toBe(true);
+  });
+
+  it("applies a CRLF oldString to an LF file without rewriting the file's endings", async () => {
+    const fileBody = `header\n${OLD_LF}\n`;
+    const { fs, files } = makeFakeFs({ files: { [r("a.ts")]: fileBody } });
+
+    const result = await applyEdit(
+      WS,
+      { path: "a.ts", oldString: crlf(OLD_LF), newString: crlf(NEW_LF), why: "w" },
+      fs,
+      { dryRun: false },
+    );
+
+    expect(result.status).toBe("applied");
+    expect(files.get(r("a.ts"))).not.toContain("\r");
+  });
+
+  it("still refuses an oldString that differs by more than line endings", async () => {
+    const { fs, files } = makeFakeFs({ files: { [r("a.ts")]: crlf("alpha\nbeta\ngamma") } });
+    const result = await applyEdit(
+      WS,
+      { path: "a.ts", oldString: "alpha\nBETA\ngamma", newString: "x", why: "w" },
+      fs,
+      { dryRun: false },
+    );
+    expect(result.status).toBe("skipped");
+    expect(result.reason).toBe("oldString not found");
+    expect(files.get(r("a.ts"))).toBe(crlf("alpha\nbeta\ngamma"));
+  });
+
+  it("reports ambiguity found only in a normalised form", async () => {
+    const { fs } = makeFakeFs({ files: { [r("a.ts")]: crlf("x\ny\nx\ny\n") } });
+    const result = await applyEdit(
+      WS,
+      { path: "a.ts", oldString: "x\ny", newString: "z", why: "w" },
+      fs,
+      { dryRun: false },
+    );
+    expect(result.status).toBe("skipped");
+    expect(result.reason).toBe("oldString matches 2 times");
+  });
+});
+
 describe("applyReview.applyEdit — no repair guessing", () => {
-  // The Markdown round trip that corrupted these strings is gone: the worker
-  // reads the file through the toolset and returns the edit as structured
-  // data. Guessing at a near-miss would now hide a genuinely wrong edit.
+  // Line endings are the only drift repaired. A diff-marked oldString is a
+  // wrong edit, not a transport artefact.
   it("skips an oldString carrying unified-diff markers", async () => {
     const fileBody = [
       "    ModelAction ResolveAction(TIn input) => ModelAction.Upsert;",
@@ -496,18 +565,6 @@ describe("applyReview.applyEdit — no repair guessing", () => {
     expect(result.status).toBe("skipped");
     expect(result.reason).toBe("oldString not found");
     expect(files.get(r("a.cs"))).toBe(fileBody);
-  });
-
-  it("skips on CRLF drift rather than silently rewriting line endings", async () => {
-    const { fs, files } = makeFakeFs({ files: { [r("a.cs")]: "alpha\nbeta\ngamma" } });
-    const result = await applyEdit(
-      WS,
-      { path: "a.cs", oldString: "alpha\r\nbeta\r\ngamma", newString: "ALPHA\r\nBETA\r\ngamma", why: "crlf" },
-      fs,
-      { dryRun: false },
-    );
-    expect(result.status).toBe("skipped");
-    expect(files.get(r("a.cs"))).toBe("alpha\nbeta\ngamma");
   });
 
   it("applies verbatim CRLF content against a CRLF file", async () => {

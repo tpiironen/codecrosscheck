@@ -389,16 +389,9 @@ export async function applyEdit(
   }
   const original = await fs.readFile(safe.abs);
 
-  // Exact match only. The worker reads files through the workspace toolset and
-  // returns edits as structured data, so there is no Markdown round trip left
-  // to corrupt line endings or leave diff markers behind — a near-miss now
-  // means the worker got it wrong, and guessing would hide that.
-  const occurrences = countOccurrences(original, edit.oldString);
-  if (occurrences === 0) {
-    return { path: edit.path, status: "skipped", reason: "oldString not found", why: edit.why };
-  }
-  if (occurrences > 1) {
-    return { path: edit.path, status: "skipped", reason: `oldString matches ${occurrences} times`, why: edit.why };
+  const match = matchEdit(original, edit.oldString, edit.newString);
+  if (!match.ok) {
+    return { path: edit.path, status: "skipped", reason: match.reason, why: edit.why };
   }
 
   if (options.dryRun) {
@@ -406,10 +399,57 @@ export async function applyEdit(
   }
   // Splice by index rather than String.replace: GetSubstitution expands `$$`,
   // `$&`, "$`" and `$'` in the replacement even for a string search value.
-  const at = original.indexOf(edit.oldString);
-  const updated = original.slice(0, at) + edit.newString + original.slice(at + edit.oldString.length);
+  const updated =
+    original.slice(0, match.at) + match.replacement + original.slice(match.at + match.matched.length);
   await fs.writeFile(safe.abs, updated);
   return { path: edit.path, status: "applied", why: edit.why };
+}
+
+/** `oldString` as written, and its pure-LF and pure-CRLF forms. Most literal first. */
+export function lineEndingVariants(raw: string): string[] {
+  const lf = raw.replace(/\r\n/g, "\n");
+  return Array.from(new Set([raw, lf, lf.replace(/\n/g, "\r\n")]));
+}
+
+/**
+ * Locate `oldString` in `original`, tolerating line-ending drift and nothing
+ * else, and pair `newString` to whichever form matched.
+ *
+ * Line endings are the one difference the model cannot be held to. It reads the
+ * file through the toolset — `read_file` preserves CRLF exactly — but emits LF
+ * in its JSON regardless: on the 2026-09-16 dogfood run, 11 of 12 edits against
+ * a CRLF worktree were skipped as "oldString not found", every `oldString`
+ * carrying LF where the file had CRLF. Structured output did not fix that, so
+ * the earlier reasoning for requiring a byte-exact match was wrong.
+ *
+ * Any *other* mismatch is still a hard failure. A near-miss means the edit is
+ * wrong, and repairing it would hide that.
+ */
+export function matchEdit(
+  original: string,
+  oldString: string,
+  newString: string,
+): { ok: true; at: number; matched: string; replacement: string } | { ok: false; reason: string } {
+  let ambiguous = 0;
+  for (const candidate of lineEndingVariants(oldString)) {
+    const count = countOccurrences(original, candidate);
+    if (count > 1) {
+      ambiguous = Math.max(ambiguous, count);
+      continue;
+    }
+    if (count === 0) continue;
+    const lfNew = newString.replace(/\r\n/g, "\n");
+    return {
+      ok: true,
+      at: original.indexOf(candidate),
+      matched: candidate,
+      replacement: candidate.includes("\r\n") ? lfNew.replace(/\n/g, "\r\n") : lfNew,
+    };
+  }
+  return {
+    ok: false,
+    reason: ambiguous > 0 ? `oldString matches ${ambiguous} times` : "oldString not found",
+  };
 }
 
 function countOccurrences(haystack: string, needle: string): number {
