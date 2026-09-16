@@ -1,6 +1,6 @@
 # prompts spec delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Grounding rules SHALL be reduced to what tools do not guarantee
 

@@ -88,61 +88,19 @@ When `vscode.lm.selectChatModels` returns no matching model (quota exhausted or 
 
 ### Requirement: /apply-review slash command
 
-The participant SHALL accept `/apply-review [extra instructions]`. The
-handler SHALL locate the most recent review transcript JSONL emitted
-by `/review-branch`, extract the latest worker fix proposal, derive
-concrete file edits from it via a worker LLM call returning
-schema-validated edits, and apply each edit to the workspace. The
-handler SHALL NOT modify files outside the workspace root and SHALL
-NOT apply an edit whose `oldString` does not appear exactly once in
-the target file.
+The participant SHALL accept `/apply-review`. The handler SHALL locate the
+most recent review transcript JSONL emitted by `/review-branch`, read the
+structured fix proposal recorded in it, and apply each edit that proposal
+carries. The handler SHALL NOT call a language model: the edits were produced
+by the fixer and are applied as recorded. The handler SHALL NOT modify files
+outside the workspace root and SHALL NOT apply an edit whose `oldString` does
+not appear exactly once in the target file.
 
-Path directives in the fix proposal SHALL be normalised before use. In
-addition to surrounding backticks, trailing parenthetical annotations and
-trailing `:line` or `:line-line` suffixes, normalisation SHALL strip a trailing
-`:symbol` suffix, because workers commonly cite a location as
-`path/to/file.ts:functionName`. The symbol MAY carry call syntax, as reviewers
-write locations such as `path/to/file.ts:someFunction().member`.
+A transcript that predates structured fix proposals carries Markdown only. The
+handler SHALL report that plainly and direct the user to re-run
+`/review-branch`, rather than applying nothing and reporting success.
 
-A referenced path that cannot denote a workspace file SHALL be reported as
-unresolvable. It SHALL NOT be presented to the worker as a file that does not
-exist yet, because that invites the creation of a phantom file and hides the
-fact that the reference was malformed.
-
-When no referenced path yields file content, the handler SHALL say so, so that
-an empty edit set is explained rather than appearing as a silent no-op.
-
-#### Scenario: Path directive annotated with a symbol
-
-- **GIVEN** a fix proposal containing `// path: src/extension.ts:someFunction`
-- **WHEN** `/apply-review` builds the file inventory
-- **THEN** the inventory contains the contents of `src/extension.ts`
-- **AND** no phantom file `src/extension.ts:someFunction` is proposed for
-  creation
-
-#### Scenario: Path directive annotated with a symbol in call syntax
-
-- **GIVEN** a reference of the form
-  `src/extension.ts:workspaceEditHost().commit`
-- **WHEN** `/apply-review` builds the file inventory
-- **THEN** the inventory contains the contents of `src/extension.ts`
-- **AND** the parentheses do not prevent the suffix from being stripped
-
-#### Scenario: Unresolvable reference is reported, not created
-
-- **GIVEN** a referenced path that cannot denote a workspace file
-- **WHEN** the file inventory is built
-- **THEN** that path is reported as unresolvable
-- **AND** it is not described to the worker as a file to create
-
-#### Scenario: Empty inventory is explained
-
-- **GIVEN** referenced paths none of which yield file content
-- **WHEN** `/apply-review` runs
-- **THEN** the handler reports that no source was available
-- **AND** the resulting empty edit set is attributed to that cause
-
-#### Scenario: Apply edits derived from latest transcript
+#### Scenario: Apply edits recorded in the latest transcript
 
 - **GIVEN** a workspace where `/review-branch` has produced at least
   one transcript ending with a `review-branch-done` event
@@ -150,12 +108,21 @@ an empty edit set is explained rather than appearing as a silent no-op.
 - **THEN** the handler reads the newest matching transcript
 - **AND** extracts the last `review-branch-iter` event with
   `role: "worker"` as the fix proposal
-- **AND** calls the worker model with the apply prompt
-- **AND** for each returned edit whose `path` resolves under the
-  workspace root and whose `oldString` matches exactly once,
-  performs the replacement via `vscode.workspace.fs`
+- **AND** applies each edit whose `path` resolves under the workspace root and
+  whose `oldString` matches exactly once, via `vscode.workspace.fs`
+- **AND** calls no language model
 - **AND** streams a per-edit applied/skipped report and a summary
   card recommending `git diff` and a follow-up `/review-branch`
+
+#### Scenario: Legacy Markdown-only transcript
+
+- **GIVEN** the newest transcript records a worker artifact but no structured
+  proposal
+- **WHEN** the user sends `@codecrosscheck /apply-review`
+- **THEN** the handler states that the transcript predates structured fix
+  proposals and names `/review-branch` as the remedy
+- **AND** shows the stored proposal
+- **AND** does NOT write to any file
 
 #### Scenario: No transcript available
 
@@ -169,7 +136,7 @@ an empty edit set is explained rather than appearing as a silent no-op.
 
 #### Scenario: Path escape attempt is rejected
 
-- **GIVEN** a worker-derived edit whose `path` resolves outside the
+- **GIVEN** an edit whose `path` resolves outside the
   workspace root (e.g. `../../etc/passwd` or an absolute path)
 - **WHEN** the handler validates the edit
 - **THEN** the edit is skipped
@@ -178,7 +145,7 @@ an empty edit set is explained rather than appearing as a silent no-op.
 
 #### Scenario: Ambiguous or missing oldString
 
-- **GIVEN** a worker-derived edit whose `oldString` is missing from
+- **GIVEN** an edit whose `oldString` is missing from
   the target file or appears more than once
 - **WHEN** the handler attempts to apply it
 - **THEN** the edit is skipped
@@ -224,170 +191,42 @@ The extension SHALL contribute two configuration settings under
 - **THEN** no test command is invoked (default empty)
 - **AND** edits are written to disk (default `dryRun=false`)
 
-### Requirement: oldString safety-net repairs
-
-The handler SHALL apply a deterministic sequence of repair variants
-when a worker-derived edit's literal `oldString` does not match the
-target file, and SHALL apply the first variant that matches uniquely.
-The candidate set SHALL include, in order: the literal string;
-CRLF/CR→LF normalisation; LF→CRLF normalisation (for CRLF source
-files); a unified-diff stripped variant that drops one leading
-`-` / `+` / space marker per line. The handler SHALL pair the
-`newString` with the same repair (so a CRLF candidate emits a CRLF
-replacement; a diff-stripped `oldString` is paired with a
-diff-stripped `newString` using `+` and context lines). The handler
-SHALL NOT enable any repair that loses information about the user's
-file (e.g. silently re-encoding line endings outside the patched
-region).
-
-#### Scenario: Worker emitted LF text but the file uses CRLF
-
-- **GIVEN** a target file whose lines are CRLF-terminated
-- **AND** a worker edit whose `oldString` uses LF only
-- **WHEN** the handler applies the edit
-- **THEN** the LF→CRLF candidate matches uniquely
-- **AND** the patched region is written with CRLF line endings,
-  matching the surrounding file
-
-#### Scenario: Worker copied a unified-diff hunk into oldString/newString
-
-- **GIVEN** a worker edit whose `oldString` and `newString` both
-  contain lines starting with `-`, `+`, or single-space markers
-- **WHEN** the handler applies the edit
-- **THEN** the diff-stripped variant of `oldString` (keeping
-  `-` and ` ` lines, dropping the marker) matches the file uniquely
-- **AND** the replacement is the diff-stripped `newString`
-  (keeping `+` and ` ` lines)
-
-#### Scenario: Empty oldString creates a new file
-
-- **GIVEN** a worker edit with `oldString === ""`
-- **AND** the resolved target path does NOT exist
-- **WHEN** the handler applies the edit
-- **THEN** parent directories are created
-- **AND** `newString` is written as the full file content
-- **AND** the outcome is `applied`
-
-#### Scenario: Empty oldString refuses to overwrite an existing file
-
-- **GIVEN** a worker edit with `oldString === ""`
-- **AND** the resolved target path already exists
-- **WHEN** the handler validates the edit
-- **THEN** the edit is skipped with reason
-  `file already exists (oldString empty implies create)`
-- **AND** the file is unchanged
-
 ### Requirement: apply-review debug log
 
 The handler SHALL persist a debug artifact at
 `<workspace>/.codecrosscheck/runs/<iso>-apply.json` containing the
-source transcript path, the iteration number, the harvested file
-paths, the unreadable paths, the worker's raw `edits[]`, and the
+source transcript path, the iteration number, the applied `edits[]`, and the
 per-edit `outcomes[]`. The log SHALL be written on every run
 (including zero-edit runs), and the path SHALL be linked from the
 chat output.
 
-#### Scenario: Worker returned zero edits
+#### Scenario: Proposal contained zero edits
 
-- **GIVEN** a worker that produced a fix proposal containing only
-  prose ("Data I need…") and no actionable hunks
-- **WHEN** `/apply-review` derives edits and gets `[]`
+- **GIVEN** a fix proposal in which every finding is `disagree` or
+  `unaddressed`
+- **WHEN** `/apply-review` runs
 - **THEN** a debug log is still written next to the source transcript
 - **AND** the log contains `edits: []` and `outcomes: []`
 
-### Requirement: review-branch repository file context
-
-The extension SHALL harvest workspace-relative file paths before each
-fixer iteration of `/review-branch` (iteration ≥ 2) from
-(a) each reviewer finding's `where` and `suggestion` fields, and
-(b) the worker's prior fix proposal (both `// path:` directives and
-free-text mentions). The extension SHALL read the current contents
-of those files (filtering out URLs, absolute Windows paths, and
-host-prefixed paths) and inject them as a `# Repository file
-context` section in the fixer input, capped at 60 000 characters.
-The fixer system prompt SHALL describe this section as canonical
-current source and SHALL forbid responding with
-"I need the source" / "Data I need" placeholders when the file is
-present in that section.
-
-The character budget SHALL be allocated across the cited files rather than
-applied as a single prefix cut over their concatenation. Every cited file that
-resolves to readable content SHALL be represented in the block. A file SHALL NOT
-be omitted merely because an earlier file consumed the budget.
-
-Where a file's contents are shorter than its share of the budget, the unused
-remainder SHALL be made available to the remaining files.
-
-Where a file cannot be included whole, it SHALL be truncated individually and
-its header SHALL state that it is partial. The retained portion SHALL include
-both the beginning and the end of the file, with the elision marked, because a
-finding may cite a symbol anywhere in the file.
-
-#### Scenario: Cited file larger than the whole budget
-
-- **GIVEN** two cited files, the first of which alone exceeds the budget
-- **WHEN** the file context block is built
-- **THEN** both files appear in the block
-- **AND** the first is marked as partial rather than silently cut
-
-#### Scenario: Small file is not padded out
-
-- **GIVEN** a cited file far smaller than its equal share of the budget
-- **WHEN** the file context block is built
-- **THEN** that file appears in full
-- **AND** the share it did not use is available to the other cited files
-
-#### Scenario: Truncation preserves the end of the file
-
-- **GIVEN** a cited file that must be truncated
-- **WHEN** it is added to the block
-- **THEN** the retained text includes the start and the end of the file
-- **AND** the omission between them is explicitly marked
-
-#### Scenario: Everything fits
-
-- **GIVEN** cited files whose combined size is within the budget
-- **WHEN** the block is built
-- **THEN** every file appears in full and none is marked partial
-
-#### Scenario: Reviewer cites a file outside the branch diff
-
-- **GIVEN** a reviewer finding whose `where` references a file not
-  modified by the branch
-- **WHEN** the fixer iteration runs
-- **THEN** that file's current contents are included in the
-  `# Repository file context` section
-- **AND** the fixer produces a concrete unified-diff hunk against
-  it rather than a "Data I need" placeholder
-
-#### Scenario: Cited path is a URL or absolute path
-
-- **GIVEN** a reviewer finding whose text mentions
-  `https://example.com/foo.ts` or `C:/temp/bar.cs`
-- **WHEN** path harvesting runs
-- **THEN** neither path is included in the file context
-
 ### Requirement: review-branch worker-disagreement adjudication
 
-The `/review-branch` fixer prompt SHALL allow the worker to push
-back on a reviewer finding by writing `**Fix:** Disagree: <rebuttal>`
-in that issue's section. The extension SHALL parse such rebuttals
-out of the final fix proposal and render them at the end of the
-chat output as a numbered, blockquoted decision block, accompanied
-by an explanation of how the user adjudicates: accept by running
-`/apply-review` (rebutted findings produce no edits, so nothing is
-applied for them) or override by re-running `/review-branch` with
-`force-fix-all` in the user prompt.
+The `/review-branch` fixer SHALL be able to push back on a reviewer finding by
+returning that fix with status `disagree` and its rebuttal in `explanation`.
+The extension SHALL render those rebuttals at the end of the chat output as a
+numbered, blockquoted decision block, accompanied by an explanation of how the
+user adjudicates: accept by running `/apply-review` (a rebutted finding carries
+no edits, so nothing is applied for it) or override by re-running
+`/review-branch` with `force-fix-all` in the user prompt.
 
 When the user prompt contains the token `force-fix-all` (matched as
 a whole word, case-insensitive), the fixer input SHALL include a
 `# User override` section, and the fixer prompt SHALL require a
-concrete fix for every reviewer finding and forbid use of
-`**Fix:** Disagree:` in that round.
+concrete fix for every reviewer finding and forbid the `disagree`
+status in that round.
 
 #### Scenario: Worker rebuts one finding
 
-- **GIVEN** the fixer wrote `**Fix:** Disagree: …` for issue 2 of 3
+- **GIVEN** the fixer returned status `disagree` for issue 2 of 3
 - **WHEN** `/review-branch` finishes
 - **THEN** the chat output ends with a section titled
   `🤔 1 worker disagreement(s) pending your decision`
@@ -401,44 +240,8 @@ concrete fix for every reviewer finding and forbid use of
 - **WHEN** the user re-runs with prompt
   `force-fix-all: address every finding`
 - **THEN** the fixer input contains a `# User override` section
-- **AND** the fixer's output contains no `**Fix:** Disagree:` lines
-- **AND** every reviewer finding has a concrete fix section
-
-### Requirement: review-branch blocked-finding detection
-
-The extension SHALL also detect issue sections in the final fix
-proposal where the worker dodged producing a concrete patch without
-using the explicit `**Fix:** Disagree:` token, by matching dodge
-patterns including `**Data I need`, `(sketch — pending current
-source)`, `I cannot produce a patch/hunk`, and "pending source".
-Such sections SHALL be rendered as a separate
-`🚫 N finding(s) the worker did not produce a real patch for`
-block at the end of the chat output, with a one-line reason per
-issue and a remediation hint (open the parent multi-project folder
-as the workspace, or re-run with `force-fix-all`). Issues already
-captured by the disagreement adjudication block SHALL be excluded
-to avoid double reporting.
-
-#### Scenario: Worker emits a sketch instead of a patch
-
-- **GIVEN** a fix proposal whose issue 1 says
-  `**Fix:** I cannot produce the unified-diff hunk … without the
-  current source` and includes
-  `// path: foo.cs (sketch — pending current source)`
-- **WHEN** `/review-branch` finishes
-- **THEN** the summary contains the
-  `🚫 1 finding(s) the worker did not produce a real patch for`
-  block referencing issue 1
-- **AND** the block names a remediation (workspace switch or
-  `force-fix-all`)
-
-#### Scenario: Disagreement and dodge are not double-reported
-
-- **GIVEN** an issue whose body uses both `**Fix:** Disagree:` and
-  the words "I cannot produce a patch"
-- **WHEN** the summary renders
-- **THEN** the issue appears in the disagreement block only
-- **AND** the dodge block does not list it
+- **AND** no fix in the response carries status `disagree`
+- **AND** every reviewer finding has a concrete fix
 
 ### Requirement: review-branch summary discoverability
 
@@ -1271,4 +1074,144 @@ assertion that bypasses the declared generic.
 - **WHEN** `filterRejectedIssues` drops one or more issues
 - **THEN** the verdict object passed in is unchanged, and the returned
   verdict is a distinct object
+
+### Requirement: review-branch SHALL offer agents a workspace toolset
+
+The triager and the fixer SHALL be granted the read-only workspace toolset
+before each fixer iteration of `/review-branch`, rather than a pre-assembled
+block of file contents. Neither agent's prompt SHALL carry a
+`# Repository file context` section.
+
+Every tool call SHALL be surfaced in the chat progress stream naming the agent
+and the tool, and recorded in the run transcript.
+
+When an agent's tool budget or deadline is exhausted, the extension SHALL say
+so in the chat output, naming the setting that raises the limit.
+
+#### Scenario: Agent reads a file nobody predicted it would need
+
+- **WHEN** the triager finds that judging a finding turns on a file the finding
+  never mentions
+- **THEN** it reads that file through the toolset and judges the finding,
+  rather than returning `uncertain` for want of context
+
+#### Scenario: Agent obtains an unlisted file type
+
+- **WHEN** a finding cites a file whose extension was not in the former
+  harvesting allowlist
+- **THEN** the agent can still read it and produce a concrete fix
+
+#### Scenario: Tool calls are visible and recorded
+
+- **WHEN** an agent makes tool calls during a run
+- **THEN** each call appears in the chat progress stream with the agent and
+  tool name
+- **AND** each call is recorded in the run transcript
+
+#### Scenario: Exhausted budget is reported to the user
+
+- **WHEN** an agent reaches its tool-call budget or deadline
+- **THEN** the chat output states which limit was hit, how many calls were
+  made, and which setting raises it
+
+### Requirement: review-branch SHALL report unaddressed findings structurally
+
+A finding the worker could neither fix nor rebut SHALL be reported because the
+worker set that status in its structured response, not because a regular
+expression matched an English phrase in its prose. The chat output SHALL list
+each such finding with the worker's own stated reason.
+
+#### Scenario: Worker cannot produce a patch
+
+- **WHEN** the worker returns a fix whose status is `unaddressed`
+- **THEN** the summary lists that finding together with the explanation the
+  worker gave
+- **AND** no prose-matching heuristic is consulted to discover it
+
+#### Scenario: A fixed finding is not reported as unaddressed
+
+- **WHEN** every fix in the proposal has status `fixed` or `disagree`
+- **THEN** no unaddressed block is rendered
+
+### Requirement: Edits SHALL repair line endings and nothing else
+
+An edit SHALL be applied only when its `oldString` occurs in the target file
+exactly once, after normalising line endings and no other difference. The
+replacement SHALL be written with the line endings of the form that matched, so
+the patched region agrees with the surrounding file.
+
+Line endings are the one difference the model cannot be held to: it reads the
+file through the toolset, which preserves CRLF exactly, but emits LF in its
+JSON regardless. Every other mismatch SHALL be a hard failure — the handler
+SHALL NOT strip unified-diff markers or try any other repaired variant, because
+a near-miss there means the edit is wrong and repairing it would conceal that.
+
+A non-matching edit SHALL be skipped with a reason and the file left unchanged.
+
+#### Scenario: Model emits LF against a CRLF file
+
+- **GIVEN** a target file with CRLF line endings
+- **AND** an edit whose `oldString` carries the same text with LF
+- **WHEN** the handler applies it
+- **THEN** the edit is applied
+- **AND** the patched region is written with CRLF, matching the file
+
+#### Scenario: Model emits CRLF against an LF file
+
+- **GIVEN** a target file with LF line endings
+- **AND** an edit whose `oldString` carries the same text with CRLF
+- **WHEN** the handler applies it
+- **THEN** the edit is applied
+- **AND** no CR is introduced into the file
+
+#### Scenario: oldString carries unified-diff markers
+
+- **GIVEN** an edit whose `oldString` lines begin with `-`, `+` or a space
+- **WHEN** the handler applies it
+- **THEN** the edit is skipped with reason `oldString not found`
+- **AND** the file is unchanged
+
+#### Scenario: Content differs by more than line endings
+
+- **GIVEN** an edit whose `oldString` differs from the file in any character
+  other than a line terminator
+- **WHEN** the handler applies it
+- **THEN** the edit is skipped and the file is unchanged
+
+#### Scenario: Empty oldString creates a new file
+
+- **GIVEN** an edit with `oldString === ""`
+- **AND** the resolved target path does NOT exist
+- **WHEN** the handler applies the edit
+- **THEN** parent directories are created
+- **AND** `newString` is written as the full file content
+- **AND** the outcome is `applied`
+
+#### Scenario: Empty oldString refuses to overwrite an existing file
+
+- **GIVEN** an edit with `oldString === ""`
+- **AND** the resolved target path already exists
+- **WHEN** the handler validates the edit
+- **THEN** the edit is skipped with reason
+  `file already exists (oldString empty implies create)`
+- **AND** the file is unchanged
+
+### Requirement: Tool budget settings
+
+The extension SHALL contribute `codecrosscheck.tools.maxCalls` (integer,
+default 24) and `codecrosscheck.tools.deadlineMs` (integer, default 180000),
+each with a user-visible description. Setting `maxCalls` to 0 SHALL disable
+tool access.
+
+#### Scenario: Default budget
+
+- **GIVEN** a fresh install with no user overrides
+- **WHEN** an agent runs with tools
+- **THEN** it may make at most 24 calls within 180 seconds
+
+#### Scenario: Tools disabled
+
+- **GIVEN** `codecrosscheck.tools.maxCalls` is 0
+- **WHEN** an agent runs
+- **THEN** it makes no tool calls and answers from the prompt alone
 
