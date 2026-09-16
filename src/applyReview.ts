@@ -493,13 +493,50 @@ export function resolveSafePath(workspaceRoot: string, candidate: string): { ok:
   return { ok: true, abs };
 }
 
+/**
+ * Keep the head and tail of `text` within `budget`, marking the elision. A
+ * finding may cite a symbol anywhere in the file, so a head-only cut would
+ * systematically hide the end.
+ */
+export function truncateMiddle(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  const marker = `\n\n… ${(text.length - budget).toLocaleString("en-US")} characters elided …\n\n`;
+  const keep = Math.max(0, budget - marker.length);
+  const head = Math.ceil(keep * 0.6);
+  const tail = keep - head;
+  return text.slice(0, head) + marker + (tail > 0 ? text.slice(text.length - tail) : "");
+}
+
+/**
+ * Split `budget` across `sizes`, smallest first so a file shorter than its
+ * equal share leaves the remainder to the others. Returns chars per index.
+ */
+export function allocateBudget(sizes: number[], budget: number): number[] {
+  const out = new Array<number>(sizes.length).fill(0);
+  const smallestFirst = sizes.map((size, index) => ({ size, index })).sort((a, b) => a.size - b.size);
+  let remaining = budget;
+  let left = smallestFirst.length;
+  for (const { size, index } of smallestFirst) {
+    const take = Math.min(size, Math.floor(remaining / left));
+    out[index] = take;
+    remaining -= take;
+    left--;
+  }
+  return out;
+}
+
+type InventoryItem =
+  | { kind: "note"; text: string }
+  | { kind: "file"; rel: string; effective: string; content: string };
+
 /** Read each referenced file (annotating missing ones as "to be created") and return a Markdown inventory. */
 export async function buildFileInventory(
   workspaceRoot: string,
   paths: string[],
   fs: FsLike,
+  opts: { budget?: number } = {},
 ): Promise<{ inventory: string; missing: string[]; resolved: Map<string, string> }> {
-  const parts: string[] = [];
+  const items: InventoryItem[] = [];
   const missing: string[] = [];
   const resolved = new Map<string, string>();
   for (const rel of paths) {
@@ -521,15 +558,39 @@ export async function buildFileInventory(
     if (!(await fs.exists(safe.abs))) {
       // File doesn't exist yet — surface to the worker so it can emit a
       // creation edit (oldString="") if the proposal calls for it.
-      parts.push(`## File: ${effective} (does not exist yet — emit a creation edit with oldString="" to create it, or skip if the proposal doesn't call for a new file)`);
+      items.push({
+        kind: "note",
+        text: `## File: ${effective} (does not exist yet — emit a creation edit with oldString="" to create it, or skip if the proposal doesn't call for a new file)`,
+      });
       continue;
     }
-    const content = await fs.readFile(safe.abs);
-    const header = effective === rel
-      ? `## File: ${effective}`
-      : `## File: ${effective} (proposal referenced as \`${rel}\` — use the resolved path \`${effective}\` in your edits)`;
-    parts.push(`${header}\n\n\`\`\`\n${content}\n\`\`\``);
+    items.push({ kind: "file", rel, effective, content: await fs.readFile(safe.abs) });
   }
+
+  const files = items.filter((i): i is Extract<InventoryItem, { kind: "file" }> => i.kind === "file");
+  // Budgeting per file, not one slice over the concatenation: a single large
+  // file used to consume the whole cap and drop every later file silently.
+  const shares =
+    opts.budget && opts.budget > 0
+      ? allocateBudget(files.map((f) => f.content.length), opts.budget)
+      : files.map((f) => f.content.length);
+
+  let fileIndex = 0;
+  const parts = items.map((item) => {
+    if (item.kind === "note") return item.text;
+    const share = shares[fileIndex++] ?? item.content.length;
+    const partial = share < item.content.length;
+    const body = partial ? truncateMiddle(item.content, share) : item.content;
+    const origin =
+      item.effective === item.rel
+        ? ""
+        : ` (proposal referenced as \`${item.rel}\` — use the resolved path \`${item.effective}\` in your edits)`;
+    const note = partial
+      ? ` (PARTIAL — ${body.length.toLocaleString("en-US")} of ${item.content.length.toLocaleString("en-US")} chars; a middle section is elided)`
+      : "";
+    return `## File: ${item.effective}${origin}${note}\n\n\`\`\`\n${body}\n\`\`\``;
+  });
+
   return { inventory: parts.join("\n\n"), missing, resolved };
 }
 

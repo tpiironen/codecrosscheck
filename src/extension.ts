@@ -537,17 +537,16 @@ async function handleReviewBranch(
     let fileContextBlock = "";
     if (harvested.size > 0) {
       stream.progress(`Reading ${harvested.size} referenced file(s) for fixer context\u2026`);
-      const { inventory, missing } = await buildFileInventory(cwd, Array.from(harvested), inventoryFs);
-      const truncated = inventory.length > fileContextCap
-        ? inventory.slice(0, fileContextCap) + `\n\n_(repo file context truncated at ${fileContextCap} chars)_`
-        : inventory;
-      if (truncated.length > 0) {
+      const { inventory, missing } = await buildFileInventory(cwd, Array.from(harvested), inventoryFs, {
+        budget: fileContextCap,
+      });
+      if (inventory.length > 0) {
         fileContextBlock = [
           "# Repository file context",
           "",
           "_Files cited by the reviewer findings or by your prior proposal. Use these as the canonical current source when producing concrete patches; do NOT request them as data._",
           "",
-          truncated,
+          inventory,
         ].join("\n");
       }
       if (missing.length > 0) {

@@ -26,7 +26,28 @@ OpenSpec changes:
 [`pin-vscode-api-floor`](openspec/changes/pin-vscode-api-floor/proposal.md),
 [`add-finding-triage`](openspec/changes/add-finding-triage/proposal.md),
 [`replace-github-models-with-openai-compatible`](openspec/changes/replace-github-models-with-openai-compatible/proposal.md),
-[`fix-referenced-path-normalisation`](openspec/changes/fix-referenced-path-normalisation/proposal.md).
+[`fix-referenced-path-normalisation`](openspec/changes/fix-referenced-path-normalisation/proposal.md),
+[`budget-file-context-per-file`](openspec/changes/budget-file-context-per-file/proposal.md).
+
+### Fixed
+
+- **A single large file could starve every other file out of the review
+  context.** The `# Repository file context` block is capped at 60 000
+  characters, and the cap was applied as one prefix slice over the
+  concatenated files. Measured on a live run: `src/extension.ts` is 63 430
+  chars, so it exceeded the whole budget alone and was cut mid-function, and
+  `src/applyReview.ts` (29 414 chars) — cited by the second finding — never
+  entered the block at all. The triager returned `uncertain` for both findings
+  and said exactly why: the file was "truncated mid-function" and the body of
+  the cited function "was not provided". Outcome `defended`, nothing fixed, one
+  model call spent reaching a non-answer.
+
+  The budget is now allocated per cited file, smallest first, so a file shorter
+  than its equal share is included whole and leaves the remainder to the
+  others. No cited file is dropped. A file that still does not fit is truncated
+  individually, labelled `PARTIAL` in its own header, and retains its head *and*
+  tail with the elision marked — a finding may cite a symbol anywhere in the
+  file, and the old head-only cut systematically hid the end.
 
 ### Fixed
 

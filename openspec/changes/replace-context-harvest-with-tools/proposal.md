@@ -45,6 +45,35 @@ combinatorial pairing rule, all to recover from the lossy round trip.
 Given tool calling, the worker fetches exactly what it needs and emits edits
 directly. The compensating machinery becomes deletable.
 
+## Measured evidence: no pre-computed heuristic can close this gap
+
+From the dogfood run of 2026-09-16
+(`C:\src\AI-review\.codecrosscheck\runs\2026-09-16T07-38-59-138Z.jsonl`).
+A single reviewer finding cited `src/extension.ts`. The triager needed
+`src/applyReview.ts` to judge it, that file was absent, and the triager returned
+`uncertain`; the run ended `defended` with nothing fixed.
+
+Two candidate heuristics were evaluated against that run and both were rejected
+on evidence, not preference:
+
+- **Symbol-directed harvesting** (resolve identifiers named in the finding to
+  their defining file) **would have failed.** Every identifier the finding named
+  — `handleApplyReview`, `workspaceEditHost.commit`, `nodeFsLike` — is defined
+  in `src/extension.ts` itself. Nothing in the finding text points outside it.
+- **One-hop import-closure harvesting would have worked but is a net loss.**
+  `extension.ts`'s local closure is 10 files / 58,241 chars; with the file
+  itself that is 121,671 against a 60,000 budget. Fair-share allocation then
+  cuts `extension.ts` from 30,586 to 15,587 chars and makes `applyReview.ts`
+  partial at 15,586, while 8 files nobody asked about consume the remaining
+  ~29k. It buys the needed file by halving the legibility of both files that
+  mattered.
+
+Both fail for one reason: the need for `applyReview.ts` was **discovered during
+reasoning**, when the triager realised `w.content`'s provenance was decided in
+another file. It was never stated in the finding. No amount of pre-computation
+can extract information the source text does not contain — only letting the
+model ask can.
+
 ## What Changes
 
 - **MODIFIED capability `chat-loop`**: `ChatClient` SHALL support tool

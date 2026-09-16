@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 import {
+  allocateBudget,
   applyEdit,
   buildFileInventory,
   composeApplyInput,
@@ -304,6 +305,83 @@ describe("applyReview.buildFileInventory", () => {
     const result = await buildFileInventory(WS, ["src/a.ts:someFunction"], fs);
     expect(result.missing[0]).toContain("not a workspace-relative path");
     expect(result.inventory).not.toContain("does not exist yet");
+  });
+});
+
+describe("applyReview.buildFileInventory — budget", () => {
+  // Sizes measured from the live run that exposed the defect (transcript
+  // 2026-09-15T12-19-06-304Z.jsonl): src/extension.ts busts the 60 000-char cap
+  // on its own, so the old prefix slice dropped src/applyReview.ts entirely and
+  // the triager returned `uncertain` for both findings.
+  const BIG = `HEAD${"a".repeat(63_430 - 8)}TAIL`;
+  const SMALL = `BSTART${"b".repeat(29_414 - 10)}BEND`;
+  const CAP = 60_000;
+
+  const twoFileFs = () =>
+    makeFakeFs({
+      files: { [r("src/extension.ts")]: BIG, [r("src/applyReview.ts")]: SMALL },
+    });
+
+  it("keeps every cited file when the first one alone exceeds the budget", async () => {
+    const { fs } = twoFileFs();
+    const result = await buildFileInventory(
+      WS,
+      ["src/extension.ts", "src/applyReview.ts"],
+      fs,
+      { budget: CAP },
+    );
+    expect(result.inventory).toContain("## File: src/extension.ts");
+    expect(result.inventory).toContain("## File: src/applyReview.ts");
+    // The second file is the one the old slice dropped: prove its body is here,
+    // not merely its header.
+    expect(result.inventory).toContain("BSTART");
+    expect(result.inventory).toContain("BEND");
+  });
+
+  it("labels the oversized file as partial and leaves the small one whole", async () => {
+    const { fs } = twoFileFs();
+    const result = await buildFileInventory(
+      WS,
+      ["src/extension.ts", "src/applyReview.ts"],
+      fs,
+      { budget: CAP },
+    );
+    expect(result.inventory).toMatch(/## File: src\/extension\.ts \(PARTIAL/);
+    expect(result.inventory).not.toMatch(/## File: src\/applyReview\.ts \(PARTIAL/);
+  });
+
+  it("keeps the head and the tail of a truncated file, marking the elision", async () => {
+    const { fs } = twoFileFs();
+    const result = await buildFileInventory(WS, ["src/extension.ts"], fs, { budget: CAP });
+    expect(result.inventory).toContain("HEAD");
+    expect(result.inventory).toContain("TAIL");
+    expect(result.inventory).toContain("characters elided");
+  });
+
+  it("stays within the budget", async () => {
+    const { fs } = twoFileFs();
+    const result = await buildFileInventory(
+      WS,
+      ["src/extension.ts", "src/applyReview.ts"],
+      fs,
+      { budget: CAP },
+    );
+    // Budget governs file contents; headers and fences are small and fixed.
+    expect(result.inventory.length).toBeLessThan(CAP + 1_000);
+  });
+
+  it("changes nothing when everything fits", async () => {
+    const { fs } = makeFakeFs({ files: { [r("a.ts")]: "AA", [r("b.ts")]: "BB" } });
+    const budgeted = await buildFileInventory(WS, ["a.ts", "b.ts"], fs, { budget: CAP });
+    const unbudgeted = await buildFileInventory(WS, ["a.ts", "b.ts"], fs);
+    expect(budgeted.inventory).toBe(unbudgeted.inventory);
+    expect(budgeted.inventory).not.toContain("PARTIAL");
+  });
+
+  it("gives an under-share file its full contents and spends the remainder elsewhere", () => {
+    // 10 + 90 within 60: the small file is not padded to 30, and the large one
+    // receives the 20 it did not use.
+    expect(allocateBudget([90, 10], 60)).toEqual([50, 10]);
   });
 });
 
