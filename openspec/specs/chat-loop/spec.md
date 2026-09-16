@@ -10,7 +10,7 @@ The system SHALL drive each pipeline stage with two distinct `ChatClient` instan
 #### Scenario: Different defaults from different vendors
 
 - **WHEN** the system runs with no model overrides
-- **THEN** the worker uses `openai/gpt-5.4` AND the reviewer uses `anthropic/claude-opus-4.6`
+- **THEN** the worker uses `anthropic/claude-opus-5` AND the reviewer uses `openai/gpt-5.3-codex`
 
 #### Scenario: Override via CLI flag
 
@@ -102,14 +102,41 @@ Code executed in the `EXECUTE` stage SHALL run in a temporary working directory 
 
 ### Requirement: Provider-agnostic ChatClient
 
-Worker and reviewer SHALL be invoked through the `ChatClient` interface. The implementation SHALL provide at least two adapters: one for the GitHub Models OpenAI-compatible endpoint and one for the VS Code Language Model API (`vscode.lm`). Adding a new provider SHALL require only a new adapter, not changes to the loop.
+Worker and reviewer SHALL be invoked through the `ChatClient` interface. The implementation SHALL provide at least two adapters: one for any OpenAI-compatible `/chat/completions` endpoint and one for the VS Code Language Model API (`vscode.lm`). Adding a new provider SHALL require only a new adapter, not changes to the loop.
 
-#### Scenario: GitHub Models adapter authenticates
+The OpenAI-compatible adapter SHALL take its base URL from configuration and
+SHALL NOT default to any provider. A missing base URL SHALL fail with an error
+naming the configuration that supplies it. Defaulting to a provider is how the
+adapter came to be hard-wired to a service that was subsequently retired.
 
-- **GIVEN** `GITHUB_TOKEN` is set with `models:read` scope
-- **WHEN** the GitHub Models adapter sends a request
-- **THEN** the request includes `Authorization: Bearer <token>`
-- **AND** the request targets `https://models.github.ai/inference/chat/completions`
+The adapter SHALL treat the API key as optional. When no key is configured it
+SHALL omit the `Authorization` header rather than sending an empty or
+placeholder credential, so that endpoints requiring no authentication work
+unmodified.
+
+The adapter SHALL NOT source credentials from a provider-specific helper such
+as `gh auth token`. A credential resolved for one provider must not be sent to
+an arbitrary configured base URL.
+
+#### Scenario: Adapter sends a configured key
+
+- **GIVEN** a base URL and an API key are configured
+- **WHEN** the OpenAI-compatible adapter sends a request
+- **THEN** the request includes `Authorization: Bearer <key>`
+- **AND** the request targets `<base URL>/chat/completions`
+
+#### Scenario: Adapter omits auth when no key is configured
+
+- **GIVEN** a base URL is configured and no API key is
+- **WHEN** the adapter sends a request
+- **THEN** the request carries no `Authorization` header
+
+#### Scenario: Missing base URL is a named error
+
+- **GIVEN** no base URL is configured
+- **WHEN** the adapter is constructed
+- **THEN** it throws an error naming the configuration that supplies the base
+  URL
 
 #### Scenario: vscode.lm adapter selects the requested model
 
@@ -165,29 +192,38 @@ computation fails, the CLI SHALL exit non-zero with the underlying error.
 
 ### Requirement: Default model pair
 
-The default worker model SHALL be `openai/gpt-5.4` and the default reviewer
-model SHALL be `anthropic/claude-opus-4.6`. These defaults apply to the CLI
+The default worker model SHALL be `anthropic/claude-opus-5` and the default
+reviewer model SHALL be `openai/gpt-5.3-codex`. These defaults apply to the CLI
 flags `--worker-model` / `--reviewer-model` and to the VS Code settings
 `codecrosscheck.workerModel` / `codecrosscheck.reviewerModel`.
 
-The reviewer default SHALL NOT be the same family as the worker default.
+The reviewer default SHALL NOT be the same family as the worker default, on any
+surface that declares one. Declaring both CLI flags with the same default is a
+violation of this requirement even when the values are individually valid.
 
 The cross-vendor invariant is additionally preserved at runtime by the chat
 participant: when `useChatPickerWorker=true` (default), the worker follows the
 Copilot Chat picker, and the participant warns when the worker and reviewer
 model ids resolve to the same value.
 
-#### Scenario: CLI uses bumped defaults
+#### Scenario: CLI uses the declared defaults
 
 - **WHEN** `codecrosscheck "..."` is invoked without `--worker-model`
   or `--reviewer-model`
-- **THEN** the worker resolves to `openai/gpt-5.4` and the reviewer
-  to `anthropic/claude-opus-4.6`
+- **THEN** the worker resolves to `anthropic/claude-opus-5` and the reviewer
+  to `openai/gpt-5.3-codex`
 
 #### Scenario: Reviewer default differs from worker default
 
 - **WHEN** the declared defaults are inspected on any surface
 - **THEN** the reviewer default is not the worker's default family
+
+#### Scenario: Chat participant reviewer ignores the picker
+
+- **GIVEN** `codecrosscheck.useChatPickerWorker` is `true`
+- **WHEN** the user selects a model in the Copilot Chat picker
+- **THEN** that model is used as the worker
+- **AND** the reviewer still resolves from `codecrosscheck.reviewerModel`
 
 ### Requirement: ChatClient SHALL expose a plain-text send path
 
@@ -371,4 +407,41 @@ unexpected formats from chat output alone, without opening the transcript.
 - **THEN** the thrown `Error.message` SHALL contain the substring
   `failed schema "<name>" twice`
 - **AND** SHALL contain a `(raw: ...)` snippet for each attempt
+
+### Requirement: Structured finding triage
+
+The system SHALL provide a triage agent that judges whether each reviewer
+finding is real, separately from any step that drafts fixes. The triage agent
+SHALL return a zod-validated structured result, not prose to be parsed.
+
+Each triage entry SHALL carry the finding's `id`, a `status` of `confirmed`,
+`rejected` or `uncertain`, and an `evidence` string.
+
+Evidence SHALL be required for every status, including rejections. A rejection
+SHALL cite the code, type declaration, test or documentation that settles the
+question. Asserting that a finding merely looks wrong is not evidence.
+
+The `uncertain` status SHALL exist so that the agent is never forced into a
+binary choice it cannot support. An agent compelled to guess produces a guess
+that later becomes a code edit.
+
+#### Scenario: A finding contradicted by the type declarations
+
+- **GIVEN** a finding claiming an API does not accept a documented option
+- **WHEN** triage runs with that API's declaration available as evidence
+- **THEN** the entry's status is `rejected`
+- **AND** its evidence quotes the declaration
+
+#### Scenario: Triage cannot answer from the evidence available
+
+- **GIVEN** a finding whose correctness depends on a file not provided
+- **WHEN** triage runs
+- **THEN** the entry's status is `uncertain` rather than `confirmed` or
+  `rejected`
+
+#### Scenario: Triage output is schema-validated
+
+- **WHEN** the triage agent returns a result missing a `status`
+- **THEN** the structured-response path rejects it rather than accepting a
+  partially parsed result
 

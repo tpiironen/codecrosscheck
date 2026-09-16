@@ -97,6 +97,51 @@ handler SHALL NOT modify files outside the workspace root and SHALL
 NOT apply an edit whose `oldString` does not appear exactly once in
 the target file.
 
+Path directives in the fix proposal SHALL be normalised before use. In
+addition to surrounding backticks, trailing parenthetical annotations and
+trailing `:line` or `:line-line` suffixes, normalisation SHALL strip a trailing
+`:symbol` suffix, because workers commonly cite a location as
+`path/to/file.ts:functionName`. The symbol MAY carry call syntax, as reviewers
+write locations such as `path/to/file.ts:someFunction().member`.
+
+A referenced path that cannot denote a workspace file SHALL be reported as
+unresolvable. It SHALL NOT be presented to the worker as a file that does not
+exist yet, because that invites the creation of a phantom file and hides the
+fact that the reference was malformed.
+
+When no referenced path yields file content, the handler SHALL say so, so that
+an empty edit set is explained rather than appearing as a silent no-op.
+
+#### Scenario: Path directive annotated with a symbol
+
+- **GIVEN** a fix proposal containing `// path: src/extension.ts:someFunction`
+- **WHEN** `/apply-review` builds the file inventory
+- **THEN** the inventory contains the contents of `src/extension.ts`
+- **AND** no phantom file `src/extension.ts:someFunction` is proposed for
+  creation
+
+#### Scenario: Path directive annotated with a symbol in call syntax
+
+- **GIVEN** a reference of the form
+  `src/extension.ts:workspaceEditHost().commit`
+- **WHEN** `/apply-review` builds the file inventory
+- **THEN** the inventory contains the contents of `src/extension.ts`
+- **AND** the parentheses do not prevent the suffix from being stripped
+
+#### Scenario: Unresolvable reference is reported, not created
+
+- **GIVEN** a referenced path that cannot denote a workspace file
+- **WHEN** the file inventory is built
+- **THEN** that path is reported as unresolvable
+- **AND** it is not described to the worker as a file to create
+
+#### Scenario: Empty inventory is explained
+
+- **GIVEN** referenced paths none of which yield file content
+- **WHEN** `/apply-review` runs
+- **THEN** the handler reports that no source was available
+- **AND** the resulting empty edit set is attributed to that cause
+
 #### Scenario: Apply edits derived from latest transcript
 
 - **GIVEN** a workspace where `/review-branch` has produced at least
@@ -264,6 +309,46 @@ The fixer system prompt SHALL describe this section as canonical
 current source and SHALL forbid responding with
 "I need the source" / "Data I need" placeholders when the file is
 present in that section.
+
+The character budget SHALL be allocated across the cited files rather than
+applied as a single prefix cut over their concatenation. Every cited file that
+resolves to readable content SHALL be represented in the block. A file SHALL NOT
+be omitted merely because an earlier file consumed the budget.
+
+Where a file's contents are shorter than its share of the budget, the unused
+remainder SHALL be made available to the remaining files.
+
+Where a file cannot be included whole, it SHALL be truncated individually and
+its header SHALL state that it is partial. The retained portion SHALL include
+both the beginning and the end of the file, with the elision marked, because a
+finding may cite a symbol anywhere in the file.
+
+#### Scenario: Cited file larger than the whole budget
+
+- **GIVEN** two cited files, the first of which alone exceeds the budget
+- **WHEN** the file context block is built
+- **THEN** both files appear in the block
+- **AND** the first is marked as partial rather than silently cut
+
+#### Scenario: Small file is not padded out
+
+- **GIVEN** a cited file far smaller than its equal share of the budget
+- **WHEN** the file context block is built
+- **THEN** that file appears in full
+- **AND** the share it did not use is available to the other cited files
+
+#### Scenario: Truncation preserves the end of the file
+
+- **GIVEN** a cited file that must be truncated
+- **WHEN** it is added to the block
+- **THEN** the retained text includes the start and the end of the file
+- **AND** the omission between them is explicitly marked
+
+#### Scenario: Everything fits
+
+- **GIVEN** cited files whose combined size is within the budget
+- **WHEN** the block is built
+- **THEN** every file appears in full and none is marked partial
 
 #### Scenario: Reviewer cites a file outside the branch diff
 
@@ -616,8 +701,8 @@ SHALL be grouped by severity (high / medium / low) with corresponding
 
 The `/review-branch` participant command SHALL apply a hard char-budget guard
 on the assembled branch diff before any reviewer LM call. The cap SHALL be
-governed by the new VS Code setting
-`codecrosscheck.reviewBranch.maxDiffChars` (integer, default `200000`,
+governed by the VS Code setting
+`codecrosscheck.reviewBranch.maxDiffChars` (integer, default `1100000`,
 minimum `0`; `0` disables the guard).
 
 When the diff exceeds the cap, the handler SHALL print a clear chat message
@@ -628,7 +713,10 @@ return without invoking the reviewer.
 
 This guard is independent of the reviewer model — it protects against the
 common case where a forgotten `diff-base` produces a multi-megabyte diff that
-no reasonable LM can review in one pass.
+no reasonable LM can review in one pass. Because the default cap is larger
+than the context window of any currently reachable reviewer model, the token
+preflight is normally the gate that fires first; this guard remains the only
+protection for models that report no `maxInputTokens`.
 
 #### Scenario: Diff over the configured cap aborts before the LM call
 
@@ -680,4 +768,146 @@ larger reviewer via `codecrosscheck.reviewerModel`, or split the branch).
   `floor(maxInputTokens * 0.9)`
 - **THEN** the preflight passes and `reviewer.judge` is called with the
   assembled prompt
+
+### Requirement: review-branch re-review diff scoping
+
+The extension SHALL scope the branch diff sent to the reviewer on re-review
+passes (iteration ≥ 2) of `/review-branch` to only those files cited by the
+prior findings and by the worker's fix proposal. The cited paths SHALL be the
+same set already harvested for the fixer's repository file context, derived
+from each finding's `where` and `suggestion` fields and from the fix proposal.
+
+The initial review pass SHALL continue to receive the complete branch diff.
+
+When the scoped patch is empty — because no cited path matched a file in the
+diff — the extension SHALL send the complete diff instead. Scoping SHALL NOT
+be allowed to reduce the reviewer's context to nothing.
+
+The re-review prompt SHALL state that the diff has been scoped and SHALL report
+how many files were omitted, so the reviewer is not misled into treating the
+scoped diff as the whole branch.
+
+The extension SHALL record the scoping outcome in the re-review
+`review-branch-iter` transcript event, including the number of characters sent,
+the number of files included and the number omitted.
+
+#### Scenario: Findings cite a subset of the changed files
+
+- **GIVEN** a branch diff touching ten files
+- **AND** a prior verdict whose findings cite two of them
+- **WHEN** the re-review prompt is built
+- **THEN** the diff in the prompt contains only those two files
+- **AND** the prompt states that eight files were omitted
+
+#### Scenario: No cited path matches the diff
+
+- **GIVEN** a prior verdict whose findings cite no path present in the diff
+- **WHEN** the re-review prompt is built
+- **THEN** the complete branch diff is sent
+- **AND** the prompt does not claim that any file was omitted
+
+#### Scenario: Initial pass is unaffected
+
+- **WHEN** the first reviewer call of `/review-branch` is made
+- **THEN** it receives the complete branch diff regardless of any scoping
+
+#### Scenario: Scoping is measurable from the transcript
+
+- **WHEN** a re-review pass completes
+- **THEN** its `review-branch-iter` transcript event records the characters
+  sent and the counts of included and omitted files
+
+### Requirement: Transcript durability before handler return
+
+Handlers that write a terminal transcript event SHALL wait for every queued
+transcript write to reach disk before returning control to the user. The
+terminal events are `review-branch-done` for `/review-branch` and
+`/openspec-review`, and `completed` for the pipeline handler.
+
+The transcript writer SHALL expose a `flush()` operation that resolves only
+once all queued appends have completed.
+
+The writer SHALL NOT silently discard append failures. It SHALL retain the
+first failure and report it from `flush()`.
+
+When `flush()` reports a failure, the handler SHALL warn the user that the
+transcript is incomplete, and SHALL NOT fail the run on that basis. A review
+that produced a verdict has succeeded regardless of whether its record was
+written.
+
+`write()` SHALL remain synchronous and non-blocking so that emitting an event
+never stalls the extension host.
+
+#### Scenario: Apply immediately after review
+
+- **GIVEN** a `/review-branch` run that has just returned
+- **WHEN** `/apply-review` runs immediately, before any further user action
+- **THEN** the transcript already contains the `review-branch-done` event
+- **AND** `/apply-review` locates it rather than reporting no transcript
+
+#### Scenario: Append failure is surfaced
+
+- **GIVEN** a transcript whose underlying append fails
+- **WHEN** the handler flushes before returning
+- **THEN** the user is warned that the transcript is incomplete
+- **AND** the review's verdict and fix proposal are still reported normally
+
+#### Scenario: Emitting an event does not block
+
+- **WHEN** a handler writes a transcript event mid-run
+- **THEN** the call returns without awaiting disk I/O
+
+### Requirement: review-branch SHALL triage findings before drafting fixes
+
+`/review-branch` SHALL run triage on the reviewer's findings before the worker
+drafts any fix, and SHALL pass only findings whose triage status is `confirmed`
+to the fix-drafting step.
+
+Findings with status `rejected` or `uncertain` SHALL be reported to the user
+with their evidence, and SHALL NOT produce fix text. A finding the worker
+cannot support must not become an edit.
+
+The triage step SHALL receive the repository file context already harvested for
+the cited paths, so that it judges against current source rather than from the
+finding's wording alone.
+
+When the `force-fix-all` directive is present, triage SHALL be bypassed and
+every finding SHALL be treated as confirmed. The directive exists for the user
+to overrule the worker.
+
+When every finding is rejected, `/review-branch` SHALL report that the code was
+defended against the findings, and SHALL NOT report the run as an approved fix
+proposal. These are different outcomes and conflating them hides the result the
+user most needs.
+
+The extension SHALL record triage results in a `review-branch-triage`
+transcript event, including each finding's id, status and evidence.
+
+#### Scenario: A rejected finding never reaches the fixer
+
+- **GIVEN** a reviewer verdict with two findings
+- **AND** triage rejects one of them with evidence
+- **WHEN** the fix-drafting step runs
+- **THEN** it receives only the confirmed finding
+- **AND** the rejected finding is shown to the user with its evidence
+
+#### Scenario: Every finding rejected
+
+- **GIVEN** a reviewer verdict whose findings are all rejected by triage
+- **WHEN** the iteration completes
+- **THEN** the run reports that the code was defended
+- **AND** no fix proposal is presented for application
+
+#### Scenario: force-fix-all overrules triage
+
+- **GIVEN** a user prompt containing `force-fix-all`
+- **WHEN** `/review-branch` runs
+- **THEN** triage does not run
+- **AND** every finding is drafted against
+
+#### Scenario: Triage is recorded for later steps
+
+- **WHEN** a triage step completes
+- **THEN** a `review-branch-triage` transcript event records each finding's id,
+  status and evidence
 
