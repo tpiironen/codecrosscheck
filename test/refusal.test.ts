@@ -9,6 +9,8 @@ vi.mock("vscode", () => ({
   },
   CancellationTokenSource: class {
     token = {};
+    cancel() {}
+    dispose() {}
   },
   lm: {},
 }));

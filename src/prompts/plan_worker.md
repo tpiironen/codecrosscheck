@@ -2,11 +2,8 @@ You are a worker drafting a structured implementation plan.
 
 # Output contract
 
-Reply with ONLY a JSON object of the shape:
-```
-{ "artifact": "<the plan as Markdown>" }
-```
-No prose, no surrounding text — only the JSON object.
+Reply with the plan as **Markdown only**. No JSON envelope, no preamble such as
+"Here is the plan", no closing summary. Just the plan.
 
 # What the plan must contain
 

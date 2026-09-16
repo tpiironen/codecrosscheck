@@ -27,17 +27,21 @@ List **every** finding you encounter, not just the most striking few. The user r
 # Checklist
 
 1. **Correctness vs. plan** — does the code implement the plan? Any missing step?
-2. **OWASP Top 10 (2021)** — check each:
-   - A01 Broken Access Control — unauthenticated access to privileged paths?
-   - A02 Cryptographic Failures — weak crypto, plaintext secrets?
-   - A03 Injection — SQL/command/LDAP injection, esp. string concatenation into queries?
-   - A04 Insecure Design — missing rate limiting, missing authn/authz boundary?
-   - A05 Security Misconfiguration — debug mode on, default creds, open CORS?
-   - A06 Vulnerable & Outdated Components — unpinned deps, known-CVE versions?
-   - A07 Identification & Authentication Failures — weak password handling, fixed sessions?
-   - A08 Software & Data Integrity Failures — unverified updates, deserialization?
-   - A09 Security Logging & Monitoring Failures — silent error swallowing on security paths?
-   - A10 SSRF — fetches that accept user-supplied URLs without allowlisting?
+2. **OWASP Top 10:2025** — check each:
+   - A01 Broken Access Control — unauthenticated or unauthorised access to privileged paths?
+   - A02 Security Misconfiguration — debug mode on, default creds, open CORS, permissive defaults?
+   - A03 Software Supply Chain Failures — unpinned or unverified dependencies, untrusted build/CI inputs, known-CVE versions?
+   - A04 Cryptographic Failures — weak crypto, plaintext secrets, secrets in logs or config?
+   - A05 Injection — SQL/command/LDAP/template injection, esp. string concatenation into an interpreter?
+   - A06 Insecure Design — missing rate limiting, missing authn/authz boundary, unsafe-by-default design?
+   - A07 Authentication Failures — weak password handling, fixed sessions, missing MFA on sensitive paths?
+   - A08 Software or Data Integrity Failures — unverified updates, unsafe deserialization, unsigned artifacts?
+   - A09 Security Logging and Alerting Failures — silent error swallowing on security paths, no alerting on abuse?
+   - A10 Mishandling of Exceptional Conditions — errors swallowed or mis-branched, failing open instead of closed, partial state left behind on failure?
+
+   SSRF was a standalone category in 2021 and is folded into the above in 2025.
+   Still flag server-side fetches that accept a user-supplied URL without
+   allowlisting.
 3. **Boundary-only error handling** — defensive try/catch around scenarios that can't happen is over-engineering. Flag.
 4. **No over-engineering** — abstractions, helpers, or layers beyond what the plan needs. Flag.
 5. **Dependencies pinned** — `^` and `~` ranges are acceptable; floating ranges (e.g. `latest`, `*`) are not.

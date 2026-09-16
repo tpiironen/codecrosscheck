@@ -1,7 +1,11 @@
 import * as path from "node:path";
-import { z } from "zod";
-import type { ChatClient, ChatMessage } from "./clients/ChatClient.js";
-import { ApplyReviewSchema, type ApplyEdit, type Verdict } from "./schemas.js";
+import {
+  FixProposalSchema,
+  type ApplyEdit,
+  type FixProposal,
+  type Issue,
+  type Verdict,
+} from "./schemas.js";
 
 /**
  * Pure orchestration for the `/apply-review` slash command. All filesystem
@@ -17,9 +21,11 @@ export interface FsLike {
   exists(p: string): Promise<boolean>;
 }
 
-export interface FixProposal {
-  /** The worker's most recent fix-proposal Markdown artifact. */
-  proposal: string;
+export interface StoredFixProposal {
+  /** The structured proposal, or null for a transcript written before 0.6. */
+  proposal: FixProposal | null;
+  /** Markdown rendition — derived for new runs, the worker's own prose for legacy ones. */
+  artifact: string;
   /** The reviewer verdict that prompted that proposal, if available. */
   verdict: Verdict | null;
   /** Iteration number recorded in the transcript (best effort). */
@@ -28,12 +34,31 @@ export interface FixProposal {
 
 export interface ApplyOutcome {
   path: string;
-  status: "applied" | "skipped" | "dry-run";
+  /** `unsaved` is a success: the edit is in an editor buffer but not yet on disk. */
+  status: "written" | "unsaved" | "skipped" | "dry-run";
   reason?: string;
   why: string;
 }
 
-/** Returns the newest `*.jsonl` in `dir` containing a `review-branch-done` event, or null. */
+/** Whether an outcome changed the file, on disk or in a buffer. */
+export function isApplied(o: ApplyOutcome): boolean {
+  return o.status === "written" || o.status === "unsaved";
+}
+
+/** Marks a completed `/review-branch` or `/openspec-review` run. */
+const TERMINAL_EVENT = "review-branch-done";
+
+/** How many trailing records to inspect when looking for the terminal event. */
+const TAIL_RECORDS = 20;
+
+/**
+ * Returns the newest `*.jsonl` in `dir` whose run completed, or null.
+ *
+ * Matches a *parsed* terminal event near the tail rather than substring-testing
+ * the whole file: a stored worker artifact can quote the event name verbatim
+ * (a review of this codebase does), which a substring test reads as a
+ * completed run.
+ */
 export async function findLatestTranscript(dir: string, fs: FsLike): Promise<string | null> {
   if (!(await fs.exists(dir))) return null;
   const entries = await fs.readDir(dir);
@@ -53,23 +78,81 @@ export async function findLatestTranscript(dir: string, fs: FsLike): Promise<str
   for (const { name } of stamped) {
     const full = path.join(dir, name);
     const text = await fs.readFile(full);
-    if (text.includes("\"review-branch-done\"") || text.includes('"event":"review-branch-done"')) {
-      return full;
-    }
+    if (hasTerminalEvent(text)) return full;
   }
   return null;
+}
+
+function hasTerminalEvent(text: string): boolean {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  for (const line of lines.slice(-TAIL_RECORDS)) {
+    let obj: unknown;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (obj && typeof obj === "object" && (obj as { event?: unknown }).event === TERMINAL_EVENT) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Delete all but the newest `keep` transcripts (and their `-apply.json`
+ * siblings). Transcripts hold full source diffs, so an unbounded directory is
+ * both a disk and a disclosure problem.
+ */
+export async function pruneTranscripts(
+  dir: string,
+  keep: number,
+  fs: FsLike & { remove(p: string): Promise<void> },
+): Promise<string[]> {
+  if (keep < 0 || !(await fs.exists(dir))) return [];
+  const entries = await fs.readDir(dir);
+  const stamped: Array<{ name: string; mtimeMs: number }> = [];
+  for (const name of entries.filter((e) => e.endsWith(".jsonl"))) {
+    try {
+      const st = await fs.stat(path.join(dir, name));
+      stamped.push({ name, mtimeMs: st.mtimeMs });
+    } catch {
+      /* skip */
+    }
+  }
+  stamped.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const removed: string[] = [];
+  for (const { name } of stamped.slice(keep)) {
+    const full = path.join(dir, name);
+    for (const victim of [full, full.replace(/\.jsonl$/i, "-apply.json")]) {
+      try {
+        if (await fs.exists(victim)) {
+          await fs.remove(victim);
+          removed.push(victim);
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+  return removed;
 }
 
 /**
  * Parse a transcript JSONL and return the last `review-branch-iter` event with
  * `role: "worker"` (the final fix proposal). Also returns the most recent
  * preceding reviewer verdict, when present.
+ *
+ * Transcripts written before structured proposals carry only the Markdown
+ * artifact; those are returned with a null `proposal` so the caller can say so
+ * rather than silently applying nothing.
  */
-export async function extractFixProposal(transcriptPath: string, fs: FsLike): Promise<FixProposal | null> {
+export async function extractFixProposal(transcriptPath: string, fs: FsLike): Promise<StoredFixProposal | null> {
   const text = await fs.readFile(transcriptPath);
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
 
-  let lastWorker: { artifact: string; iteration: number } | null = null;
+  let lastWorker: { artifact: string; proposal: FixProposal | null; iteration: number } | null = null;
   let lastVerdict: Verdict | null = null;
 
   for (const line of lines) {
@@ -84,8 +167,10 @@ export async function extractFixProposal(transcriptPath: string, fs: FsLike): Pr
     if (ev.event !== "review-branch-iter") continue;
     const role = ev.role;
     if (role === "worker" && typeof ev.artifact === "string") {
+      const parsed = ev.proposal ? FixProposalSchema.safeParse(ev.proposal) : null;
       lastWorker = {
         artifact: ev.artifact,
+        proposal: parsed?.success ? parsed.data : null,
         iteration: typeof ev.iteration === "number" ? ev.iteration : 0,
       };
     } else if (role === "reviewer" && ev.verdict && typeof ev.verdict === "object") {
@@ -96,53 +181,11 @@ export async function extractFixProposal(transcriptPath: string, fs: FsLike): Pr
 
   if (!lastWorker) return null;
   return {
-    proposal: lastWorker.artifact,
+    proposal: lastWorker.proposal,
+    artifact: lastWorker.artifact,
     verdict: lastVerdict,
     iteration: lastWorker.iteration,
   };
-}
-
-/** A single worker rebuttal extracted from a fix proposal. */
-export interface Disagreement {
-  /** 1-based index matching the issue number in the proposal. */
-  id: number;
-  /** The "Issue N: ..." heading, used to tie back to the reviewer finding. */
-  heading: string;
-  /** The worker's rebuttal paragraph (everything after `**Fix:** Disagree:`). */
-  rebuttal: string;
-}
-
-/**
- * Parse `**Fix:** Disagree: ...` rebuttals out of a fixer proposal Markdown.
- * Returns one entry per Issue section whose Fix paragraph starts with "Disagree:".
- */
-export function parseDisagreements(proposal: string): Disagreement[] {
-  const out: Disagreement[] = [];
-  // Split on top-level "### Issue N: ..." headings.
-  const sectionRe = /^###\s+Issue\s+(\d+)[^\n]*$/gm;
-  const headings: { id: number; heading: string; start: number }[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = sectionRe.exec(proposal)) !== null) {
-    headings.push({
-      id: Number.parseInt(m[1], 10),
-      heading: m[0].replace(/^###\s+/, "").trim(),
-      start: m.index,
-    });
-  }
-  for (let i = 0; i < headings.length; i++) {
-    const start = headings[i].start;
-    const end = i + 1 < headings.length ? headings[i + 1].start : proposal.length;
-    const body = proposal.slice(start, end);
-    // Look for "**Fix:** Disagree:" (allow whitespace variations).
-    const fixMatch = body.match(/\*\*Fix:\*\*\s*Disagree\s*:\s*([\s\S]*?)(?=\n\n\*\*|\n###|\n```|$)/i);
-    if (!fixMatch) continue;
-    out.push({
-      id: headings[i].id,
-      heading: headings[i].heading,
-      rebuttal: fixMatch[1].trim(),
-    });
-  }
-  return out;
 }
 
 /**
@@ -157,24 +200,26 @@ export function issueFingerprint(it: { severity: string; where: string; why: str
 }
 
 /**
- * Drop verdict issues whose fingerprint matches one in `rejected`. If the
- * filter empties the issues array, the returned verdict is auto-approved
- * because there is nothing left to revise. Returns the (possibly new)
- * verdict and the count of dropped issues.
+ * Drop verdict issues whose fingerprint matches one in `rejected`.
+ *
+ * This never decides the verdict. When filtering empties the issue list it
+ * reports `emptiedBySuppression` and leaves the verdict untouched, because
+ * "the worker rebutted everything" is not the same outcome as "the reviewer
+ * approved" and must not be presented as one.
  */
 export function filterRejectedIssues<V extends { verdict: string; issues: Array<{ severity: string; where: string; why: string }> }>(
   verdict: V,
   rejected: ReadonlySet<string>,
-): { verdict: V; dropped: number } {
-  if (rejected.size === 0) return { verdict, dropped: 0 };
+): { verdict: V; dropped: number; emptiedBySuppression: boolean } {
+  if (rejected.size === 0) return { verdict, dropped: 0, emptiedBySuppression: false };
   const kept = verdict.issues.filter((it) => !rejected.has(issueFingerprint(it)));
   const dropped = verdict.issues.length - kept.length;
-  if (dropped === 0) return { verdict, dropped: 0 };
-  const next = { ...verdict, issues: kept } as V;
-  if (kept.length === 0 && next.verdict !== "approve") {
-    (next as { verdict: string }).verdict = "approve";
-  }
-  return { verdict: next, dropped };
+  if (dropped === 0) return { verdict, dropped: 0, emptiedBySuppression: false };
+  return {
+    verdict: { ...verdict, issues: kept },
+    dropped,
+    emptiedBySuppression: kept.length === 0,
+  };
 }
 
 /** Result of running a post-apply build/verify command. */
@@ -194,12 +239,13 @@ export interface BuildGateResult {
 /**
  * Spawn a shell command in `cwd`, capture combined stdout+stderr, return the
  * exit code and (truncated) output. Used by `/apply-review` after successful
- * edits to verify the working tree still compiles/tests. Pure I/O, no
- * vscode dep — testable with a real subprocess.
+ * edits to verify the working tree still compiles/tests.
  *
- * Injects `child_process.exec` via `runner` so tests can stub it. Keeps a
- * hard timeout (default 5 min) and an output cap (default 16 KB) so a
- * runaway build can't hang the chat session or flood the log.
+ * This is the one place the repo's "never `exec` a string" rule is relaxed:
+ * the value is a user-authored command line (`npm run build`, `dotnet build
+ * -nologo`) that only a shell can interpret. The setting is contributed with
+ * `scope: "machine"` so a workspace cannot supply it, and `/apply-review`
+ * additionally requires a trusted workspace before calling this.
  */
 export interface RunBuildGateOptions {
   cwd: string;
@@ -255,157 +301,6 @@ export async function runBuildGate(opts: RunBuildGateOptions): Promise<BuildGate
   });
 }
 
-/** A finding the worker effectively skipped without using the explicit `Disagree:` token. */
-export interface BlockedFinding {
-  /** 1-based index matching the issue number in the proposal. */
-  id: number;
-  /** The "Issue N: ..." heading. */
-  heading: string;
-  /** Short reason describing which dodge pattern matched. */
-  reason: string;
-}
-
-/**
- * Detect per-issue sections where the worker dodged producing a concrete
- * patch — e.g. responded with `**Data I need:**`, `(sketch — pending current
- * source)`, or `I cannot produce the unified-diff hunk` — but did not use
- * the explicit `**Fix:** Disagree:` token. These look like real fixes at a
- * glance but are not actionable, so we surface them alongside disagreements
- * for adjudication. Issues that already match `parseDisagreements` are
- * excluded so they aren't reported twice.
- */
-export function parseBlockedFindings(proposal: string): BlockedFinding[] {
-  const out: BlockedFinding[] = [];
-  const disagreedIds = new Set(parseDisagreements(proposal).map((d) => d.id));
-  const sectionRe = /^###\s+Issue\s+(\d+)[^\n]*$/gm;
-  const headings: { id: number; heading: string; start: number }[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = sectionRe.exec(proposal)) !== null) {
-    headings.push({
-      id: Number.parseInt(m[1], 10),
-      heading: m[0].replace(/^###\s+/, "").trim(),
-      start: m.index,
-    });
-  }
-  const dodgePatterns: { re: RegExp; reason: string }[] = [
-    { re: /\*\*Data I need(?: to produce the patch)?[:\*]/i, reason: "asks for more source files" },
-    { re: /\(sketch\s*[\u2014\-]\s*pending current source/i, reason: "code block marked sketch / pending current source" },
-    { re: /I cannot produce (?:the |a )?(?:unified-diff hunk|patch|fix)/i, reason: "explicitly refuses to produce a patch" },
-    { re: /pending (?:the )?(?:current )?source(?:\s+(?:of|for))?/i, reason: "deferred pending source" },
-  ];
-  for (let i = 0; i < headings.length; i++) {
-    if (disagreedIds.has(headings[i].id)) continue;
-    const start = headings[i].start;
-    const end = i + 1 < headings.length ? headings[i + 1].start : proposal.length;
-    const body = proposal.slice(start, end);
-    for (const { re, reason } of dodgePatterns) {
-      if (re.test(body)) {
-        out.push({ id: headings[i].id, heading: headings[i].heading, reason });
-        break;
-      }
-    }
-  }
-  return out;
-}
-
-/** Extract unique workspace-relative paths from `// path: <file>` directives in the proposal. */
-export function parseReferencedFiles(proposal: string): string[] {
-  const re = /^\s*\/\/\s*path:\s*([^\s].*?)\s*$/gm;
-  const found = new Set<string>();
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(proposal)) !== null) {
-    const cleaned = normalizeReferencedPath(m[1]);
-    if (cleaned.length > 0) found.add(cleaned);
-  }
-  return Array.from(found);
-}
-
-/**
- * Extract any plausible workspace-relative file paths from arbitrary text —
- * used to harvest paths from reviewer findings (`where` fields) and from the
- * worker's prose ("Data I need: full current contents of …").
- *
- * Heuristic: token contains a `/`, ends in a recognised source extension,
- * does not start with `http://` or absolute drive prefix.
- */
-export function harvestPathsFromText(text: string): string[] {
-  const found = new Set<string>();
-  // Match runs of non-whitespace, non-quote characters that look like a path.
-  const re = /([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)+\.(?:cs|ts|tsx|js|jsx|mjs|cjs|json|md|py|go|rs|java|kt|rb|sql|yml|yaml|bicep|csproj|sln|xml|cshtml|razor|css|scss))(?::\d+(?:-\d+)?)?/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    // Reject when preceded by URL scheme `://`, drive prefix `:/` or `:\`,
-    // or the substring forms part of a URL host (`<ident>://`).
-    const start = m.index;
-    const before2 = start >= 2 ? text.slice(start - 2, start) : "";
-    const before3 = start >= 3 ? text.slice(start - 3, start) : "";
-    if (before2 === "//" || before2 === ":/" || before2 === ":\\") continue;
-    if (before3.endsWith("://")) continue;
-    // Reject "host.tld/path.ext" patterns by skipping if first segment looks
-    // like a hostname (contains a dot, the matched path itself starts with the
-    // hostname). Heuristic: if the first segment before the first slash has a
-    // dot AND is followed by no further dot-extension before the slash, treat
-    // as host. Simpler: reject if the captured path's first segment ends with
-    // a known TLD-ish pattern AND is followed by `/`.
-    let p = m[1].replace(/\\/g, "/");
-    const firstSlash = p.indexOf("/");
-    if (firstSlash > 0) {
-      const head = p.slice(0, firstSlash);
-      if (/^[A-Za-z0-9-]+\.(com|org|net|io|dev|ai|co|gov|edu|uk|de|fr)$/i.test(head)) {
-        continue;
-      }
-    }
-    if (/^[A-Za-z]+:\/\//.test(p)) continue;
-    if (/^[A-Za-z]:\//.test(p)) continue;
-    p = normalizeReferencedPath(p);
-    if (p.length > 0) found.add(p);
-  }
-  return Array.from(found);
-}
-
-/**
- * Strip annotations the worker commonly tacks onto path directives:
- *  - trailing parenthetical comments: `foo.cs (excerpt)`, `foo.cs (new file)`
- *  - line-number suffixes: `foo.cs:21`, `foo.cs:21-30`
- *  - surrounding backticks
- */
-export function normalizeReferencedPath(raw: string): string {
-  let p = raw.trim();
-  // Strip wrapping backticks.
-  p = p.replace(/^`+|`+$/g, "").trim();
-  // Strip a single trailing parenthetical annotation ("(excerpt)", "(new file)", ...).
-  p = p.replace(/\s*\([^)]*\)\s*$/, "").trim();
-  // Strip a trailing :line or :line-line suffix.
-  p = p.replace(/:\d+(?:-\d+)?$/, "").trim();
-  return p;
-}
-
-/**
- * If `candidate` doesn't exist directly under `workspaceRoot`, progressively
- * drop leading path segments and return the first variant that exists. This
- * recovers from worker-supplied repo-relative paths when the workspace is
- * actually a subdirectory of the repo (very common in monorepos).
- */
-export async function resolveReferencedPath(
-  workspaceRoot: string,
-  candidate: string,
-  fs: FsLike,
-): Promise<string> {
-  const safe = resolveSafePath(workspaceRoot, candidate);
-  if (safe.ok && (await fs.exists(safe.abs))) return candidate;
-
-  // Try dropping leading segments one at a time.
-  const parts = candidate.split(/[\\/]/).filter((s) => s.length > 0);
-  for (let i = 1; i < parts.length; i++) {
-    const trimmed = parts.slice(i).join("/");
-    const trySafe = resolveSafePath(workspaceRoot, trimmed);
-    if (trySafe.ok && (await fs.exists(trySafe.abs))) {
-      return trimmed;
-    }
-  }
-  return candidate;
-}
-
 /**
  * Validate a proposed edit's path: must resolve under `workspaceRoot` after
  * normalisation, must not be absolute, must not escape via `..`. Returns the
@@ -424,64 +319,89 @@ export function resolveSafePath(workspaceRoot: string, candidate: string): { ok:
   return { ok: true, abs };
 }
 
-/** Read each referenced file (annotating missing ones as "to be created") and return a Markdown inventory. */
-export async function buildFileInventory(
-  workspaceRoot: string,
-  paths: string[],
-  fs: FsLike,
-): Promise<{ inventory: string; missing: string[]; resolved: Map<string, string> }> {
-  const parts: string[] = [];
-  const missing: string[] = [];
-  const resolved = new Map<string, string>();
-  for (const rel of paths) {
-    // Try to resolve repo-prefixed paths to actual workspace-relative paths.
-    const effective = await resolveReferencedPath(workspaceRoot, rel, fs);
-    resolved.set(rel, effective);
-    const safe = resolveSafePath(workspaceRoot, effective);
-    if (!safe.ok) {
-      missing.push(`${rel} (${safe.reason})`);
+/**
+ * Keep the head and tail of `text` within `budget`, marking the elision. A
+ * caller may cite a symbol anywhere in the file, so a head-only cut would
+ * systematically hide the end.
+ */
+export function truncateMiddle(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  const marker = `\n\n… ${(text.length - budget).toLocaleString("en-US")} characters elided …\n\n`;
+  const keep = Math.max(0, budget - marker.length);
+  const head = Math.ceil(keep * 0.6);
+  const tail = keep - head;
+  return text.slice(0, head) + marker + (tail > 0 ? text.slice(text.length - tail) : "");
+}
+
+/**
+ * Every applicable edit in a fix proposal, in the order the worker listed
+ * them. Only `fixed` entries contribute: the schema already refuses edits on
+ * any other status, and this second gate means a transcript written before
+ * that rule — or a hand-edited one — still cannot apply an edit the UI
+ * presents as rebutted or unaddressed.
+ */
+export function editsFrom(proposal: FixProposal): ApplyEdit[] {
+  return proposal.fixes.filter((f) => f.status === "fixed").flatMap((f) => f.edits);
+}
+
+/**
+ * Check that a proposal answers exactly the findings it was given: one entry
+ * per finding, each `findingId` in `1..findingCount`, each used once. The
+ * schema cannot express this — it does not know how many findings there were —
+ * so a model can otherwise drop a finding silently or answer one twice, and
+ * the rendered Markdown would look complete.
+ *
+ * Returns null when the proposal is well-formed, or a one-line problem
+ * description suitable for a reprompt.
+ */
+export function validateFixCoverage(proposal: FixProposal, findingCount: number): string | null {
+  const problems: string[] = [];
+  const seen = new Set<number>();
+  for (const fix of proposal.fixes) {
+    if (fix.findingId < 1 || fix.findingId > findingCount) {
+      problems.push(`findingId ${fix.findingId} is outside 1..${findingCount}`);
       continue;
     }
-    if (!(await fs.exists(safe.abs))) {
-      // File doesn't exist yet — surface to the worker so it can emit a
-      // creation edit (oldString="") if the proposal calls for it.
-      parts.push(`## File: ${effective} (does not exist yet — emit a creation edit with oldString="" to create it, or skip if the proposal doesn't call for a new file)`);
+    if (seen.has(fix.findingId)) {
+      problems.push(`findingId ${fix.findingId} appears more than once`);
       continue;
     }
-    const content = await fs.readFile(safe.abs);
-    const header = effective === rel
-      ? `## File: ${effective}`
-      : `## File: ${effective} (proposal referenced as \`${rel}\` — use the resolved path \`${effective}\` in your edits)`;
-    parts.push(`${header}\n\n\`\`\`\n${content}\n\`\`\``);
+    seen.add(fix.findingId);
   }
-  return { inventory: parts.join("\n\n"), missing, resolved };
+  const missing: number[] = [];
+  for (let id = 1; id <= findingCount; id++) {
+    if (!seen.has(id)) missing.push(id);
+  }
+  if (missing.length > 0) problems.push(`no entry for finding(s) ${missing.join(", ")}`);
+  if (problems.length === 0) return null;
+  return `Expected exactly ${findingCount} fix entries, one per finding, with findingId 1..${findingCount} used once each: ${problems.join("; ")}.`;
 }
 
-/** Compose the worker user message from the fix proposal and file inventory. */
-export function composeApplyInput(proposal: string, inventory: string): string {
-  return [
-    "# Fix proposal",
-    "",
-    proposal,
-    "",
-    "# Current file contents",
-    "",
-    inventory.length > 0 ? inventory : "_(no files supplied — return empty edits)_",
-  ].join("\n");
-}
-
-/** Call the worker model and return validated edits. */
-export async function deriveEdits(
-  client: ChatClient,
-  systemPrompt: string,
-  userInput: string,
-): Promise<ApplyEdit[]> {
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userInput },
-  ];
-  const result = await client.sendStructured(messages, ApplyReviewSchema, "ApplyReview");
-  return result.edits;
+/**
+ * Render a structured fix proposal as Markdown, for display and for the
+ * reviewer's re-review pass. The model no longer writes this prose — it is
+ * derived from the structured response, so the two cannot disagree.
+ */
+export function renderFixProposal(proposal: FixProposal, issues: Issue[] = []): string {
+  const label = { fixed: "Fixed", disagree: "Disagree", unaddressed: "Unaddressed" } as const;
+  const parts: string[] = ["## Summary", "", proposal.summary];
+  for (const fix of proposal.fixes) {
+    const issue = issues[fix.findingId - 1];
+    const heading = issue ? `${fix.findingId}: ${issue.where}` : `${fix.findingId}`;
+    parts.push("", `### Finding ${heading} — ${label[fix.status]}`, "", fix.explanation);
+    for (const edit of fix.edits) {
+      parts.push(
+        "",
+        `**Edit** \`${edit.path}\` — ${edit.why}`,
+        "",
+        "```diff",
+        ...edit.oldString.split("\n").map((l) => `-${l}`),
+        ...edit.newString.split("\n").map((l) => `+${l}`),
+        "```",
+      );
+    }
+  }
+  return parts.join("\n");
 }
 
 /** Apply a single edit. Returns outcome; never throws on validation failures. */
@@ -506,7 +426,7 @@ export async function applyEdit(
       return { path: edit.path, status: "dry-run", why: edit.why };
     }
     await fs.writeFile(safe.abs, edit.newString);
-    return { path: edit.path, status: "applied", why: edit.why };
+    return { path: edit.path, status: "written", why: edit.why };
   }
 
   if (!exists) {
@@ -514,118 +434,67 @@ export async function applyEdit(
   }
   const original = await fs.readFile(safe.abs);
 
-  // Try the model's oldString as-is, then a sequence of safety-net repairs:
-  // 1. Strip diff markers (the worker pasted unified-diff lines).
-  // 2. Normalise CRLF / leading-tab vs leading-spaces drift.
-  const candidates = buildOldStringCandidates(edit.oldString);
-  let matchedOld: string | null = null;
-  for (const cand of candidates) {
-    const c = countOccurrences(original, cand);
-    if (c === 1) {
-      matchedOld = cand;
-      break;
-    }
+  const match = matchEdit(original, edit.oldString, edit.newString);
+  if (!match.ok) {
+    return { path: edit.path, status: "skipped", reason: match.reason, why: edit.why };
   }
-  if (matchedOld === null) {
-    // Diagnose with the original oldString so the message is meaningful.
-    const c = countOccurrences(original, edit.oldString);
-    if (c === 0) {
-      return { path: edit.path, status: "skipped", reason: "oldString not found", why: edit.why };
-    }
-    return { path: edit.path, status: "skipped", reason: `oldString matches ${c} times`, why: edit.why };
-  }
-
-  // Pair newString with the same repair that worked for oldString.
-  const repairedNew = repairNewStringFor(matchedOld, edit.oldString, edit.newString);
 
   if (options.dryRun) {
     return { path: edit.path, status: "dry-run", why: edit.why };
   }
-  const updated = original.replace(matchedOld, repairedNew);
+  // Splice by index rather than String.replace: GetSubstitution expands `$$`,
+  // `$&`, "$`" and `$'` in the replacement even for a string search value.
+  const updated =
+    original.slice(0, match.at) + match.replacement + original.slice(match.at + match.matched.length);
   await fs.writeFile(safe.abs, updated);
-  return { path: edit.path, status: "applied", why: edit.why };
+  return { path: edit.path, status: "written", why: edit.why };
+}
+
+/** `oldString` as written, and its pure-LF and pure-CRLF forms. Most literal first. */
+export function lineEndingVariants(raw: string): string[] {
+  const lf = raw.replace(/\r\n/g, "\n");
+  return Array.from(new Set([raw, lf, lf.replace(/\n/g, "\r\n")]));
 }
 
 /**
- * Build candidate forms of `oldString` to try against the file. Order matters
- * — first match wins, so list more conservative repairs first.
- */
-export function buildOldStringCandidates(raw: string): string[] {
-  const out: string[] = [];
-  const add = (s: string): void => {
-    if (s.length > 0 && !out.includes(s)) out.push(s);
-  };
-  add(raw);
-  // CRLF/CR -> LF normalisation (file has LF, worker emitted CRLF).
-  const lf = raw.replace(/\r\n?/g, "\n");
-  add(lf);
-  // LF -> CRLF (file has CRLF, worker emitted LF — common on Windows repos).
-  add(lf.replace(/\n/g, "\r\n"));
-  // Diff-style: keep ' ' + '-' lines, strip the one-char marker (LF form).
-  const stripped = stripDiffMarkers(lf, "old");
-  if (stripped !== lf) {
-    add(stripped);
-    add(stripped.replace(/\n/g, "\r\n"));
-  }
-  return out;
-}
-
-/**
- * Pair `newString` with the same repair that produced `matchedOld`. If the
- * old candidate that matched was the diff-stripped variant, strip diff markers
- * from `newString` too. If it was the CRLF variant, emit CRLF in newString too.
- */
-export function repairNewStringFor(matchedOld: string, originalOld: string, originalNew: string): string {
-  const lfNew = originalNew.replace(/\r\n?/g, "\n");
-  const lfOld = originalOld.replace(/\r\n?/g, "\n");
-
-  const wasStripped = matchedOld === stripDiffMarkers(lfOld, "old") && matchedOld !== lfOld;
-  const usesCrlf = matchedOld.includes("\r\n");
-
-  let result = wasStripped ? stripDiffMarkers(lfNew, "new") : lfNew;
-  if (usesCrlf) {
-    result = result.replace(/\n/g, "\r\n");
-  }
-  return result;
-}
-
-/**
- * Strip unified-diff line markers from a multi-line string.
+ * Locate `oldString` in `original`, tolerating line-ending drift and nothing
+ * else, and pair `newString` to whichever form matched.
  *
- * `mode === "old"`: keep lines starting with ` ` (context) or `-` (removed); drop `+` lines.
- *                    Strip the leading marker character.
- * `mode === "new"`: keep lines starting with ` ` (context) or `+` (added); drop `-` lines.
- *                    Strip the leading marker character.
+ * Line endings are the one difference the model cannot be held to. It reads the
+ * file through the toolset — `read_file` preserves CRLF exactly — but emits LF
+ * in its JSON regardless: on the 2026-09-16 dogfood run, 11 of 12 edits against
+ * a CRLF worktree were skipped as "oldString not found", every `oldString`
+ * carrying LF where the file had CRLF. Structured output did not fix that, so
+ * the earlier reasoning for requiring a byte-exact match was wrong.
  *
- * Returns the input unchanged if it doesn't look like diff (no line starts with `-` or `+`,
- * or any non-empty line starts with a character outside `[ +\-]`).
+ * Any *other* mismatch is still a hard failure. A near-miss means the edit is
+ * wrong, and repairing it would hide that.
  */
-export function stripDiffMarkers(text: string, mode: "old" | "new"): string {
-  const lines = text.split("\n");
-  let hasMarker = false;
-  for (const line of lines) {
-    if (line.length === 0) continue;
-    const ch = line[0];
-    if (ch !== " " && ch !== "+" && ch !== "-") {
-      // Not diff-shaped — bail out.
-      return text;
-    }
-    if (ch === "-" || ch === "+") hasMarker = true;
-  }
-  if (!hasMarker) return text;
-
-  const keep = mode === "old" ? new Set([" ", "-"]) : new Set([" ", "+"]);
-  const out: string[] = [];
-  for (const line of lines) {
-    if (line.length === 0) {
-      out.push("");
+export function matchEdit(
+  original: string,
+  oldString: string,
+  newString: string,
+): { ok: true; at: number; matched: string; replacement: string } | { ok: false; reason: string } {
+  let ambiguous = 0;
+  for (const candidate of lineEndingVariants(oldString)) {
+    const count = countOccurrences(original, candidate);
+    if (count > 1) {
+      ambiguous = Math.max(ambiguous, count);
       continue;
     }
-    const ch = line[0];
-    if (!keep.has(ch)) continue;
-    out.push(line.slice(1));
+    if (count === 0) continue;
+    const lfNew = newString.replace(/\r\n/g, "\n");
+    return {
+      ok: true,
+      at: original.indexOf(candidate),
+      matched: candidate,
+      replacement: candidate.includes("\r\n") ? lfNew.replace(/\n/g, "\r\n") : lfNew,
+    };
   }
-  return out.join("\n");
+  return {
+    ok: false,
+    reason: ambiguous > 0 ? `oldString matches ${ambiguous} times` : "oldString not found",
+  };
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -639,24 +508,61 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-/** Apply many edits in order. */
+/** Destination for a committed batch of whole-file writes. */
+export interface EditHost {
+  commit(writes: Array<{ path: string; content: string }>): Promise<void>;
+}
+
+/**
+ * Buffers writes over a base filesystem so a batch can be inspected and
+ * committed as a unit, and so a later edit in the batch sees earlier ones.
+ */
+function overlayFs(base: FsLike): FsLike & { pending(): Array<{ path: string; content: string }> } {
+  const buffered = new Map<string, string>();
+  return {
+    readDir: (dir) => base.readDir(dir),
+    stat: (p) => base.stat(p),
+    async readFile(p) {
+      const held = buffered.get(p);
+      return held !== undefined ? held : base.readFile(p);
+    },
+    async writeFile(p, content) {
+      buffered.set(p, content);
+    },
+    async exists(p) {
+      return buffered.has(p) ? true : base.exists(p);
+    },
+    pending: () => Array.from(buffered, ([path, content]) => ({ path, content })),
+  };
+}
+
+/**
+ * Apply many edits in order, committing them only once every edit has been
+ * computed, so a failure partway leaves the tree untouched.
+ */
 export async function applyEdits(
   workspaceRoot: string,
   edits: ApplyEdit[],
   fs: FsLike,
-  options: { dryRun: boolean },
+  options: { dryRun: boolean; host?: EditHost },
 ): Promise<ApplyOutcome[]> {
+  const overlay = overlayFs(fs);
   const results: ApplyOutcome[] = [];
   for (const e of edits) {
-    results.push(await applyEdit(workspaceRoot, e, fs, options));
+    results.push(await applyEdit(workspaceRoot, e, overlay, options));
   }
+  if (options.dryRun) return results;
+
+  const writes = overlay.pending();
+  if (writes.length === 0) return results;
+  if (options.host) {
+    await options.host.commit(writes);
+    // The host mutates open documents; nothing is on disk until the user saves.
+    return results.map((o) => (o.status === "written" ? { ...o, status: "unsaved" as const } : o));
+  }
+  for (const w of writes) await fs.writeFile(w.path, w.content);
   return results;
 }
 
 // Exposed for tests.
 export const __test = { countOccurrences };
-
-// Re-export schema for convenience.
-export { ApplyReviewSchema };
-// Suppress unused-import warning when only types are re-exported in some callers.
-void z;

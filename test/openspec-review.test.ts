@@ -139,7 +139,7 @@ describe("openspec-review transcript contract", () => {
     const fs = makeFakeFs({ files: { [p]: transcript } });
     const result = await extractFixProposal(p, fs);
     expect(result).not.toBeNull();
-    expect(result?.proposal).toBe(codeArtifact);
+    expect(result?.artifact).toBe(codeArtifact);
     expect(result?.verdict?.verdict).toBe("approve");
   });
 
@@ -153,7 +153,7 @@ describe("openspec-review transcript contract", () => {
     const p = path.resolve("/t.jsonl");
     const fs = makeFakeFs({ files: { [p]: transcript } });
     const result = await extractFixProposal(p, fs);
-    expect(result?.proposal).toBe(codeArtifact);
-    expect(result?.proposal).not.toContain("plan text");
+    expect(result?.artifact).toBe(codeArtifact);
+    expect(result?.artifact).not.toContain("plan text");
   });
 });

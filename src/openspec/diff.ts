@@ -6,20 +6,50 @@ export interface DiffOptions {
   baseRef?: string;
   /** Only include hunks whose file path starts with one of these prefixes (the change's stated impact). */
   scopePaths?: string[];
+  /**
+   * Compare commits only, excluding the working tree. Default `false`: a
+   * review should cover what the author is looking at, not the previous commit.
+   */
+  committedOnly?: boolean;
 }
 
-export async function getChangeDiff(opts: DiffOptions = {}): Promise<string> {
+export interface ChangeDiff {
+  patch: string;
+  /** Human-readable account of what was compared, for the review header. */
+  description: string;
+}
+
+/**
+ * Diff the branch against its base.
+ *
+ * By default the comparison runs base..working tree, so staged and unstaged
+ * edits to tracked files are included. Untracked files are excluded: git does
+ * not track them, and sweeping them in risks pulling build output and secrets
+ * into a model prompt.
+ */
+export async function getChangeDiff(opts: DiffOptions = {}): Promise<ChangeDiff> {
   const cwd = opts.cwd ?? process.cwd();
   const base = opts.baseRef ?? (await resolveMergeBase(cwd));
-  // Three-dot (A...B) computes the merge-base automatically — great for
-  // branches that share history. Two-dot (A..B) works for orphan refs that
-  // have no common ancestor. Use two-dot when the caller supplied an
-  // explicit baseRef (they know what they want).
-  const range = opts.baseRef ? `${base}..HEAD` : `${base}...HEAD`;
 
-  const raw = await runGit(["diff", range], cwd);
-  if (!opts.scopePaths || opts.scopePaths.length === 0) return raw;
-  return filterPatchToScope(raw, opts.scopePaths);
+  // `base` is already a resolved commit, so a two-dot range is exact and also
+  // works for orphan refs that share no history.
+  const args = opts.committedOnly ? ["diff", `${base}..HEAD`] : ["diff", base];
+  const raw = await runGit(args, cwd);
+
+  const baseLabel = opts.baseRef ?? `merge-base ${short(base)}`;
+  const description = opts.committedOnly
+    ? `committed changes vs ${baseLabel}`
+    : `working tree vs ${baseLabel}, including staged and unstaged edits to tracked files`;
+
+  const patch =
+    !opts.scopePaths || opts.scopePaths.length === 0
+      ? raw
+      : filterPatchToScope(raw, opts.scopePaths);
+  return { patch, description };
+}
+
+function short(ref: string): string {
+  return /^[0-9a-f]{40}$/i.test(ref) ? ref.slice(0, 8) : ref;
 }
 
 async function resolveMergeBase(cwd: string): Promise<string> {
@@ -67,6 +97,35 @@ export function filterPatchToScope(patch: string, scopePaths: string[]): string 
     }
   }
   return kept.join("");
+}
+
+/** Count the per-file blocks in a unified-diff patch. */
+export function countPatchFiles(patch: string): number {
+  return patch.split(/^(?=diff --git )/m).filter((b) => b.trim()).length;
+}
+
+export interface ScopedPatch {
+  patch: string;
+  included: number;
+  omitted: number;
+  /** False when `paths` matched nothing and the full patch was kept instead. */
+  scoped: boolean;
+}
+
+/**
+ * Narrow a patch to `paths` for a re-review prompt. Falls back to the whole
+ * patch when nothing matches — an empty diff would tell the reviewer the
+ * branch changed nothing, which is worse than sending too much.
+ */
+export function scopePatchToPaths(patch: string, paths: string[]): ScopedPatch {
+  const total = countPatchFiles(patch);
+  if (paths.length === 0) return { patch, included: total, omitted: 0, scoped: false };
+
+  const filtered = filterPatchToScope(patch, paths);
+  if (!filtered.trim()) return { patch, included: total, omitted: 0, scoped: false };
+
+  const included = countPatchFiles(filtered);
+  return { patch: filtered, included, omitted: Math.max(0, total - included), scoped: true };
 }
 
 /** Estimate tokens as ceil(chars / 4); split a patch into per-file chunks under `budgetTokens`. */

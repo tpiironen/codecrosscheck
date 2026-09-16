@@ -13,7 +13,362 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
-_No unreleased changes — promote the next batch of work here as it lands._
+## [0.5.0] — 2026-09-16
+
+OpenSpec changes (all archived under `openspec/changes/archive/2026-09-16-*`):
+[`fix-edit-application-and-verdict-honesty`](openspec/changes/archive/2026-09-16-fix-edit-application-and-verdict-honesty/proposal.md),
+[`harden-trust-and-sandbox`](openspec/changes/archive/2026-09-16-harden-trust-and-sandbox/proposal.md),
+[`add-cancellation-and-worktree-diff`](openspec/changes/archive/2026-09-16-add-cancellation-and-worktree-diff/proposal.md),
+[`modernize-chat-surface`](openspec/changes/archive/2026-09-16-modernize-chat-surface/proposal.md),
+[`modernize-toolchain`](openspec/changes/archive/2026-09-16-modernize-toolchain/proposal.md),
+[`update-default-model-pair`](openspec/changes/archive/2026-09-16-update-default-model-pair/proposal.md),
+[`raise-review-branch-diff-budget`](openspec/changes/archive/2026-09-16-raise-review-branch-diff-budget/proposal.md),
+[`trim-rereview-diff-context`](openspec/changes/archive/2026-09-16-trim-rereview-diff-context/proposal.md),
+[`flush-transcript-before-return`](openspec/changes/archive/2026-09-16-flush-transcript-before-return/proposal.md),
+[`pin-vscode-api-floor`](openspec/changes/archive/2026-09-16-pin-vscode-api-floor/proposal.md),
+[`add-finding-triage`](openspec/changes/archive/2026-09-16-add-finding-triage/proposal.md),
+[`replace-github-models-with-openai-compatible`](openspec/changes/archive/2026-09-16-replace-github-models-with-openai-compatible/proposal.md),
+[`fix-referenced-path-normalisation`](openspec/changes/archive/2026-09-16-fix-referenced-path-normalisation/proposal.md),
+[`budget-file-context-per-file`](openspec/changes/archive/2026-09-16-budget-file-context-per-file/proposal.md),
+[`replace-context-harvest-with-tools`](openspec/changes/archive/2026-09-16-replace-context-harvest-with-tools/proposal.md),
+[`report-applied-edits-as-unsaved`](openspec/changes/archive/2026-09-16-report-applied-edits-as-unsaved/proposal.md).
+
+**Known gap:** the planted-flaw corpus comparison for
+`replace-context-harvest-with-tools` (task E2) has not been run. It needs
+`RUN_LIVE_TESTS=1` and a configured model endpoint. Nothing in this release
+should be read as evidence about the corpus pass rate.
+
+### Added
+
+- **Agents can now ask for files instead of being handed a guess.** `ChatClient`
+  supports a tool-call round trip, implemented identically by the in-editor
+  (`vscode.lm`) and OpenAI-compatible (CLI) transports, and the triager and
+  fixer are given a read-only workspace toolset: `read_file`,
+  `search_workspace`, `list_directory`. Every path is confined to the workspace
+  root by `resolveSafePath`, screened by a denylist (VCS metadata, build
+  output, dependency trees, `.env` / `*.pem` / `id_rsa` and similar), and then
+  by `git check-ignore` when the workspace is a repository. The toolset exposes
+  no operation that writes, creates or deletes. Each loop is bounded by
+  `codecrosscheck.tools.maxCalls` (default 24) and
+  `codecrosscheck.tools.deadlineMs` (default 180 000); on exhaustion the client
+  withdraws the tools, tells the model, and takes one final answer. Every call
+  is streamed to the user and recorded in the transcript as a `tool-call`
+  event.
+
+  This closes the defect that motivated the change. On the 2026-09-16 dogfood
+  run the triager needed `src/applyReview.ts` to judge a finding that cited
+  only `src/extension.ts`, could not ask for it, and returned `uncertain`;
+  nothing was fixed. Both pre-computed alternatives were measured and rejected:
+  symbol-directed harvesting would have found nothing (every identifier the
+  finding named is defined in `extension.ts` itself), and one-hop import
+  closure would have pulled 121 671 chars against a 60 000 budget, halving both
+  files that mattered to make room for eight nobody asked about. The need was
+  discovered *during reasoning* — only letting the model ask can supply it.
+
+### Changed
+
+- **The fixer returns structured edits; `/apply-review` no longer calls a
+  model.** `/review-branch` now produces a schema-validated `FixProposal`: one
+  entry per finding with a `status` (`fixed` / `disagree` / `unaddressed`), an
+  explanation, and exact `oldString` / `newString` edits. The Markdown shown in
+  chat and sent to the reviewer for re-review is derived from that structure,
+  so the prose and the edits cannot disagree. `/apply-review` reads those edits
+  from the transcript and applies them — it is now purely the user-confirmation
+  checkpoint, with dry-run, path validation and the build gate intact.
+- **Edits repair line endings and nothing else.** The unified-diff-marker
+  stripping and the general repair-candidate sequence are gone: with the
+  Markdown round trip removed, a near-miss there means the edit is wrong and
+  repairing it would hide that. Line-ending pairing stays, because dogfooding
+  showed the model reads a CRLF file through `read_file` and emits LF in its
+  JSON anyway — 11 of 12 edits were skipped before this was fixed. Any other
+  mismatch is skipped with a reason and the file left untouched.
+- **Worker push-back and dodges are structural, not textual.** A rebuttal is
+  `status: "disagree"` rather than the string `**Fix:** Disagree:`, and a
+  finding the worker could not patch is `status: "unaddressed"` rather than a
+  regex match on `**Data I need` or `pending current source` — phrases that
+  occur in ordinary prose.
+- `scripts/copy-assets.mjs` clears the destination before copying. `cpSync`
+  merges, so a deleted prompt survived in `dist/` and shipped in the VSIX.
+- **`/apply-review` no longer calls an unsaved buffer "applied".** Edits are
+  committed through `vscode.workspace.applyEdit` so one undo reverts the batch,
+  which means nothing reaches disk until the files are saved — but the report
+  said `✅ applied` and the debug log agreed. During this release's own
+  dogfooding that read as a broken apply path twice in one hour, `git status`
+  showing a clean tree after a run that claimed 12 edits. Outcomes now
+  distinguish `written` from `unsaved`, the summary says plainly that nothing
+  is on disk yet, and it offers a Save button.
+
+### Removed
+
+- `harvestPathsFromText`, `resolveReferencedPath`, `normalizeReferencedPath`,
+  `buildFileInventory`, `allocateBudget`, `parseReferencedFiles`,
+  `composeApplyInput`, `deriveEdits`, `parseDisagreements`,
+  `parseBlockedFindings`, `buildOldStringCandidates`, `repairNewStringFor`,
+  `stripDiffMarkers`, `buildWorkerWithPrompt`, `ApplyReviewSchema`, and
+  `src/prompts/apply_review_worker.md`. Every one of them compensated for the
+  model not being able to fetch a file or carry an exact string.
+- The `# Repository file context` block and its 60 000-character cap.
+
+### Fixed
+
+- **A single large file could starve every other file out of the review
+  context.** The `# Repository file context` block is capped at 60 000
+  characters, and the cap was applied as one prefix slice over the
+  concatenated files. Measured on a live run: `src/extension.ts` is 63 430
+  chars, so it exceeded the whole budget alone and was cut mid-function, and
+  `src/applyReview.ts` (29 414 chars) — cited by the second finding — never
+  entered the block at all. The triager returned `uncertain` for both findings
+  and said exactly why: the file was "truncated mid-function" and the body of
+  the cited function "was not provided". Outcome `defended`, nothing fixed, one
+  model call spent reaching a non-answer.
+
+  The budget is now allocated per cited file, smallest first, so a file shorter
+  than its equal share is included whole and leaves the remainder to the
+  others. No cited file is dropped. A file that still does not fit is truncated
+  individually, labelled `PARTIAL` in its own header, and retains its head *and*
+  tail with the elision marked — a finding may cite a symbol anywhere in the
+  file, and the old head-only cut systematically hid the end.
+
+### Fixed
+
+- **`/apply-review` silently produced zero edits when a path directive named a
+  symbol.** Workers commonly write `// path: src/extension.ts:someFunction`,
+  and reviewers cite locations with call syntax such as
+  `src/extension.ts:workspaceEditHost().commit`.
+  `normalizeReferencedPath` stripped backticks, parentheticals and `:line`
+  suffixes but not `:symbol`, so the malformed path reached
+  `buildFileInventory` — which found it did not exist and offered it to the
+  worker as *a file to create*. Six such references became six invitations to
+  create phantom files, `missing` stayed empty, the existing "unreadable
+  path(s)" warning never fired, and the worker was never shown a line of real
+  source. It correctly returned no edits.
+
+  Symbol suffixes are now stripped, including symbols written with call syntax,
+  a reference that cannot denote a workspace
+  file is reported as unresolvable rather than offered for creation, and the
+  handler says so when the inventory yields no source at all. Observed live:
+  the same transcript that produced 0 edits now produces 6.
+
+### Removed
+
+- **`GithubModelsClient` and the GitHub Models backend.** GitHub Models was
+  fully retired on 2026-07-30; the endpoint returns HTTP 410. Every CLI
+  invocation had been broken since, and the README still instructed new users
+  to set `GITHUB_TOKEN` with a `models:read` scope for it.
+
+- **The `gh auth token` credential fallback.** It resolved a GitHub credential
+  for what is now an arbitrary configured base URL — a credential-leak shape.
+
+### Added
+
+- **`OpenAiCompatibleClient`: bring your own endpoint.** The CLI now talks to
+  any OpenAI-compatible `/chat/completions` API — OpenAI, Azure AI Foundry,
+  vLLM, Ollama, LM Studio. Configure with `CODECROSSCHECK_BASE_URL` or
+  `--base-url`. There is deliberately **no default provider**: hard-coding one
+  is exactly how the CLI came to depend on a service that was switched off.
+  The API key is optional (`CODECROSSCHECK_API_KEY` or `OPENAI_API_KEY`); when
+  unset the `Authorization` header is omitted entirely, so keyless local
+  servers work unmodified.
+
+  The VS Code extension is unaffected — it runs on `vscode.lm`, which GitHub's
+  retirement notice describes as a separate, unrelated service.
+
+### Added
+
+- **`/review-branch` now triages findings before drafting fixes.** The worker
+  is asked, per finding, whether the finding is real — as a schema-validated
+  judgement (`confirmed` / `rejected` / `uncertain`) with mandatory evidence in
+  both directions — before any fix is written. Only confirmed findings reach
+  the fixer; `uncertain` never does, so a guess cannot become a code edit.
+  `force-fix-all` bypasses triage so you can still overrule the worker.
+
+  This exists because of a real failure. In the run recorded at
+  `2026-09-14T12-25-09-360Z.jsonl`, the reviewer claimed
+  `WorkspaceEdit.createFile(uri, { contents })` does not accept a `contents`
+  payload. It does, and the VS Code typings say so. The worker did not push
+  back: it restated the false premise, rewrote `workspaceEditHost().commit`
+  with an extra `fs.stat` per file, and added the comment "`createFile` only
+  creates the file; the content must be a separate text edit". The reviewer
+  approved it. Applying that proposal would have replaced working code with
+  more complex code and recorded a falsehood in a comment. A worker instructed
+  to fix N issues fixes N issues, including the ones that are wrong.
+
+- **New `defended` review outcome**, for a run where no remaining finding
+  survived triage. That is an assessment of your code, not an approval of a fix
+  proposal, and the two are now reported differently.
+
+### Changed
+
+- **Minimum VS Code is now 1.95.0** (was 1.93.0), and `@types/vscode` is pinned
+  with a tilde range. `engines.vscode` declared `^1.93.0` while `@types/vscode`
+  used a caret and resolved to **1.116.0**, so typecheck validated against an
+  API surface 23 minor versions newer than the advertised range. Pinning to
+  1.93 produced four errors, all `ChatRequest.model`, which only exists from
+  1.95.0. Since `useChatPickerWorker` defaults to `true`, the picker-as-worker
+  feature silently did nothing on 1.93 and 1.94. The floor is now enforced by
+  the compiler instead of assumed.
+
+### Fixed
+
+- **`/apply-review` could fail to find a review that had just succeeded.**
+  Transcript writes were queued and the handler returned without waiting, so
+  the terminal `review-branch-done` event was not guaranteed to be on disk —
+  including when `/apply-review` was launched from the button the review itself
+  renders. Handlers now flush before returning. Append failures were also
+  discarded by a bare `.catch(() => undefined)`, making a dropped event
+  indistinguishable from a stale build; the first failure is now reported and
+  surfaced in chat as a warning, without failing a run that produced a verdict.
+  Found by the tool reviewing its own branch.
+
+- **`/review-branch` no longer resends the whole branch diff on every
+  re-review.** Each iteration previously carried the full diff to both the
+  fixer and the reviewer. Measured on this repository: a two-iteration run made
+  three calls that each carried 178,575 chars — 535,725 chars of duplicated
+  diff, roughly 150,000 input tokens, to produce two findings. The re-review
+  pass now sends only the files its own prior findings cited, reusing the path
+  set already harvested for the fixer's file context. The prompt states how
+  many files were omitted so the reviewer is not misled about the branch's
+  size, and the counts are recorded in the transcript so the saving can be
+  checked rather than taken on trust. When no cited path matches the diff, the
+  full diff is sent unchanged — scoping never empties the reviewer's context.
+  The initial review pass is untouched and still sees everything.
+
+- **`codecrosscheck.reviewBranch.maxDiffChars` now defaults to `1100000`**
+  (was `200000`). The old cap aborted `/review-branch` on ordinary working
+  trees before any model call — a 65-file change set on this repository
+  measures over 500,000 chars — so the first thing a user had to do was find
+  and raise the setting. The char cap was always a cheap pre-filter; the
+  accurate gate is the token preflight that follows it, which asks the
+  reviewer model for its own `maxInputTokens`. Note the trade-off: at this
+  size the cap no longer catches anything the preflight would not, and the
+  preflight is best-effort — it permits the call when a model reports no
+  `maxInputTokens`. Lower the setting to restore the stricter behaviour.
+
+- **Default model pair is now worker `anthropic/claude-opus-5`, reviewer
+  `openai/gpt-5.3-codex`** (was worker `openai/gpt-5.4`, reviewer
+  `anthropic/claude-opus-4.6`). The pair remains cross-vendor; the direction
+  flips, so the OpenAI model is now the judge. Note that
+  `codecrosscheck.useChatPickerWorker` defaults to `true`, so in the chat
+  participant the worker follows the Copilot Chat picker and
+  `codecrosscheck.workerModel` only applies as a fallback. The reviewer is
+  always taken from `codecrosscheck.reviewerModel`.
+
+### Fixed
+
+- **The CLI shipped a same-model pair.** `--worker-model` and
+  `--reviewer-model` both defaulted to `openai/gpt-5.4`, so a plain
+  `codecrosscheck "..."` invocation ran the worker and the reviewer on one
+  model — defeating the cross-vendor premise and contradicting the `chat-loop`
+  requirement that the reviewer default not share the worker's family. The two
+  flags now default to different vendors. This restores spec conformance but
+  does not make the CLI usable: its backend, GitHub Models, was retired by
+  GitHub on 2026-07-30 and the endpoint returns HTTP 410.
+
+- **`/apply-review` corrupted any replacement containing `$&`, `` $` ``, `$'`
+  or `$$`.** `applyEdit` wrote the new content with
+  `original.replace(matchedOld, repairedNew)`; `String.prototype.replace` runs
+  `GetSubstitution` on the replacement even for a string search value, so those
+  patterns were expanded instead of written literally — and the edit was still
+  reported as `applied`. Replacements are now spliced by index. Common triggers
+  were Makefile/shell `$$`, bash `$'…'`, and source that itself calls
+  `.replace(…, "$&")`.
+- **`/review-branch` claimed the reviewer approved when it had not.** When the
+  worker rebutted every outstanding finding, `filterRejectedIssues` flipped the
+  verdict to `approve` and the summary printed "Approved — reviewer is
+  satisfied". The reviewer never approved; the worker suppressed the findings.
+  There is now an explicit outcome (`approved`, `rebutted`, `exhausted`,
+  `cancelled`, `failed`), and `rebutted` is rendered as a stalled disagreement
+  pointing at the rebuttal list.
+- **`/review-branch` did not review uncommitted work.** `getChangeDiff` ran
+  `git diff <base>...HEAD`, so staged and unstaged edits were invisible even
+  though the documented workflow says to review the working tree. The default
+  comparison now includes the working tree; pass `committed-only` for the old
+  behaviour. Untracked files stay excluded. The chat header now names the
+  comparison that was made.
+- **Stopping a chat response did not stop the loop.** The request
+  `CancellationToken` was discarded and `VscodeLmClient` created a token source
+  nobody could trigger and nobody disposed. Cancellation is now threaded
+  through the clients, `reviewLoop` and `runPipeline`.
+- The structured-output retry now shows the model its own failed response and
+  the validation error. The previous reminder named a schema without stating
+  it, and fell back to the sentence "the previously stated structured-verdict
+  schema" for every schema in the codebase.
+- Transcript discovery matched the substring `"review-branch-done"` anywhere in
+  a file, so a stored worker artifact quoting the event name read as a
+  completed run. It now matches a parsed terminating event near the tail.
+- Files attached to a chat request were silently discarded; they are now read
+  into the prompt, listed in the response, and counted against the diff budget.
+
+### Security
+
+- `codecrosscheck.applyReview.buildCommand` and `.testCommand` are now
+  `scope: "machine"`. They previously had no scope, so a repository's
+  `.vscode/settings.json` could choose the command `/apply-review` executes.
+- The manifest now declares `capabilities.untrustedWorkspaces` explicitly
+  instead of relying on the absence of the field, and `/apply-review` refuses
+  to run build or test commands unless the workspace is trusted.
+- `.codecrosscheck/` now self-ignores in git on creation, and transcripts are
+  pruned to `codecrosscheck.reviewBranch.keepTranscripts` (default 50).
+  Transcripts contain full source diffs.
+- The verdict webview declares `localResourceRoots: []` and a
+  `default-src 'none'` Content Security Policy.
+
+### Changed
+
+- **`/apply-review` applies its batch through `vscode.workspace.applyEdit`**, so
+  a run is a single undo step and files with unsaved changes are edited in the
+  document rather than overwritten on disk. Edits are also computed in full
+  before anything is written, so a mid-batch failure leaves the tree untouched.
+- **Worker prompts no longer use a `{"artifact": "…"}` JSON envelope.** Workers
+  produce documents and now reply with plain text; reviewers remain structured
+  and zod-validated.
+- **The CODE reviewer checklist moved from OWASP Top 10:2021 to Top 10:2025**
+  (verified against owasp.org — 2021 is now listed as a previous version). A03
+  is Software Supply Chain Failures, A10 is Mishandling of Exceptional
+  Conditions, and SSRF is no longer a standalone category, so an explicit note
+  keeps it covered. The edition is read back out of the prompt and recorded in
+  the transcript, so a past review can be audited against the list that was
+  actually applied.
+- All settings are resolved through `src/config.ts` with one declared default
+  each, asserted against the manifest by `test/config.test.ts`. This fixes the
+  reviewer default falling back to the worker's vendor in `/review-branch` and
+  the `maxIters` default disagreeing across manifest, code, CLI and docs.
+- `codecrosscheck.workerModel` / `reviewerModel` are free text instead of a
+  hand-maintained enum of 15 families. New command **CodeCrossCheck: Pick
+  Worker and Reviewer Models** lists what `vscode.lm` actually offers.
+  `workerModelOverride` / `reviewerModelOverride` are deprecated but honoured.
+- Chat handlers return a `ChatResult` with `errorDetails`, offer followups, and
+  expose the recommended next step as a button.
+- Compiler strictness raised (`noUncheckedIndexedAccess`, `noUnusedLocals`,
+  `noUnusedParameters`, `noImplicitOverride`,
+  `noFallthroughCasesInSwitch`); the four `void x;` suppression statements are
+  gone, and `test/hygiene.test.ts` keeps them gone.
+
+### Added
+
+- ESLint with `typescript-eslint` (`npm run lint`) and a type-check gate that
+  covers `test/` for the first time (`npm run typecheck`). CI runs both, and
+  now also packages a VSIX.
+- The planted-flaw reviewer corpus runs as a scheduled/dispatchable CI job, and
+  states its reason when skipped instead of looking like a passing gate.
+- `codecrosscheck.reviewBranch.keepTranscripts` setting.
+
+### Removed
+
+- **`codecrosscheck.execute.allowNetwork` and the CLI `--allow-network` flag.**
+  The option was implemented as `NO_PROXY=*`, which tells clients to *bypass* a
+  proxy and denies nothing. Rather than keep a control that does not work, it
+  is removed and the sandbox's actual containment (temp cwd, allowlisted
+  environment, hard timeout) is documented plainly.
+- Dependencies `undici` and `zod-to-json-schema`. zod 4 generates JSON Schema
+  natively and Node 20 has a global `fetch`; dropping `undici` also removed the
+  `closeUndici()` libuv shutdown workaround in the CLI.
+
+### Notes
+
+- `typescript` stays on `^5.9.3`: `typescript-eslint` does not support TS 7.0
+  ([typescript-eslint#10940](https://github.com/typescript-eslint/typescript-eslint/issues/10940)).
+  See the deferral note in the `modernize-toolchain` proposal.
 
 ## [0.4.0] — 2026-05-29
 

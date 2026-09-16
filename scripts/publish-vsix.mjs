@@ -14,13 +14,15 @@ function run(cmd) {
 
 run("npx vsce package --no-dependencies");
 
-const vsix = fs.readdirSync(".").find((f) => f.endsWith(".vsix"));
-if (!vsix) {
-  console.error("publish-vsix: no .vsix file produced.");
+const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+// Name the artifact explicitly: the directory holds older .vsix files and a
+// readdir scan returns the alphabetically-first one, not the one just built.
+const vsix = `${pkg.name}-${pkg.version}.vsix`;
+if (!fs.existsSync(vsix)) {
+  console.error(`publish-vsix: expected ${vsix} but vsce did not produce it.`);
   process.exit(1);
 }
 
-const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
 run(
   `az artifacts universal publish --feed ${FEED} --name ${PACKAGE_NAME} --version ${pkg.version} --description "CodeCrossCheck VS Code extension" --path ${vsix}`,
 );

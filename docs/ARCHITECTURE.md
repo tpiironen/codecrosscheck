@@ -40,7 +40,7 @@ flowchart TB
 
   subgraph Adapters["ChatClient adapters"]
     IFACE["src/clients/ChatClient.ts<br/>sendStructured&lt;T&gt;"]
-    GH["src/clients/githubModels.ts<br/>undici + json_schema strict"]
+    GH["src/clients/openaiCompatible.ts<br/>global fetch + json_schema"]
     VLM["src/clients/vscodeLm.ts<br/>vscode.lm + extractJson"]
   end
 
@@ -146,10 +146,13 @@ Key behaviours encoded in [src/loop.ts](../src/loop.ts):
   blocks and rethrown as a typed `OversizedPromptError` *without*
   triggering the schema-reminder retry. `/review-branch` adds two
   upstream guards: a hard char-budget cap
-  (`codecrosscheck.reviewBranch.maxDiffChars`, default 200 KB) and a
+  (`codecrosscheck.reviewBranch.maxDiffChars`, default 1.1 M chars) and a
   best-effort `countTokens` preflight against the reviewer model's
-  `maxInputTokens` (with a 10% response reserve). See OpenSpec change
-  `guard-oversized-review-prompts`.
+  `maxInputTokens` (with a 10% response reserve). The cap now sits above
+  every reachable model's context window, so the preflight is normally the
+  gate that fires; the cap still covers models reporting no
+  `maxInputTokens`. See OpenSpec changes
+  `guard-oversized-review-prompts` and `raise-review-branch-diff-budget`.
 - **Revision prompts include structured issues, not raw reviewer prose.**
   `buildRevisionInput` formats `severity / where / why / suggestion` so the
   worker sees machine-actionable feedback.
@@ -181,6 +184,39 @@ flowchart LR
 
 `opts.stages` lets callers run a subset (`--stages plan` or `/plan`).
 
+### 4.1 How a `/review-branch` dialogue ends
+
+`/review-branch` does not use `runPipeline`; it drives its own
+reviewer→triage→worker→reviewer dialogue and classifies the ending into exactly
+one `ReviewOutcome`. The distinction matters because three of these look like
+success and only one is an approval of a fix:
+
+| Outcome | Meaning | Rendered as |
+|---|---|---|
+| `approved` | The reviewer returned `verdict: "approve"` on its own. | ✅ Approved |
+| `defended` | Triage could not confirm a single remaining finding, so nothing was drafted. **The code was defended against the findings** — a different claim from "the fix is good". | 🛡️ Findings did not survive triage, with the evidence for each rejection |
+| `rebutted` | Every outstanding finding matched a fingerprint the worker had rebutted with `**Fix:** Disagree:`, so the filter emptied the list. **The reviewer never approved.** | 🤝 Stalled on disagreement, with the rebuttals listed for the user to adjudicate |
+| `exhausted` | `maxIters` reached with findings still open. | ⚠️ Did not converge |
+| `cancelled` | The request's `CancellationToken` fired. | ⏹️ Cancelled |
+| `failed` | Diff could not be computed, budget exceeded, or a model call failed. | ❌ with `ChatResult.errorDetails` |
+
+`defended` and `rebutted` both mean "no fix was produced", but they arrive
+differently: `rebutted` is the worker declining while drafting, recovered by
+parsing prose; `defended` is a dedicated triage pass returning a schema-validated
+judgement with evidence, before any drafting happens.
+
+`rebutted` exists because of a real defect: `filterRejectedIssues` used to flip
+the verdict to `approve` when suppression emptied the issue list, and the
+summary then printed "Approved — reviewer is satisfied". That let the *worker*
+self-certify by disagreeing, in a tool whose entire premise is that a second
+model judges the first. The helper is now side-effect free and reports
+`emptiedBySuppression`; the handler decides the outcome and the renderer never
+shows an approval the reviewer did not give.
+
+The outcome is written to the terminating `review-branch-done` transcript
+event and returned in `ChatResult.metadata`, which is what drives the
+followups (`apply`, `force-fix-all`, `raise the cap`).
+
 ## 5. Sandbox
 
 [src/sandbox.ts](../src/sandbox.ts) is the only place that runs untrusted
@@ -192,7 +228,6 @@ code. Guarantees:
 | Fresh working dir per run | `fs.mkdtempSync(path.join(os.tmpdir(), "ccc-"))` |
 | Env scrubbed to allowlist | `PATH`, `LANG`, `TMPDIR`/`TEMP`, `HOME`/`USERPROFILE` only |
 | Hard timeout | Default 30 s; process tree killed on expiry |
-| Network deny by default | `NO_PROXY=*` injected unless `--allow-network` |
 | Cleanup | `rm -rf` of tmpdir on completion (success or failure) |
 
 The sandbox is **not** an adversarial isolator. Treat it as a guardrail
@@ -209,9 +244,9 @@ classDiagram
     +modelId: string
     +sendStructured~T~(messages, schema) Promise~T~
   }
-  class GitHubModelsClient {
-    +endpoint: "models.github.ai/inference/chat/completions"
-    +reads GITHUB_TOKEN
+  class OpenAiCompatibleClient {
+    +endpoint: $CODECROSSCHECK_BASE_URL + "/chat/completions"
+    +optional bearer key; omitted when unset
     +response_format: json_schema strict
   }
   class VscodeLmClient {
@@ -220,31 +255,46 @@ classDiagram
     +preselected model? LmChat
     +extractJson(streamedText)
   }
-  ChatClient <|.. GitHubModelsClient
+  ChatClient <|.. OpenAiCompatibleClient
   ChatClient <|.. VscodeLmClient
 ```
 
-- **`githubModels.ts`** is what the CLI uses. It sends OpenAI-style
-  `response_format: { type: "json_schema", strict: true }` derived from the
-  zod schema via `zod-to-json-schema`. Single retry on parse failure with a
-  stricter system message.
+- **`openaiCompatible.ts`** is what the CLI uses. It sends OpenAI-style
+  `response_format: { type: "json_schema" }` derived from the zod schema via
+  zod 4's native `z.toJSONSchema()`. `strict` is declared only when the
+  generated schema actually satisfies strict mode (every property required,
+  `additionalProperties: false`), because declaring it otherwise makes the
+  provider reject the request. HTTP goes through the platform `fetch`.
+  There is deliberately no default base URL: the previous client hard-coded
+  GitHub Models, and when that service was retired on 2026-07-30 every CLI
+  invocation broke. The API key is optional so keyless local servers work.
 - **`vscodeLm.ts`** is what the extension uses. `vscode.lm` wants a `family`
-  string (`"gpt-5.4"`), not a vendor-prefixed id (`"openai/gpt-5.4"`); the
+  string (`"claude-opus-5"`), not a vendor-prefixed id
+  (`"anthropic/claude-opus-5"`); the
   client strips the vendor with `stripVendor()`. It also accepts a
   pre-resolved `LmChat` so the extension can pass `request.model` (the
   Copilot Chat picker selection) without re-resolving.
+- Both retry **once** on a parse or schema failure, and the retry includes the
+  model's own failed response as an assistant turn plus the validation error.
+  A reminder that names a schema without stating it gives the model nothing to
+  correct against.
+- Both accept an `AbortSignal`. `VscodeLmClient` creates one
+  `CancellationTokenSource` per call, cancels it from the signal, and disposes
+  it in a `finally`.
 
 The two model-id formats are why the extension surfaces both
 `codecrosscheck.workerModel` (full id, for fallback resolution) and
 `codecrosscheck.useChatPickerWorker` (boolean, for picker passthrough).
-Both `workerModel` and `reviewerModel` are enum-typed for a dropdown in
-Settings UI; free-text `workerModelOverride` / `reviewerModelOverride`
-fields allow arbitrary families without needing an enum update.
+Both `workerModel` and `reviewerModel` are free-text settings; the
+**CodeCrossCheck: Pick Worker and Reviewer Models** command populates them
+from `vscode.lm.selectChatModels()` so the list cannot go stale. All settings
+are read through [src/config.ts](../src/config.ts), which holds exactly one
+default per setting; `test/config.test.ts` asserts those match the manifest.
 
 ## 7. OpenSpec mode
 
 When `--openspec <change-id>` is set (CLI) or
-`/openspec-implement <change-id>` is invoked (chat), three things happen:
+`/openspec-review <change-id>` is invoked (chat), three things happen:
 
 1. **Change frame injection.** [src/openspec/loader.ts](../src/openspec/loader.ts)
    reads `proposal.md`, `tasks.md`, and `specs/**/spec.md` for the change
@@ -259,10 +309,13 @@ When `--openspec <change-id>` is set (CLI) or
    the call uses `shell: true` (required on Windows for `.cmd` shims after
    Node 22's CVE-2024-27980 hardening).
 3. **Diff scoping.** [src/openspec/diff.ts](../src/openspec/diff.ts)
-   computes `git diff` against the merge-base with `origin/main`, chunks it
-   per-file with overlap to stay under context limits, and feeds it into
-   the CODE reviewer. The same helper backs the CLI's `--diff` flag and
-   the extension's `/review-branch` slash command.
+   computes `git diff` against the merge-base with `origin/main` **and the
+   working tree**, so staged and unstaged edits to tracked files are reviewed;
+   untracked files are excluded. Pass `committedOnly` (CLI `--committed-only`,
+   chat `committed-only`) to compare commits alone. It returns the patch plus a
+   description of what was compared, which `/review-branch` prints in its
+   header. The helper chunks per-file with overlap to stay under context
+   limits, and backs the CLI's `--diff` flag and the `/review-branch` command.
 
 ## 8. Surfaces
 
@@ -273,16 +326,16 @@ When `--openspec <change-id>` is set (CLI) or
   `.codecrosscheck/runs/<ISO-timestamp>.jsonl`. Includes worker drafts,
   verdicts (with `source: "model" | "validator"`), sandbox results, and
   the final `completed` record.
-- Exit 0 if final stage `approved`, else 1. Honours `process.exitCode`
-  rather than calling `process.exit` so async cleanup (undici dispatcher
-  close) can run.
+- Exit 0 if final stage `approved`, else 1. There is no dispatcher teardown
+  step: the client uses the platform `fetch`, so the `undici` keep-alive pool
+  that used to need closing on Windows is gone.
 
 ### 8.2 VS Code extension ([src/extension.ts](../src/extension.ts))
 
 ```mermaid
 flowchart TB
   Activate[activate] --> RegPart[createChatParticipant id=codecrosscheck]
-  Activate --> RegCmd[registerCommand × 3]
+  Activate --> RegCmd[registerCommand × 5]
   RegCmd --> RS[reviewSelection]
   RegCmd --> RA[reviewActiveFile]
   RegCmd --> IS[installSkill]
@@ -303,47 +356,45 @@ flowchart TB
   participant streams a warning before running the loop.
 - **`/review-branch [extra]`** runs a dedicated reviewer-first dialogue
   loop (not `runPipeline`). Iteration 1 calls the CODE reviewer directly
-  on the diff. Iterations 2..N call the worker with the
-  [`review_branch_fixer`](../src/prompts/review_branch_fixer.md) prompt to
-  produce concrete fixes for the prior findings, then have the reviewer
-  re-judge whether those fixes resolve the issues. The worker uses
-  `ChatClient.sendText` (plain Markdown, no JSON envelope) because fix
-  proposals contain code blocks that large-context models drop from
-  structured wrappers. Two pieces of feedback flow back into each fixer
-  iteration:
-  - **Repository file context.** Before each iteration ≥ 2 the handler
-    runs `harvestPathsFromText` over every reviewer finding's `where` /
-    `suggestion` and over the prior fix proposal, reads those files via
-    `buildFileInventory`, and injects them as a `# Repository file
-    context` section in the fixer input (capped at 60 000 characters).
-    This eliminates the "I need the source of X" dodge for files that
-    live outside the diff. URLs, absolute Windows paths, and
-    host-prefixed paths are filtered out.
-  - **Worker disagreement adjudication.** The fixer prompt allows a
-    push-back via `**Fix:** Disagree: <rebuttal>` per issue. After the
-    final iteration the handler runs `parseDisagreements` over the
-    proposal and renders any rebuttals at the end of the chat output as
-    a numbered, blockquoted decision block. The user adjudicates by
-    accepting (run `/apply-review` — rebutted findings emit no edits)
-    or overriding: re-run with `force-fix-all` anywhere in the prompt
-    (whole-word, case-insensitive) to append a `# User override`
-    section that requires a concrete fix for every finding and forbids
-    `Disagree:` in that round.
-  - **Blocked-finding detection.** A complementary `parseBlockedFindings`
-    helper flags issue sections where the worker dodged via prose
-    ("Data I need", `(sketch — pending current source)`, "I cannot
-    produce a patch") without using the explicit `Disagree:` token.
-    Such issues look like fixes at a glance but produce zero edits, so
-    they are rendered as a separate `🚫 N finding(s) the worker did
-    not produce a real patch for` block, naming the likely cause (the
-    cited file lives outside the workspace root, so the file-context
-    injector could not read it) and pointing at the workspace-switch /
-    `force-fix-all` remedies. Disagreement-captured issues are
-    excluded so they aren't reported twice.
+  on the diff. Iterations 2..N triage the findings, then call the worker with
+  the [`review_branch_fixer`](../src/prompts/review_branch_fixer.md) prompt to
+  produce concrete fixes for the confirmed findings, then have the reviewer
+  re-judge whether those fixes resolve the issues. The fixer returns a
+  schema-validated `FixProposal` — one entry per finding carrying a status, an
+  explanation and exact edits — and the Markdown shown to the user and sent to
+  the reviewer is *derived* from that structure, so prose and edits cannot
+  disagree.
+  - **Workspace toolset.** The triager and the fixer are given a read-only
+    toolset (`read_file`, `search_workspace`, `list_directory`) from
+    [`src/tools/workspaceTools.ts`](../src/tools/workspaceTools.ts) and fetch
+    what they need mid-turn. This replaced a pre-computed harvesting pass:
+    measured on the 2026-09-16 dogfood run, the file the triager turned out to
+    need was named nowhere in the finding, so no amount of pre-computation
+    could have supplied it. Every path is validated with `resolveSafePath`,
+    filtered through a denylist (VCS metadata, build output, dependency trees,
+    credential files) and then through `git check-ignore` when the workspace is
+    a repository. Each loop is bounded by `codecrosscheck.tools.maxCalls` and
+    `codecrosscheck.tools.deadlineMs`; on exhaustion the client withdraws the
+    tools, tells the model so, and takes one final answer. Every call is
+    streamed to the user and written to the transcript as a `tool-call` event.
+  - **Worker disagreement adjudication.** A fix with status `disagree` is a
+    push-back, and its `explanation` is the rebuttal. After the final iteration
+    the handler renders any rebuttals at the end of the chat output as a
+    numbered, blockquoted decision block. The user adjudicates by accepting
+    (run `/apply-review` — a rebutted finding carries no edits) or overriding:
+    re-run with `force-fix-all` anywhere in the prompt (whole-word,
+    case-insensitive) to append a `# User override` section that requires a
+    concrete fix for every finding and withdraws the `disagree` status.
+  - **Unaddressed findings.** A fix with status `unaddressed` is one the worker
+    could neither fix nor rebut. These are rendered as a separate
+    `🚫 N finding(s) the worker could not produce a patch for` block quoting
+    the worker's own reason. This replaced a set of English-phrase regexes
+    (`**Data I need`, `pending current source`) that had obvious false
+    positives in ordinary prose.
   - **Reviewer exhaustiveness and complete-round rule.** The reviewer
     prompt requires every finding to be listed (high → low →
     file/line) with no arbitrary cap. The fixer prompt requires each
-    round to be a complete, self-contained proposal: any hunk from
+    round to be a complete, self-contained proposal: any edit from
     round N that is still needed must be repeated verbatim in round
     N+1, since `/apply-review` consumes only the final round.
   - **Per-invocation iteration cap.** The handler parses
@@ -356,32 +407,31 @@ flowchart TB
     proposal exists (converged or not) the summary points the user at
     `/apply-review`. The manual-only fallback only renders when no
     proposal exists at all.
-- **`/apply-review [extra]`** is the apply step of the review loop and
+- **`/apply-review`** is the apply step of the review loop and
   lives in a dedicated handler in
   [`src/extension.ts`](../src/extension.ts) backed by the pure
   [`src/applyReview.ts`](../src/applyReview.ts) module. Flow: locate the
   newest `.codecrosscheck/runs/*.jsonl` containing a `review-branch-done`
-  event → extract the last `review-branch-iter` event with
-  `role: "worker"` (the final fix proposal) → parse `// path:` directives
-  to determine which files to read → call the worker with the
-  [`apply_review_worker`](../src/prompts/apply_review_worker.md) prompt
-  using `ChatClient.sendStructured` and the `ApplyReviewSchema`
-  (`{edits: [{path, oldString, newString, why}]}`) → for each edit,
-  validate the path resolves under the workspace root, then run a
-  deterministic candidate sequence on `oldString` (literal → CRLF↔LF
-  normalisation → unified-diff stripping) and apply the first variant
-  that matches uniquely, with the `newString` paired to the same
-  repair, then write via `vscode.workspace.fs`. An empty `oldString`
-  means create-mode (refuses to overwrite). Every run persists a debug
-  log at `<workspace>/.codecrosscheck/runs/<iso>-apply.json` containing
-  the source transcript, harvested paths, raw worker `edits`, and
-  per-edit `outcomes` — linked from chat output even on zero-edit
-  runs so worker stalls are diagnosable. Apply is a separate slash
-  command (not part of `/review-branch`) so the review loop stays
-  read-only and safe to run on any branch; applying is the explicit,
-  opt-in "do it" step. Settings `codecrosscheck.applyReview.dryRun`
-  and `codecrosscheck.applyReview.testCommand` control preview-only
-  mode and an optional follow-up test invocation.
+  event → extract the structured proposal from the last
+  `review-branch-iter` event with `role: "worker"` → for each edit, validate
+  the path resolves under the workspace root, require `oldString` to occur
+  exactly once byte for byte, then write via `vscode.workspace.fs`. **It calls
+  no model.** The second model hop that used to re-derive `oldString` /
+  `newString` from Markdown existed only because prose could not be trusted to
+  carry exact strings; with structured edits there is nothing to re-derive, and
+  with it went the CRLF-and-diff-marker repair machinery — a near-miss now
+  means the edit is wrong, and repairing it would hide that. An empty
+  `oldString` means create-mode (refuses to overwrite). A transcript written
+  before structured proposals is reported as such rather than silently
+  applying nothing. Every run persists a debug log at
+  `<workspace>/.codecrosscheck/runs/<iso>-apply.json` containing the source
+  transcript, the `edits`, and per-edit `outcomes` — linked from chat output
+  even on zero-edit runs. Apply is a separate slash command (not part of
+  `/review-branch`) so the review loop stays read-only and safe to run on any
+  branch; applying is the explicit, opt-in "do it" step. Settings
+  `codecrosscheck.applyReview.dryRun` and
+  `codecrosscheck.applyReview.testCommand` control preview-only mode and an
+  optional follow-up test invocation.
 - **`installSkill` command** copies the bundled
   `dist/assets/skills/codecrosscheck-delegate/SKILL.md` to either
   `<workspace>/.github/skills/` or `<homedir>/.agents/skills/`. Refuses
@@ -432,7 +482,7 @@ flowchart LR
 - **Unit tests** drive `loop.ts` and `pipeline.ts` with a deterministic
   `FakeChatClient` whose responses are scripted; no network, no
   flakiness. Sandbox tests use real subprocesses but tiny scripts.
-- **Live integration test** is gated on `RUN_LIVE_TESTS=1` + `GITHUB_TOKEN`
+- **Live integration test** is gated on `RUN_LIVE_TESTS=1` + `CODECROSSCHECK_BASE_URL`
   and is the only test that touches the network in CI.
 - **Selftests** are end-to-end smoke tests run manually with a token. They
   exercise the actual binaries against live GitHub Models, including the
@@ -458,7 +508,7 @@ doesn't ship. End users can ignore them.
 ## 12. Self-hosting
 
 From `0.1.0` onward, changes in this repo are reviewed by `@codecrosscheck`
-itself in OpenSpec mode (`/openspec-implement <change-id>` or
+itself in OpenSpec mode (`/openspec-review <change-id>` or
 `/review-branch`). The genesis change (`add-codecrosscheck`) and this
 session's change (`add-chat-picker-and-delegation`) both live under
 [openspec/changes/](../openspec/changes/) and validate clean against

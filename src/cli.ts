@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { getGlobalDispatcher } from "undici";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { GithubModelsClient } from "./clients/githubModels.js";
+import { OpenAiCompatibleClient } from "./clients/openaiCompatible.js";
 import { runPipeline, type PipelineEvent } from "./pipeline.js";
 import { loadChange, renderChangeFrame } from "./openspec/loader.js";
 import { validateStrict } from "./openspec/validate.js";
@@ -19,21 +18,26 @@ program
   .argument("<task>", "The task description")
   .option("--stages <list>", "Comma-separated stages: plan,code,execute", "plan,code,execute")
   .option("--max-iters <n>", "Maximum loop iterations per stage", "3")
-  .option("--worker-model <id>", "Worker model id (GitHub Models)", "openai/gpt-5.4")
-  .option("--reviewer-model <id>", "Reviewer model id (GitHub Models)", "openai/gpt-5.4")
-  .option("--allow-network", "Allow network access in the EXECUTE sandbox", false)
+  .option("--worker-model <id>", "Worker model id", "anthropic/claude-opus-5")
+  .option("--reviewer-model <id>", "Reviewer model id", "openai/gpt-5.3-codex")
+  .option(
+    "--base-url <url>",
+    "OpenAI-compatible API root (default: $CODECROSSCHECK_BASE_URL), e.g. https://api.openai.com/v1",
+  )
   .option("--timeout-ms <n>", "Sandbox timeout in milliseconds", "30000")
   .option("--openspec <changeId>", "Run with OpenSpec change frame and validator pre-gate")
-  .option("--diff", "Append the current branch diff (vs origin/main merge-base) to the task prompt", false)
+  .option("--diff", "Append the current branch diff to the task prompt", false)
   .option("--diff-base <ref>", "Override the base ref for --diff (default: merge-base with origin/main, falling back to HEAD)")
+  .option("--committed-only", "With --diff, compare commits only and exclude the working tree", false)
   .action(async (task: string, opts: Record<string, string | boolean>) => {
     const stages = String(opts.stages)
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean) as Stage[];
 
-    const workerClient = new GithubModelsClient({ modelId: String(opts.workerModel) });
-    const reviewerClient = new GithubModelsClient({ modelId: String(opts.reviewerModel) });
+    const baseUrl = typeof opts.baseUrl === "string" ? opts.baseUrl : undefined;
+    const workerClient = new OpenAiCompatibleClient({ modelId: String(opts.workerModel), baseUrl });
+    const reviewerClient = new OpenAiCompatibleClient({ modelId: String(opts.reviewerModel), baseUrl });
 
     const transcriptPath = openTranscript();
     const writeEvent = (event: Record<string, unknown>) => {
@@ -46,8 +50,8 @@ program
     if (opts.openspec) {
       const changeId = String(opts.openspec);
       const change = loadChange(changeId);
-      const diff = await getChangeDiff().catch(() => "");
-      const frame = renderChangeFrame(change, diff);
+      const diff = await getChangeDiff().catch(() => null);
+      const frame = renderChangeFrame(change, diff?.patch);
       resolvedTask = `${task}\n\n${frame}`;
       preReviewFactory = () => async (): Promise<Verdict | null> => {
         const result = await validateStrict(changeId);
@@ -69,13 +73,15 @@ program
 
     if (opts.diff && !opts.openspec) {
       const baseRef = typeof opts.diffBase === "string" ? opts.diffBase : undefined;
-      const diff = await getChangeDiff({ baseRef }).catch((err: Error) => {
-        process.stderr.write(`codecrosscheck: --diff failed: ${err.message}\n`);
-        return "";
-      });
-      if (diff.trim()) {
-        resolvedTask = `${task}\n\n# Current branch diff\n\n\`\`\`diff\n${diff}\n\`\`\``;
-        writeEvent({ event: "diff-attached", baseRef: baseRef ?? "auto", bytes: diff.length });
+      const result = await getChangeDiff({ baseRef, committedOnly: Boolean(opts.committedOnly) }).catch(
+        (err: Error) => {
+          process.stderr.write(`codecrosscheck: --diff failed: ${err.message}\n`);
+          return null;
+        },
+      );
+      if (result?.patch.trim()) {
+        resolvedTask = `${task}\n\n# Branch diff (${result.description})\n\n\`\`\`diff\n${result.patch}\n\`\`\``;
+        writeEvent({ event: "diff-attached", baseRef: baseRef ?? "auto", bytes: result.patch.length });
       } else {
         process.stderr.write("codecrosscheck: --diff produced no changes; running without diff context.\n");
       }
@@ -101,7 +107,6 @@ program
       maxIters: Number(opts.maxIters),
       sandbox: {
         timeoutMs: Number(opts.timeoutMs),
-        allowNetwork: Boolean(opts.allowNetwork),
       },
       preReview: preReviewFactory,
       onEvent,
@@ -109,19 +114,8 @@ program
 
     writeEvent({ event: "completed", approved: result.approved });
     process.stdout.write(`\nTranscript: ${transcriptPath}\n`);
-    await closeUndici();
     process.exit(result.approved ? 0 : 1);
   });
-
-async function closeUndici(): Promise<void> {
-  // Without this the keep-alive pool can crash libuv on shutdown on Windows.
-  try {
-    const d = getGlobalDispatcher();
-    await (d as { close?: () => Promise<void> }).close?.();
-  } catch {
-    // best-effort
-  }
-}
 
 function openTranscript(): string {
   const dir = path.join(process.cwd(), ".codecrosscheck", "runs");
@@ -130,8 +124,7 @@ function openTranscript(): string {
   return path.join(dir, `${stamp}.jsonl`);
 }
 
-program.parseAsync().catch(async (err: Error) => {
+program.parseAsync().catch((err: Error) => {
   process.stderr.write(`codecrosscheck: ${err.message}\n`);
-  await closeUndici();
   process.exit(2);
 });

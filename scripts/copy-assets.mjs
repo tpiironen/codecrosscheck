@@ -1,6 +1,6 @@
 // Copies non-TS assets (prompts/ and skills/) from the repo into dist/ so they
 // are resolvable relative to the built JS files when the package or VSIX runs.
-import { cpSync, existsSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +14,9 @@ function copy(srcRel, destRel, label) {
     console.error(`No ${label} directory found at ${src}`);
     process.exit(1);
   }
+  // Clear first: cpSync merges, so a deleted source file otherwise lives on in
+  // dist and ships in the VSIX.
+  rmSync(dest, { recursive: true, force: true });
   mkdirSync(path.dirname(dest), { recursive: true });
   cpSync(src, dest, { recursive: true });
   console.log(`Copied ${label} -> ${dest}`);

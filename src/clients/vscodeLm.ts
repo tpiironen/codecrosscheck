@@ -1,5 +1,18 @@
 import { z } from "zod";
-import type { ChatClient, ChatMessage } from "./ChatClient.js";
+import {
+  ReviewCancelledError,
+  TOOL_BUDGET_REFUSAL,
+  budgetExceeded,
+  openToolBudget,
+  throwIfAborted,
+  toolBudgetNudge,
+  toolsEnabled,
+  type ChatClient,
+  type ChatMessage,
+  type SendOptions,
+  type ToolCall,
+} from "./ChatClient.js";
+import { describeSchema, explainFailure } from "./schemaText.js";
 
 // `vscode` is a peer dependency; we import it lazily so the CLI build works without it.
 type VsCodeLm = typeof import("vscode") extends { lm: infer L } ? L : never;
@@ -10,8 +23,11 @@ type VsCodeLm = typeof import("vscode") extends { lm: infer L } ? L : never;
 interface LmChat {
   readonly vendor: string;
   readonly family: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  sendRequest(messages: any, options: any, token: any): any;
+  sendRequest(
+    messages: never[],
+    options: Record<string, never>,
+    token: never,
+  ): PromiseLike<{ text: AsyncIterable<string>; stream?: AsyncIterable<unknown> }>;
 }
 
 export interface VscodeLmOptions {
@@ -51,41 +67,151 @@ export class VscodeLmClient implements ChatClient {
     const lm = await this.lmPromise;
     const models = await lm.selectChatModels({ vendor: this.vendor, family: this.family });
     if (models.length === 0) {
+      const available = await Promise.resolve(lm.selectChatModels({ vendor: this.vendor })).catch(
+        () => [] as Array<{ family: string }>,
+      );
+      const families = Array.from(new Set(available.map((m) => m.family))).sort();
       throw new Error(
-        `No vscode.lm models match vendor="${this.vendor}" family="${this.family}". ` +
-          `Update codecrosscheck.workerModel / codecrosscheck.reviewerModel to a family available in this VS Code session.`,
+        `No vscode.lm model matches vendor="${this.vendor}" family="${this.family}". ` +
+          (families.length
+            ? `Available families: ${families.join(", ")}. `
+            : "No models are available in this session. ") +
+          `Run "CodeCrossCheck: Pick Worker and Reviewer Models", or set ` +
+          `codecrosscheck.workerModel / codecrosscheck.reviewerModel to an available family.`,
       );
     }
-    return models[0]!;
+    return models[0]! as unknown as LmChat;
   }
 
-  private async sendRaw(messages: ChatMessage[]): Promise<string> {
+  private async sendRaw(messages: ChatMessage[], opts?: SendOptions): Promise<string> {
+    throwIfAborted(opts?.signal, this.modelId);
     const vscode = await import("vscode");
     const model = await this.select();
-    const lmMessages = messages.map((m) =>
+    const history: unknown[] = messages.map((m) =>
       m.role === "assistant"
         ? vscode.LanguageModelChatMessage.Assistant(m.content)
         : vscode.LanguageModelChatMessage.User(m.content),
     );
-    const response = await model.sendRequest(lmMessages, {}, new vscode.CancellationTokenSource().token);
-    let buf = "";
-    for await (const chunk of response.text) {
-      buf += chunk;
+
+    const tools = opts?.tools;
+    if (!toolsEnabled(tools)) {
+      return (await this.request(vscode, model, history, {}, opts)).text;
     }
-    return buf;
+
+    const budget = openToolBudget(tools);
+    const declared = {
+      tools: tools.specs.map((s) => ({
+        name: s.name,
+        description: s.description,
+        inputSchema: s.inputSchema,
+      })),
+      toolMode: vscode.LanguageModelChatToolMode.Auto,
+    };
+
+    for (;;) {
+      const stop = budgetExceeded(budget);
+      if (stop) {
+        history.push(vscode.LanguageModelChatMessage.User(toolBudgetNudge(stop, budget)));
+        const cut = await this.request(vscode, model, history, {}, opts);
+        tools.onFinish?.({ stop, callCount: budget.calls });
+        return cut.text;
+      }
+
+      const res = await this.request(vscode, model, history, declared, opts);
+      if (res.calls.length === 0) {
+        tools.onFinish?.({ stop: "final", callCount: budget.calls });
+        return res.text;
+      }
+
+      // Every requested call must be answered or the next request is
+      // malformed, so each one gets a result part — but the budget is a hard
+      // cap on work actually done: once it is spent the remaining calls in this
+      // turn are refused rather than invoked.
+      history.push(vscode.LanguageModelChatMessage.Assistant(res.parts as never));
+      const answers: unknown[] = [];
+      for (const call of res.calls) {
+        throwIfAborted(opts?.signal, this.modelId);
+        if (budget.calls >= budget.maxCalls) {
+          answers.push(
+            new vscode.LanguageModelToolResultPart(call.callId, [
+              new vscode.LanguageModelTextPart(TOOL_BUDGET_REFUSAL),
+            ]),
+          );
+          continue;
+        }
+        budget.calls++;
+        const result = await tools.invoke(call);
+        tools.onCall?.(call, result);
+        answers.push(
+          new vscode.LanguageModelToolResultPart(call.callId, [
+            new vscode.LanguageModelTextPart(result.content),
+          ]),
+        );
+      }
+      history.push(vscode.LanguageModelChatMessage.User(answers as never));
+    }
   }
 
-  async sendText(messages: ChatMessage[]): Promise<string> {
-    return this.sendRaw(messages);
+  /** One request/response turn. Splits the stream into text, tool calls, and the raw parts to echo back. */
+  private async request(
+    vscode: typeof import("vscode"),
+    model: LmChat,
+    history: unknown[],
+    requestOptions: Record<string, unknown>,
+    opts: SendOptions | undefined,
+  ): Promise<{ text: string; calls: ToolCall[]; parts: unknown[] }> {
+    throwIfAborted(opts?.signal, this.modelId);
+
+    // One source per call, cancelled by the caller's signal and always
+    // disposed. The previous implementation created a source nobody could
+    // trigger, so stopping a chat response left the loop running.
+    const source = new vscode.CancellationTokenSource();
+    const onAbort = () => source.cancel();
+    opts?.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const response = await model.sendRequest(
+        history as never[],
+        requestOptions as Record<string, never>,
+        source.token as never,
+      );
+      let text = "";
+      const calls: ToolCall[] = [];
+      const parts: unknown[] = [];
+      if (response.stream) {
+        for await (const part of response.stream) {
+          parts.push(part);
+          if (part instanceof vscode.LanguageModelToolCallPart) {
+            calls.push({ callId: part.callId, name: part.name, input: part.input });
+          } else if (part instanceof vscode.LanguageModelTextPart) {
+            text += part.value;
+          }
+        }
+      } else {
+        for await (const chunk of response.text) {
+          text += chunk;
+        }
+      }
+      throwIfAborted(opts?.signal, this.modelId);
+      return { text, calls, parts };
+    } catch (err) {
+      if (opts?.signal?.aborted) throw new ReviewCancelledError(this.modelId);
+      throw err;
+    } finally {
+      opts?.signal?.removeEventListener("abort", onAbort);
+      source.dispose();
+    }
+  }
+
+  async sendText(messages: ChatMessage[], opts?: SendOptions): Promise<string> {
+    return this.sendRaw(messages, opts);
   }
 
   async sendStructured<T>(
     messages: ChatMessage[],
-    schema: z.ZodSchema<T>,
+    schema: z.ZodType<T>,
     schemaName: string,
+    opts?: SendOptions,
   ): Promise<T> {
-    const send = (msgs: ChatMessage[]) => this.sendRaw(msgs);
-
     const tryParseOrRefuse = (raw: string): T => {
       // Refusals never become valid JSON — surface them up immediately so the user sees the cause
       // instead of a confusing "Unexpected token 'S'" parse error after a wasted retry.
@@ -96,9 +222,10 @@ export class VscodeLmClient implements ChatClient {
     let firstRaw = "";
     let firstError: unknown;
     try {
-      firstRaw = await send(messages);
+      firstRaw = await this.sendRaw(messages, opts);
       return tryParseOrRefuse(firstRaw);
     } catch (err) {
+      if (err instanceof ReviewCancelledError) throw err;
       if (err instanceof ModelRefusalError) throw err;
       // Token-limit failures cannot be fixed by re-asking with the same prompt + a schema reminder.
       // Re-throw as a typed error so callers (and users) see the actual problem instead of a
@@ -107,27 +234,36 @@ export class VscodeLmClient implements ChatClient {
       firstError = err;
     }
 
+    throwIfAborted(opts?.signal, this.modelId);
+
+    // Show the model what it actually returned and why that failed. A reminder
+    // that only names the schema gives it nothing to correct against.
     const retryMessages: ChatMessage[] = [
       ...messages,
+      { role: "assistant", content: firstRaw },
       {
         role: "system",
         content:
-          `Your previous response was not valid JSON for schema "${schemaName}". ` +
-          `Reply with ONLY a JSON object validating against this zod schema description: ` +
-          schemaDescription(schema),
+          `That response is not valid JSON for schema "${schemaName}". ` +
+          `It failed with: ${explainFailure(firstError)}. ` +
+          `Reply with ONLY a JSON object validating against this JSON Schema, and nothing else:\n` +
+          describeSchema(schema as z.ZodType<unknown>, schemaName),
       },
     ];
     let retryRaw = "";
     try {
-      retryRaw = await send(retryMessages);
+      // No tools on the retry: the reminder is about JSON shape, not missing
+      // data, and re-running the loop would spend a second budget on it.
+      retryRaw = await this.sendRaw(retryMessages, { ...opts, tools: undefined });
       return tryParseOrRefuse(retryRaw);
     } catch (err) {
+      if (err instanceof ReviewCancelledError) throw err;
       if (err instanceof ModelRefusalError) throw err;
       assertNotOversized(err, this.modelId);
       throw new Error(
         `vscode.lm response failed schema "${schemaName}" twice. ` +
-          `First: ${(firstError as Error)?.message} (raw: ${snippet(firstRaw)}). ` +
-          `Retry: ${(err as Error)?.message} (raw: ${snippet(retryRaw)}).`,
+          `First: ${explainFailure(firstError)} (raw: ${snippet(firstRaw)}). ` +
+          `Retry: ${explainFailure(err)} (raw: ${snippet(retryRaw)}).`,
       );
     }
   }
@@ -167,7 +303,7 @@ export { assertNotRefusal };
  * the input (or guard on token count before sending).
  */
 export class OversizedPromptError extends Error {
-  constructor(public readonly modelId: string, public readonly cause: Error) {
+  constructor(public readonly modelId: string, public override readonly cause: Error) {
     super(
       `Model "${modelId}" rejected the prompt as too large for its context window: ${cause.message}. ` +
         `Shrink the input (e.g. pass diff-base=<closer-ref> to /review-branch, split the branch, ` +
@@ -213,9 +349,4 @@ function extractJson(raw: string): string {
   const last = raw.lastIndexOf("}");
   if (first >= 0 && last > first) return raw.slice(first, last + 1);
   return raw.trim();
-}
-
-function schemaDescription(schema: z.ZodSchema<unknown>): string {
-  // Best-effort textual hint; the JSON-schema generator is used in the GitHub Models path.
-  return schema.description ?? "the previously stated structured-verdict schema";
 }

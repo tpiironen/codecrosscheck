@@ -14,6 +14,8 @@ export interface PipelineOptions {
   preReview?: (stage: Stage) => LoopOptions["preReview"];
   /** Streamed event sink for transcript / chat UI. */
   onEvent?: (event: PipelineEvent) => void;
+  /** Aborts the run between stages and cancels in-flight model calls. */
+  signal?: AbortSignal;
 }
 
 export interface StageResult {
@@ -25,6 +27,7 @@ export interface StageResult {
 export interface PipelineResult {
   approved: boolean;
   stages: StageResult[];
+  cancelled: boolean;
 }
 
 export type PipelineEvent =
@@ -43,18 +46,21 @@ export type PipelineEvent =
     }
   | { type: "stage-end"; stage: Stage; approved: boolean; iterations: number }
   | { type: "sandbox"; stage: Stage; sandbox: SandboxResult }
-  | { type: "completed"; approved: boolean };
+  | { type: "completed"; approved: boolean; cancelled: boolean };
 
 const DEFAULT_STAGES: Stage[] = ["plan", "code", "execute"];
 
 export async function runPipeline(task: string, opts: PipelineOptions): Promise<PipelineResult> {
   const stages = opts.stages ?? DEFAULT_STAGES;
   const stageResults: StageResult[] = [];
-  let context = task;
   let approvedPlan: string | undefined;
   let codeArtifact: string | undefined;
 
   for (const stage of stages) {
+    if (opts.signal?.aborted) {
+      opts.onEvent?.({ type: "completed", approved: false, cancelled: true });
+      return { approved: false, stages: stageResults, cancelled: true };
+    }
     const worker = buildWorker(stage, opts.workerClient);
     const reviewer = buildReviewer(stage, opts.reviewerClient);
     const maxIters = opts.maxIters ?? 3;
@@ -69,12 +75,13 @@ export async function runPipeline(task: string, opts: PipelineOptions): Promise<
     const stageInput = buildStageInput(stage, task, approvedPlan, codeArtifact);
 
     const result = await reviewLoop(stageInput, {
-      worker: { modelId: worker.modelId, produce: (input) => worker.produce(input) },
+      worker: { modelId: worker.modelId, produce: (input, o) => worker.produce(input, o) },
       reviewer: {
         modelId: reviewer.modelId,
-        judge: (artifact) => reviewer.judge(artifact),
+        judge: (artifact, o) => reviewer.judge(artifact, o),
       },
       maxIters,
+      signal: opts.signal,
       preReview: opts.preReview?.(stage),
       onIterationStart: (iteration) =>
         opts.onEvent?.({ type: "iteration-start", stage, iteration, maxIters }),
@@ -116,19 +123,22 @@ export async function runPipeline(task: string, opts: PipelineOptions): Promise<
 
     stageResults.push({ stage, result, sandbox });
 
+    if (result.cancelled) {
+      opts.onEvent?.({ type: "completed", approved: false, cancelled: true });
+      return { approved: false, stages: stageResults, cancelled: true };
+    }
+
     if (!result.approved) {
-      opts.onEvent?.({ type: "completed", approved: false });
-      return { approved: false, stages: stageResults };
+      opts.onEvent?.({ type: "completed", approved: false, cancelled: false });
+      return { approved: false, stages: stageResults, cancelled: false };
     }
 
     if (stage === "plan") approvedPlan = result.artifact;
     if (stage === "code") codeArtifact = result.artifact;
-    context = result.artifact;
   }
 
-  void context;
-  opts.onEvent?.({ type: "completed", approved: true });
-  return { approved: true, stages: stageResults };
+  opts.onEvent?.({ type: "completed", approved: true, cancelled: false });
+  return { approved: true, stages: stageResults, cancelled: false };
 }
 
 function buildStageInput(

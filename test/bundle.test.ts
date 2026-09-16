@@ -19,19 +19,32 @@ describe("extension bundle", () => {
     expect(fs.existsSync(bundlePath)).toBe(true);
   });
 
-  it("is self-contained — no `require('zod' | 'commander' | 'undici')`", () => {
+  it("is self-contained — no `require('zod' | 'commander')`", () => {
     const src = fs.readFileSync(bundlePath, "utf8");
     // The runtime deps must be inlined. The only `require` calls left
     // should be for node:* builtins and 'vscode' (declared external).
     const externalImports = [
       /require\(["']zod["']\)/,
       /require\(["']commander["']\)/,
-      /require\(["']undici["']\)/,
-      /require\(["']zod-to-json-schema["']\)/,
     ];
     for (const re of externalImports) {
       expect(src, `bundle still references ${re.source}`).not.toMatch(re);
     }
+  });
+
+  it("does not reference the dependencies that were removed", () => {
+    const src = fs.readFileSync(bundlePath, "utf8");
+    // zod 4 generates JSON Schema natively and Node 20 has global fetch, so
+    // neither package should reappear via a stray import.
+    for (const gone of ["zod-to-json-schema", "undici"]) {
+      expect(src, `bundle re-introduced ${gone}`).not.toContain(`require("${gone}")`);
+      expect(src, `bundle re-introduced ${gone}`).not.toContain(`require('${gone}')`);
+    }
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+    };
+    expect(Object.keys(pkg.dependencies ?? {})).not.toContain("undici");
+    expect(Object.keys(pkg.dependencies ?? {})).not.toContain("zod-to-json-schema");
   });
 
   it("loads under Node and exports activate()", () => {

@@ -1,9 +1,10 @@
 /**
  * Live-mode reviewer corpus harness.
  *
- * Skipped entirely unless RUN_LIVE_TESTS=1 (and, for non-validator cases,
- * GITHUB_TOKEN is also required). For each subdirectory under test/corpus,
- * the harness loads expected.json and either:
+ * Skipped entirely unless RUN_LIVE_TESTS=1 (and, for non-validator cases, an
+ * OpenAI-compatible endpoint is configured via CODECROSSCHECK_BASE_URL). For
+ * each subdirectory under test/corpus, the harness loads expected.json and
+ * either:
  *   - calls the corresponding reviewer agent against artifact.{ts,md,mjs,…}
  *     (or against {artifact, sandboxResult} for execute cases), OR
  *   - asserts that `openspec validate --strict` rejects the case for openspec
@@ -14,14 +15,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildReviewer } from "../src/agents.js";
-import { GithubModelsClient } from "../src/clients/githubModels.js";
+import { OpenAiCompatibleClient, BASE_URL_ENV, resolveBaseUrl } from "../src/clients/openaiCompatible.js";
 import type { Stage, Verdict } from "../src/schemas.js";
 
 const RUN = process.env.RUN_LIVE_TESTS === "1";
-const HAS_TOKEN = Boolean(process.env.GITHUB_TOKEN);
-const REVIEWER_MODEL = process.env.CCC_REVIEWER_MODEL ?? "anthropic/claude-opus-4.6";
+const HAS_ENDPOINT = Boolean(resolveBaseUrl());
+const REVIEWER_MODEL = process.env.CCC_REVIEWER_MODEL ?? "openai/gpt-5.3-codex";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const CORPUS_ROOT = path.resolve(HERE, "corpus");
+
+const SEVERITY_RANK: Record<string, number> = { low: 0, medium: 1, high: 2 };
 
 interface ExpectedIssue {
   severityAtLeast: "low" | "medium" | "high";
@@ -34,10 +38,6 @@ interface Expected {
   sandboxResult?: { stdout: string; stderr: string; exitCode: number };
   issues: ExpectedIssue[];
 }
-HERE
-const SEVERITY_RANK: Record<string, number> = { low: 0, medium: 1, high: 2 };
-
-const CORPUS_ROOT = path.resolve(__dirname, "corpus");
 
 function discoverCases(): { dir: string; name: string; expected: Expected }[] {
   if (!fs.existsSync(CORPUS_ROOT)) return [];
@@ -85,6 +85,18 @@ function assertVerdictMatches(verdict: Verdict, expected: Expected): void {
 
 const cases = discoverCases();
 
+// A permanently inert gate must not read as a passing one: say why it skipped.
+if (!RUN) {
+  const reason = HAS_ENDPOINT
+    ? "RUN_LIVE_TESTS is not 1"
+    : `RUN_LIVE_TESTS is not 1 and ${BASE_URL_ENV} is not set`;
+  console.warn(
+    `[corpus] Skipping ${cases.length} planted-flaw case(s): ${reason}. ` +
+      `This is the only gate on reviewer prompt behaviour — run it with ` +
+      `RUN_LIVE_TESTS=1 ${BASE_URL_ENV}=<api-root> npx vitest run test/corpus.test.ts`,
+  );
+}
+
 describe.skipIf(!RUN)("planted-flaw corpus", () => {
   for (const c of cases) {
     it(c.name, async () => {
@@ -92,10 +104,10 @@ describe.skipIf(!RUN)("planted-flaw corpus", () => {
         // Validator-only case — handled by a sibling test below.
         return;
       }
-      if (!HAS_TOKEN) {
-        throw new Error("GITHUB_TOKEN required for non-validator corpus cases");
+      if (!HAS_ENDPOINT) {
+        throw new Error(`${BASE_URL_ENV} required for non-validator corpus cases`);
       }
-      const client = new GithubModelsClient({ modelId: REVIEWER_MODEL });
+      const client = new OpenAiCompatibleClient({ modelId: REVIEWER_MODEL });
       const reviewer = buildReviewer(c.expected.stage, client);
       const artifact = loadArtifact(c.dir);
       const input =
