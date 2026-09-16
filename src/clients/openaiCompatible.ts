@@ -1,10 +1,16 @@
 import { z } from "zod";
 import {
   ReviewCancelledError,
+  budgetExceeded,
+  openToolBudget,
   throwIfAborted,
+  toolBudgetNudge,
+  toolsEnabled,
   type ChatClient,
   type ChatMessage,
+  type ChatRole,
   type SendOptions,
+  type ToolCall,
 } from "./ChatClient.js";
 import { ModelRefusalError, assertNotRefusal, assertNotOversized } from "./vscodeLm.js";
 import { explainFailure, satisfiesStrictMode, toProviderJsonSchema } from "./schemaText.js";
@@ -73,6 +79,18 @@ export class OpenAiCompatibleClient implements ChatClient {
   }
 
   private async post(body: unknown, signal: AbortSignal | undefined): Promise<string> {
+    const message = await this.postRaw(body, signal);
+    if (!message.content) {
+      throw new Error(`Response from ${this.endpoint} did not contain message content.`);
+    }
+    return message.content;
+  }
+
+  /**
+   * One request/response turn. Returns the assistant message verbatim, because
+   * a turn that only requests tools legitimately carries no content.
+   */
+  private async postRaw(body: unknown, signal: AbortSignal | undefined): Promise<ChatCompletionMessage> {
     throwIfAborted(signal, this.modelId);
     let res: Response;
     try {
@@ -89,12 +107,77 @@ export class OpenAiCompatibleClient implements ChatClient {
     if (!res.ok) {
       throw new Error(`Model request to ${this.endpoint} failed (${res.status}): ${await res.text()}`);
     }
-    const parsed = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    const content = parsed.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error(`Response from ${this.endpoint} did not contain message content.`);
+    const parsed = (await res.json()) as { choices?: { message?: ChatCompletionMessage }[] };
+    const message = parsed.choices?.[0]?.message;
+    if (!message) {
+      throw new Error(`Response from ${this.endpoint} did not contain a message.`);
     }
-    return content;
+    return message;
+  }
+
+  /**
+   * Issue one send, running a tool round trip first when tools are offered.
+   * `extra` carries per-call request fields such as `response_format`.
+   */
+  private async send(
+    messages: ChatMessage[],
+    extra: Record<string, unknown>,
+    opts: SendOptions | undefined,
+  ): Promise<string> {
+    const tools = opts?.tools;
+    const history: WireMessage[] = messages.map((m) => ({ role: m.role, content: m.content }));
+    if (!toolsEnabled(tools)) {
+      return this.post({ model: this.modelId, messages: history, ...extra }, opts?.signal);
+    }
+
+    const budget = openToolBudget(tools);
+    const declared = tools.specs.map((s) => ({
+      type: "function" as const,
+      function: { name: s.name, description: s.description, parameters: s.inputSchema },
+    }));
+
+    for (;;) {
+      const stop = budgetExceeded(budget);
+      if (stop) {
+        history.push({ role: "user", content: toolBudgetNudge(stop, budget) });
+        const cut = await this.post(
+          { model: this.modelId, messages: history, ...extra },
+          opts?.signal,
+        );
+        tools.onFinish?.({ stop, callCount: budget.calls });
+        return cut;
+      }
+
+      const message = await this.postRaw(
+        { model: this.modelId, messages: history, tools: declared, tool_choice: "auto", ...extra },
+        opts?.signal,
+      );
+      const requested = message.tool_calls ?? [];
+      if (requested.length === 0) {
+        if (!message.content) {
+          throw new Error(`Response from ${this.endpoint} did not contain message content.`);
+        }
+        tools.onFinish?.({ stop: "final", callCount: budget.calls });
+        return message.content;
+      }
+
+      // Every requested call must be answered or the next request is malformed,
+      // so a turn that overshoots the budget still runs; the check above ends
+      // the loop before another turn is granted.
+      history.push(message);
+      for (const raw of requested) {
+        throwIfAborted(opts?.signal, this.modelId);
+        budget.calls++;
+        const call: ToolCall = {
+          callId: raw.id,
+          name: raw.function.name,
+          input: decodeArguments(raw.function.arguments),
+        };
+        const result = await tools.invoke(call);
+        tools.onCall?.(call, result);
+        history.push({ role: "tool", tool_call_id: raw.id, content: result.content });
+      }
+    }
   }
 
   async sendStructured<T>(
@@ -115,8 +198,8 @@ export class OpenAiCompatibleClient implements ChatClient {
       },
     };
 
-    const attempt = (msgs: ChatMessage[]) =>
-      this.post({ model: this.modelId, messages: msgs, response_format }, opts?.signal);
+    const attempt = (msgs: ChatMessage[], useTools: boolean) =>
+      this.send(msgs, { response_format }, useTools ? opts : { ...opts, tools: undefined });
 
     const tryParse = (raw: string): T => {
       assertNotRefusal(raw, this.modelId);
@@ -126,7 +209,7 @@ export class OpenAiCompatibleClient implements ChatClient {
     let firstRaw = "";
     let firstError: unknown;
     try {
-      firstRaw = await attempt(messages);
+      firstRaw = await attempt(messages, true);
       return tryParse(firstRaw);
     } catch (err) {
       if (err instanceof ReviewCancelledError) throw err;
@@ -150,7 +233,9 @@ export class OpenAiCompatibleClient implements ChatClient {
       },
     ];
     try {
-      return tryParse(await attempt(retryMessages));
+      // No tools on the retry: the reminder is about JSON shape, not missing
+      // data, and re-running the loop would spend a second budget on it.
+      return tryParse(await attempt(retryMessages, false));
     } catch (err) {
       if (err instanceof ReviewCancelledError) throw err;
       if (err instanceof ModelRefusalError) throw err;
@@ -163,6 +248,31 @@ export class OpenAiCompatibleClient implements ChatClient {
   }
 
   async sendText(messages: ChatMessage[], opts?: SendOptions): Promise<string> {
-    return this.post({ model: this.modelId, messages }, opts?.signal);
+    return this.send(messages, {}, opts);
+  }
+}
+
+/** The subset of an OpenAI `chat.completion` assistant message this client reads. */
+interface ChatCompletionMessage {
+  role: "assistant";
+  content?: string | null;
+  tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>;
+}
+
+type WireMessage =
+  | { role: ChatRole; content: string }
+  | { role: "tool"; tool_call_id: string; content: string }
+  | ChatCompletionMessage;
+
+/**
+ * Providers send tool arguments as a JSON *string*. Malformed JSON is handed to
+ * the tool as-is rather than thrown, so the toolset can answer with an input
+ * error the model can correct on its next call.
+ */
+function decodeArguments(raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return raw;
   }
 }

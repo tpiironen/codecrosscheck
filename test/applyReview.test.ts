@@ -1,24 +1,19 @@
 import { describe, expect, it } from "vitest";
 import * as path from "node:path";
 import {
-  allocateBudget,
   applyEdit,
-  buildFileInventory,
-  composeApplyInput,
+  editsFrom,
   extractFixProposal,
   filterRejectedIssues,
   findLatestTranscript,
-  harvestPathsFromText,
   issueFingerprint,
-  normalizeReferencedPath,
-  parseDisagreements,
-  parseBlockedFindings,
-  parseReferencedFiles,
+  renderFixProposal,
   resolveSafePath,
   runBuildGate,
-  stripDiffMarkers,
+  truncateMiddle,
   type FsLike,
 } from "../src/applyReview.js";
+import type { FixProposal } from "../src/schemas.js";
 
 /**
  * Use a platform-correct workspace root so path.resolve produces matching keys
@@ -98,62 +93,107 @@ describe("applyReview.extractFixProposal", () => {
     expect(await extractFixProposal(p, fs)).toBeNull();
   });
 
-  it("returns last worker artifact and last reviewer verdict", async () => {
+  it("returns the last structured proposal and last reviewer verdict", async () => {
     const p = path.resolve("/t.jsonl");
+    const proposal = {
+      summary: "one fix",
+      fixes: [
+        {
+          findingId: 1,
+          status: "fixed",
+          explanation: "guarded the null case",
+          edits: [{ path: "src/a.ts", oldString: "x", newString: "y", why: "guard" }],
+        },
+      ],
+    };
     const lines = [
       `{"event":"review-branch-iter","iteration":1,"role":"reviewer","verdict":{"verdict":"revise","issues":[{"severity":"high","where":"a","why":"b","suggestion":"c"}]}}`,
-      `{"event":"review-branch-iter","iteration":2,"role":"worker","artifact":"## Fix\\n// path: src/a.ts\\n"}`,
+      JSON.stringify({
+        event: "review-branch-iter",
+        iteration: 2,
+        role: "worker",
+        artifact: "## Summary\n\none fix",
+        proposal,
+      }),
       `{"event":"review-branch-iter","iteration":2,"role":"reviewer","verdict":{"verdict":"approve","issues":[]}}`,
       `{"event":"review-branch-done"}`,
     ];
     const { fs } = makeFakeFs({ files: { [p]: lines.join("\n") + "\n" } });
     const result = await extractFixProposal(p, fs);
     expect(result?.iteration).toBe(2);
-    expect(result?.proposal).toContain("// path: src/a.ts");
+    expect(result?.proposal?.fixes[0]?.edits[0]?.path).toBe("src/a.ts");
     expect(result?.verdict?.verdict).toBe("approve");
+  });
+
+  it("returns a null proposal for a legacy Markdown-only transcript", async () => {
+    const p = path.resolve("/t.jsonl");
+    const lines = [
+      `{"event":"review-branch-iter","iteration":2,"role":"worker","artifact":"## Fix\\n// path: src/a.ts\\n"}`,
+      `{"event":"review-branch-done"}`,
+    ];
+    const { fs } = makeFakeFs({ files: { [p]: lines.join("\n") + "\n" } });
+    const result = await extractFixProposal(p, fs);
+    expect(result).not.toBeNull();
+    expect(result?.proposal).toBeNull();
+    expect(result?.artifact).toContain("// path: src/a.ts");
+  });
+
+  it("ignores a stored proposal that does not validate", async () => {
+    const p = path.resolve("/t.jsonl");
+    const line = JSON.stringify({
+      event: "review-branch-iter",
+      iteration: 1,
+      role: "worker",
+      artifact: "text",
+      proposal: { summary: "x", fixes: [{ findingId: 0, status: "nope" }] },
+    });
+    const { fs } = makeFakeFs({ files: { [p]: line + "\n" } });
+    expect((await extractFixProposal(p, fs))?.proposal).toBeNull();
   });
 });
 
-describe("applyReview.parseReferencedFiles", () => {
-  it("extracts unique paths from `// path:` directives", () => {
-    const md = [
-      "```ts",
-      "// path: src/a.ts",
-      "x",
-      "```",
-      "",
-      "```cs",
-      "// path: src/B.cs",
-      "y",
-      "```",
-      "",
-      "```ts",
-      "// path: src/a.ts",
-      "z",
-      "```",
-    ].join("\n");
-    expect(parseReferencedFiles(md).sort()).toEqual(["src/B.cs", "src/a.ts"]);
+describe("applyReview.editsFrom + renderFixProposal", () => {
+  const proposal: FixProposal = {
+    summary: "two findings",
+    fixes: [
+      {
+        findingId: 1,
+        status: "fixed",
+        explanation: "added the guard",
+        edits: [{ path: "src/a.ts", oldString: "old", newString: "new", why: "guard" }],
+      },
+      { findingId: 2, status: "disagree", explanation: "already handled at line 12", edits: [] },
+    ],
+  };
+
+  it("flattens edits in proposal order", () => {
+    expect(editsFrom(proposal).map((e) => e.path)).toEqual(["src/a.ts"]);
   });
 
-  it("strips trailing parenthetical annotations like (excerpt)", () => {
-    const md = [
-      "// path: src/a.cs (excerpt)",
-      "// path: src/b.cs (new file)",
-      "// path: src/c.cs",
-    ].join("\n");
-    expect(parseReferencedFiles(md).sort()).toEqual(["src/a.cs", "src/b.cs", "src/c.cs"]);
+  it("renders every fix, its status and its edits", () => {
+    const md = renderFixProposal(proposal, [
+      { severity: "high", where: "src/a.ts:1", why: "w", suggestion: "s" },
+      { severity: "low", where: "src/b.ts:2", why: "w", suggestion: "s" },
+    ]);
+    expect(md).toContain("two findings");
+    expect(md).toContain("Finding 1: src/a.ts:1 — Fixed");
+    expect(md).toContain("Finding 2: src/b.ts:2 — Disagree");
+    expect(md).toContain("already handled at line 12");
+    expect(md).toContain("`src/a.ts` — guard");
+  });
+});
+
+describe("applyReview.truncateMiddle", () => {
+  it("returns short text unchanged", () => {
+    expect(truncateMiddle("abc", 10)).toBe("abc");
   });
 
-  it("strips :line and :line-line suffixes", () => {
-    const md = [
-      "// path: src/a.cs:21",
-      "// path: src/b.cs:10-20",
-    ].join("\n");
-    expect(parseReferencedFiles(md).sort()).toEqual(["src/a.cs", "src/b.cs"]);
-  });
-
-  it("returns empty when no directives present", () => {
-    expect(parseReferencedFiles("nothing here")).toEqual([]);
+  it("keeps head and tail and marks the elision", () => {
+    const text = "A".repeat(200) + "TAIL";
+    const out = truncateMiddle(text, 120);
+    expect(out.length).toBeLessThanOrEqual(120);
+    expect(out).toContain("characters elided");
+    expect(out.endsWith("TAIL")).toBe(true);
   });
 });
 
@@ -270,274 +310,6 @@ describe("applyReview.applyEdit", () => {
     );
     expect(result.status).toBe("dry-run");
     expect(files.get(r("a.ts"))).toBe("old");
-  });
-});
-
-describe("applyReview.buildFileInventory", () => {
-  it("includes existing files and annotates missing ones for creation", async () => {
-    const { fs } = makeFakeFs({ files: { [r("a.ts")]: "AA" } });
-    const result = await buildFileInventory(WS, ["a.ts", "b.ts"], fs);
-    expect(result.inventory).toContain("AA");
-    expect(result.inventory).toContain("b.ts (does not exist yet");
-    expect(result.missing).toEqual([]);
-  });
-
-  it("reports unsafe paths in missing list", async () => {
-    const { fs } = makeFakeFs({});
-    const result = await buildFileInventory(WS, ["../oops"], fs);
-    expect(result.missing[0]).toContain("path outside workspace");
-  });
-
-  it("resolves repo-prefixed paths by stripping leading segments", async () => {
-    // Workspace contains src/a.ts; proposal supplies repo-prefixed path.
-    const { fs } = makeFakeFs({ files: { [r("src/a.ts")]: "BODY" } });
-    const result = await buildFileInventory(WS, ["repo/sub/src/a.ts"], fs);
-    expect(result.inventory).toContain("BODY");
-    expect(result.inventory).toContain("resolved path");
-    expect(result.resolved.get("repo/sub/src/a.ts")).toBe("src/a.ts");
-    expect(result.missing).toEqual([]);
-  });
-
-  it("reports a colon-bearing reference instead of offering to create it", async () => {
-    // Observed live: six such references produced six phantom creation notes,
-    // an empty `missing`, and zero edits.
-    const { fs } = makeFakeFs({ files: { [r("src/a.ts")]: "BODY" } });
-    const result = await buildFileInventory(WS, ["src/a.ts:someFunction"], fs);
-    expect(result.missing[0]).toContain("not a workspace-relative path");
-    expect(result.inventory).not.toContain("does not exist yet");
-  });
-});
-
-describe("applyReview.buildFileInventory — budget", () => {
-  // Sizes measured from the live run that exposed the defect (transcript
-  // 2026-09-15T12-19-06-304Z.jsonl): src/extension.ts busts the 60 000-char cap
-  // on its own, so the old prefix slice dropped src/applyReview.ts entirely and
-  // the triager returned `uncertain` for both findings.
-  const BIG = `HEAD${"a".repeat(63_430 - 8)}TAIL`;
-  const SMALL = `BSTART${"b".repeat(29_414 - 10)}BEND`;
-  const CAP = 60_000;
-
-  const twoFileFs = () =>
-    makeFakeFs({
-      files: { [r("src/extension.ts")]: BIG, [r("src/applyReview.ts")]: SMALL },
-    });
-
-  it("keeps every cited file when the first one alone exceeds the budget", async () => {
-    const { fs } = twoFileFs();
-    const result = await buildFileInventory(
-      WS,
-      ["src/extension.ts", "src/applyReview.ts"],
-      fs,
-      { budget: CAP },
-    );
-    expect(result.inventory).toContain("## File: src/extension.ts");
-    expect(result.inventory).toContain("## File: src/applyReview.ts");
-    // The second file is the one the old slice dropped: prove its body is here,
-    // not merely its header.
-    expect(result.inventory).toContain("BSTART");
-    expect(result.inventory).toContain("BEND");
-  });
-
-  it("labels the oversized file as partial and leaves the small one whole", async () => {
-    const { fs } = twoFileFs();
-    const result = await buildFileInventory(
-      WS,
-      ["src/extension.ts", "src/applyReview.ts"],
-      fs,
-      { budget: CAP },
-    );
-    expect(result.inventory).toMatch(/## File: src\/extension\.ts \(PARTIAL/);
-    expect(result.inventory).not.toMatch(/## File: src\/applyReview\.ts \(PARTIAL/);
-  });
-
-  it("keeps the head and the tail of a truncated file, marking the elision", async () => {
-    const { fs } = twoFileFs();
-    const result = await buildFileInventory(WS, ["src/extension.ts"], fs, { budget: CAP });
-    expect(result.inventory).toContain("HEAD");
-    expect(result.inventory).toContain("TAIL");
-    expect(result.inventory).toContain("characters elided");
-  });
-
-  it("stays within the budget", async () => {
-    const { fs } = twoFileFs();
-    const result = await buildFileInventory(
-      WS,
-      ["src/extension.ts", "src/applyReview.ts"],
-      fs,
-      { budget: CAP },
-    );
-    // Budget governs file contents; headers and fences are small and fixed.
-    expect(result.inventory.length).toBeLessThan(CAP + 1_000);
-  });
-
-  it("changes nothing when everything fits", async () => {
-    const { fs } = makeFakeFs({ files: { [r("a.ts")]: "AA", [r("b.ts")]: "BB" } });
-    const budgeted = await buildFileInventory(WS, ["a.ts", "b.ts"], fs, { budget: CAP });
-    const unbudgeted = await buildFileInventory(WS, ["a.ts", "b.ts"], fs);
-    expect(budgeted.inventory).toBe(unbudgeted.inventory);
-    expect(budgeted.inventory).not.toContain("PARTIAL");
-  });
-
-  it("gives an under-share file its full contents and spends the remainder elsewhere", () => {
-    // 10 + 90 within 60: the small file is not padded to 30, and the large one
-    // receives the 20 it did not use.
-    expect(allocateBudget([90, 10], 60)).toEqual([50, 10]);
-  });
-});
-
-describe("applyReview.normalizeReferencedPath — symbol suffixes", () => {
-  it("strips a trailing :symbol", () => {
-    expect(normalizeReferencedPath("src/extension.ts:workspaceEditHost")).toBe("src/extension.ts");
-    expect(normalizeReferencedPath("src/a.ts:Transcript")).toBe("src/a.ts");
-    expect(normalizeReferencedPath("a/b/c.cs:Foo.Bar")).toBe("a/b/c.cs");
-  });
-
-  it("strips a symbol written with call syntax", () => {
-    // Verbatim from the 2026-09-14 transcript's verdict `where` field; the
-    // first version of this fix could not match it.
-    expect(normalizeReferencedPath("src/extension.ts:workspaceEditHost().commit")).toBe(
-      "src/extension.ts",
-    );
-  });
-
-  it("still strips line and range suffixes", () => {
-    expect(normalizeReferencedPath("src/a.ts:21")).toBe("src/a.ts");
-    expect(normalizeReferencedPath("src/a.ts:21-30")).toBe("src/a.ts");
-  });
-
-  it("leaves a bare path untouched", () => {
-    expect(normalizeReferencedPath("src/a.ts")).toBe("src/a.ts");
-  });
-
-  it("leaves a drive-qualified path for the safety check to reject", () => {
-    // Stripping here would turn an absolute path into a plausible relative one.
-    expect(normalizeReferencedPath("C:/tmp/a.ts")).toBe("C:/tmp/a.ts");
-  });
-});
-
-describe("applyReview.composeApplyInput", () => {
-  it("includes proposal and inventory", () => {
-    const out = composeApplyInput("PROPOSAL", "INV");
-    expect(out).toContain("PROPOSAL");
-    expect(out).toContain("INV");
-  });
-});
-
-describe("applyReview.harvestPathsFromText", () => {
-  it("extracts paths with recognised extensions", () => {
-    const text = "Issue at Platform.Integration.Core/Function/BaseServiceBusFunction.cs:42 and src/foo.ts";
-    const paths = harvestPathsFromText(text).sort();
-    expect(paths).toEqual([
-      "Platform.Integration.Core/Function/BaseServiceBusFunction.cs",
-      "src/foo.ts",
-    ]);
-  });
-
-  it("normalises backslashes and strips :line suffixes", () => {
-    const paths = harvestPathsFromText("see Foo\\Bar\\Baz.cs:21-30");
-    expect(paths).toEqual(["Foo/Bar/Baz.cs"]);
-  });
-
-  it("ignores URLs and absolute Windows paths", () => {
-    const text = "https://example.com/foo.ts and C:/temp/bar.cs (skip both)";
-    expect(harvestPathsFromText(text)).toEqual([]);
-  });
-
-  it("returns empty for prose without paths", () => {
-    expect(harvestPathsFromText("just words, no files here")).toEqual([]);
-  });
-});
-
-describe("applyReview.parseDisagreements", () => {
-  it("extracts a single rebuttal from a fix proposal", () => {
-    const md = [
-      "## Fix proposal (round 2)",
-      "",
-      "### Issue 1: medium · src/foo.cs:10",
-      "**Original finding:** something is wrong",
-      "**Fix:** Disagree: the diff already handles this at line 12 via `EnsureValid`.",
-      "",
-      "**Justification:** see existing test `EnsureValid_HandlesNull`.",
-      "",
-      "### Issue 2: high · src/bar.cs:20",
-      "**Original finding:** missing null check",
-      "**Fix:** add `ArgumentNullException.ThrowIfNull(input)` at the top of `Process`.",
-      "",
-      "```cs",
-      "// path: src/bar.cs",
-      "...",
-      "```",
-    ].join("\n");
-    const ds = parseDisagreements(md);
-    expect(ds).toHaveLength(1);
-    expect(ds[0].id).toBe(1);
-    expect(ds[0].heading).toContain("Issue 1");
-    expect(ds[0].rebuttal).toContain("EnsureValid");
-  });
-
-  it("returns empty when no disagreements present", () => {
-    const md = "### Issue 1: low · a.cs:1\n**Fix:** add a comment\n";
-    expect(parseDisagreements(md)).toEqual([]);
-  });
-
-  it("matches case-insensitively and tolerates whitespace", () => {
-    const md = "### Issue 3: high · x.ts:5\n**Fix:**  disagree :  reviewer is wrong because Y\n";
-    const ds = parseDisagreements(md);
-    expect(ds).toHaveLength(1);
-    expect(ds[0].id).toBe(3);
-    expect(ds[0].rebuttal).toContain("reviewer is wrong");
-  });
-});
-
-describe("applyReview.parseBlockedFindings", () => {
-  it("flags 'Data I need' dodges as blocked", () => {
-    const md = [
-      "### Issue 1: medium · src/foo.cs:Execute",
-      "**Original finding:** Cannot evaluate without source.",
-      "**Fix:** I cannot produce the unified-diff hunk for `foo.cs` without the current source.",
-      "",
-      "**Data I need to produce the patch:**",
-      "- Full current contents of foo.cs",
-    ].join("\n");
-    const blocked = parseBlockedFindings(md);
-    expect(blocked).toHaveLength(1);
-    expect(blocked[0].id).toBe(1);
-    expect(blocked[0].reason).toMatch(/source files|refuses|sketch|pending source/);
-  });
-
-  it("flags '(sketch \u2014 pending current source)' code blocks", () => {
-    const md = [
-      "### Issue 2: high · src/bar.cs:10",
-      "**Fix:** Intended shape:",
-      "",
-      "```cs",
-      "// path: src/bar.cs (sketch \u2014 pending current source)",
-      "public class Bar {}",
-      "```",
-    ].join("\n");
-    expect(parseBlockedFindings(md)).toHaveLength(1);
-  });
-
-  it("does not double-report findings already in parseDisagreements", () => {
-    const md = [
-      "### Issue 1: low · src/x.cs:1",
-      "**Fix:** Disagree: I cannot produce a patch because the diff already handles this.",
-    ].join("\n");
-    expect(parseDisagreements(md)).toHaveLength(1);
-    expect(parseBlockedFindings(md)).toEqual([]);
-  });
-
-  it("returns empty when the proposal is fully concrete", () => {
-    const md = [
-      "### Issue 1: high · src/y.cs:5",
-      "**Fix:** Replace the call site:",
-      "",
-      "```cs",
-      "// path: src/y.cs",
-      "x.Foo();",
-      "```",
-    ].join("\n");
-    expect(parseBlockedFindings(md)).toEqual([]);
   });
 });
 
@@ -699,75 +471,54 @@ describe("applyReview.runBuildGate", () => {
   });
 });
 
-describe("applyReview.stripDiffMarkers", () => {
-  it("strips '-' and ' ' markers in old mode", () => {
-    const diff = ["-removed", " context", "+added"].join("\n");
-    expect(stripDiffMarkers(diff, "old")).toBe("removed\ncontext");
-  });
-
-  it("strips '+' and ' ' markers in new mode", () => {
-    const diff = ["-removed", " context", "+added"].join("\n");
-    expect(stripDiffMarkers(diff, "new")).toBe("context\nadded");
-  });
-
-  it("returns input unchanged when not diff-shaped", () => {
-    const code = "function foo() {\n  return 1;\n}";
-    expect(stripDiffMarkers(code, "old")).toBe(code);
-  });
-
-  it("returns input unchanged when no +/- markers present", () => {
-    const code = " line1\n line2";
-    expect(stripDiffMarkers(code, "old")).toBe(code);
-  });
-});
-
-describe("applyReview.applyEdit diff-marker safety net", () => {
-  it("recovers when worker pasted unified-diff lines into oldString/newString", async () => {
+describe("applyReview.applyEdit — no repair guessing", () => {
+  // The Markdown round trip that corrupted these strings is gone: the worker
+  // reads the file through the toolset and returns the edit as structured
+  // data. Guessing at a near-miss would now hide a genuinely wrong edit.
+  it("skips an oldString carrying unified-diff markers", async () => {
     const fileBody = [
       "    ModelAction ResolveAction(TIn input) => ModelAction.Upsert;",
       "    void Other();",
     ].join("\n");
     const { fs, files } = makeFakeFs({ files: { [r("a.cs")]: fileBody } });
-
-    // Simulate a worker that pasted diff markers verbatim (the bug we hit).
-    const oldStr = ["-    ModelAction ResolveAction(TIn input) => ModelAction.Upsert;", " ", "+    ModelAction? ResolveAction(TIn input) => null;"].join("\n");
-    const newStr = oldStr; // both fields contain the same diff block
+    const oldStr = [
+      "-    ModelAction ResolveAction(TIn input) => ModelAction.Upsert;",
+      " ",
+      "+    ModelAction? ResolveAction(TIn input) => null;",
+    ].join("\n");
 
     const result = await applyEdit(
       WS,
-      { path: "a.cs", oldString: oldStr, newString: newStr, why: "diff-style" },
+      { path: "a.cs", oldString: oldStr, newString: oldStr, why: "diff-style" },
       fs,
       { dryRun: false },
     );
-    expect(result.status).toBe("applied");
-    expect(files.get(r("a.cs"))).toContain("ModelAction? ResolveAction(TIn input) => null;");
-    expect(files.get(r("a.cs"))).not.toContain("=> ModelAction.Upsert");
+    expect(result.status).toBe("skipped");
+    expect(result.reason).toBe("oldString not found");
+    expect(files.get(r("a.cs"))).toBe(fileBody);
   });
 
-  it("recovers from CRLF drift between worker output and file", async () => {
-    const fileBody = "alpha\nbeta\ngamma";
-    const { fs, files } = makeFakeFs({ files: { [r("a.cs")]: fileBody } });
+  it("skips on CRLF drift rather than silently rewriting line endings", async () => {
+    const { fs, files } = makeFakeFs({ files: { [r("a.cs")]: "alpha\nbeta\ngamma" } });
     const result = await applyEdit(
       WS,
       { path: "a.cs", oldString: "alpha\r\nbeta\r\ngamma", newString: "ALPHA\r\nBETA\r\ngamma", why: "crlf" },
       fs,
       { dryRun: false },
     );
-    expect(result.status).toBe("applied");
-    expect(files.get(r("a.cs"))).toBe("ALPHA\nBETA\ngamma");
+    expect(result.status).toBe("skipped");
+    expect(files.get(r("a.cs"))).toBe("alpha\nbeta\ngamma");
   });
 
-  it("recovers when file is CRLF but worker emitted LF (common on Windows repos)", async () => {
-    const fileBody = "alpha\r\nbeta\r\ngamma\r\n";
-    const { fs, files } = makeFakeFs({ files: { [r("a.cs")]: fileBody } });
+  it("applies verbatim CRLF content against a CRLF file", async () => {
+    const { fs, files } = makeFakeFs({ files: { [r("a.cs")]: "alpha\r\nbeta\r\ngamma\r\n" } });
     const result = await applyEdit(
       WS,
-      { path: "a.cs", oldString: "alpha\nbeta\ngamma", newString: "ALPHA\nBETA\ngamma", why: "lf-on-crlf" },
+      { path: "a.cs", oldString: "alpha\r\nbeta\r\n", newString: "ALPHA\r\nBETA\r\n", why: "verbatim" },
       fs,
       { dryRun: false },
     );
     expect(result.status).toBe("applied");
-    // Replacement should have preserved CRLF inside the patched region.
     expect(files.get(r("a.cs"))).toBe("ALPHA\r\nBETA\r\ngamma\r\n");
   });
 });

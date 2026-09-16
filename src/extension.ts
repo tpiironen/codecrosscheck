@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { buildReviewer, buildTriager, buildWorkerWithPrompt, loadPromptByName, reviewerOwaspEdition } from "./agents.js";
+import { buildFixer, buildReviewer, buildTriager, reviewerOwaspEdition } from "./agents.js";
 import { readConfig, resolveClients, stripVendor, type ResolvedConfig } from "./config.js";
 import { runPipeline, type PipelineEvent } from "./pipeline.js";
 import { loadChange, renderChangeFrame } from "./openspec/loader.js";
@@ -7,31 +7,30 @@ import { validateStrict } from "./openspec/validate.js";
 import { getChangeDiff, scopePatchToPaths } from "./openspec/diff.js";
 import { createTranscriptWriter, type TranscriptWriter as Transcript } from "./transcript.js";
 import { selectConfirmedFindings } from "./triage.js";
-import type { Issue, Stage, Triage, Verdict } from "./schemas.js";
+import type { FixProposal, Issue, Stage, Triage, Verdict } from "./schemas.js";
 import type { LoopOptions } from "./loop.js";
-import { ReviewCancelledError } from "./clients/ChatClient.js";
+import { ReviewCancelledError, type ToolContext } from "./clients/ChatClient.js";
+import {
+  createWorkspaceToolset,
+  nodeToolFs,
+  repositoryIgnorePolicy,
+  type WorkspaceToolset,
+} from "./tools/workspaceTools.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fsp from "node:fs/promises";
 import {
   applyEdits,
-  buildFileInventory,
-  composeApplyInput,
-  deriveEdits,
+  editsFrom,
   extractFixProposal,
   filterRejectedIssues,
   findLatestTranscript,
-  harvestPathsFromText,
   issueFingerprint,
-  parseBlockedFindings,
-  parseDisagreements,
-  parseReferencedFiles,
   pruneTranscripts,
+  renderFixProposal,
   runBuildGate,
   type ApplyOutcome,
-  type BlockedFinding,
-  type Disagreement,
   type EditHost,
   type FsLike,
 } from "./applyReview.js";
@@ -152,7 +151,7 @@ async function routeRequest(
     return handleReviewBranch(request, stream, cfg, signal);
   }
   if (cmd === "apply-review") {
-    return handleApplyReview(request, stream, cfg, signal);
+    return handleApplyReview(stream, cfg);
   }
 
   const stages = SLASH_TO_STAGE[cmd] ?? (["plan", "code", "execute"] as Stage[]);
@@ -430,9 +429,14 @@ async function handleReviewBranch(
   }
 
   const { worker: workerClient, reviewer: reviewerClient } = resolveClients(cfg, request.model);
-  const fixer = buildWorkerWithPrompt(loadPromptByName("review_branch_fixer"), workerClient);
+  const fixer = buildFixer(workerClient);
   const triager = buildTriager(workerClient);
   const reviewer = buildReviewer("code", reviewerClient);
+  const toolset = createWorkspaceToolset({
+    root: cwd,
+    fs: nodeToolFs(),
+    ignore: repositoryIgnorePolicy(cwd),
+  });
 
   const userTask = request.prompt.trim();
   // Recognise user adjudication directive that overrides any worker rebuttals.
@@ -471,19 +475,23 @@ async function handleReviewBranch(
 
   const startedAt = Date.now();
   let verdict: Verdict | undefined;
-  let lastFixProposal = "";
+  let lastProposal: FixProposal | undefined;
+  let lastArtifact = "";
   let iter = 0;
   let outcome: ReviewOutcome = "exhausted";
 
-  // Findings the worker has already rebutted with `**Fix:** Disagree: …`,
-  // fingerprinted so a restatement in a later round can be dropped. Without
-  // this the reviewer keeps re-flagging, the worker keeps rebutting, and the
-  // loop burns iterations on a question only the user can settle.
+  // Findings the worker has already rebutted with `disagree`, fingerprinted so
+  // a restatement in a later round can be dropped. Without this the reviewer
+  // keeps re-flagging, the worker keeps rebutting, and the loop burns
+  // iterations on a question only the user can settle.
   const rejectedFingerprints = new Set<string>();
-  const cumulativeDisagreements: Array<Disagreement & { fingerprint: string }> = [];
+  const cumulativeDisagreements: Array<{ id: number; heading: string; rebuttal: string }> = [];
 
-  const inventoryFs: FsLike = nodeFsLike();
-  const fileContextCap = 60_000; // total chars budget for repo file context
+  const toolsFor = (agent: string): ToolContext =>
+    makeToolContext(toolset, stream, transcript, agent, {
+      maxCalls: cfg.toolMaxCalls,
+      deadlineMs: cfg.toolDeadlineMs,
+    });
 
   // ---- Iteration 1: reviewer reads the raw diff. ----
   iter = 1;
@@ -521,38 +529,6 @@ async function handleReviewBranch(
     }
     iter++;
     stream.markdown(`---\n\n### Iteration ${iter} / ${maxIters} \u2014 worker proposes fixes\n\n`);
-    stream.progress(`Worker \`${fixer.modelId}\` drafting fixes for ${verdict.issues.length} issue(s)\u2026`);
-
-    // Harvest workspace-relative paths the worker is likely to need, read them,
-    // and inject as context so the fixer can produce concrete patches.
-    const harvested = new Set<string>();
-    for (const it of verdict.issues) {
-      for (const p of harvestPathsFromText(it.where)) harvested.add(p);
-      for (const p of harvestPathsFromText(it.suggestion)) harvested.add(p);
-    }
-    if (lastFixProposal) {
-      for (const p of harvestPathsFromText(lastFixProposal)) harvested.add(p);
-      for (const p of parseReferencedFiles(lastFixProposal)) harvested.add(p);
-    }
-    let fileContextBlock = "";
-    if (harvested.size > 0) {
-      stream.progress(`Reading ${harvested.size} referenced file(s) for fixer context\u2026`);
-      const { inventory, missing } = await buildFileInventory(cwd, Array.from(harvested), inventoryFs, {
-        budget: fileContextCap,
-      });
-      if (inventory.length > 0) {
-        fileContextBlock = [
-          "# Repository file context",
-          "",
-          "_Files cited by the reviewer findings or by your prior proposal. Use these as the canonical current source when producing concrete patches; do NOT request them as data._",
-          "",
-          inventory,
-        ].join("\n");
-      }
-      if (missing.length > 0) {
-        fileContextBlock += `\n\n_Unreadable: ${missing.map((m) => `\`${m}\``).join(", ")}_\n`;
-      }
-    }
 
     // Adjudicate before drafting. A worker told to fix N issues will fix N
     // issues, including the ones that are wrong.
@@ -561,10 +537,10 @@ async function handleReviewBranch(
       stream.progress(`Worker \`${triager.modelId}\` checking whether the findings are real\u2026`);
       let triage: Triage | undefined;
       try {
-        triage = await triager.triage(
-          buildTriageInput({ verdict, fileContextBlock, diffDescription }),
-          { signal },
-        );
+        triage = await triager.triage(buildTriageInput({ verdict, diffDescription }), {
+          signal,
+          tools: toolsFor("triager"),
+        });
       } catch (err) {
         if (err instanceof ReviewCancelledError) {
           outcome = "cancelled";
@@ -587,17 +563,17 @@ async function handleReviewBranch(
       }
     }
 
+    stream.progress(`Worker \`${fixer.modelId}\` drafting fixes for ${fixableVerdict.issues.length} issue(s)\u2026`);
     const fixerInput = buildFixerInput({
       taskHeader,
       diffBlock,
       currentVerdict: fixableVerdict,
-      priorFixProposal: lastFixProposal,
+      priorFixProposal: lastArtifact,
       round: iter - 1,
-      fileContextBlock,
       forceFixAll,
     });
     try {
-      lastFixProposal = await fixer.produce(fixerInput, { signal });
+      lastProposal = await fixer.propose(fixerInput, { signal, tools: toolsFor("fixer") });
     } catch (err) {
       if (err instanceof ReviewCancelledError) {
         outcome = "cancelled";
@@ -606,20 +582,33 @@ async function handleReviewBranch(
       stream.markdown(`\u274c Worker call failed: \`${(err as Error).message}\`\n\n`);
       break;
     }
-    transcript.write({ event: "review-branch-iter", iteration: iter, role: "worker", workerId: fixer.modelId, artifact: lastFixProposal });
-    renderWorkerArtifact(stream, lastFixProposal);
+    lastArtifact = renderFixProposal(lastProposal, fixableVerdict.issues);
+    transcript.write({
+      event: "review-branch-iter",
+      iteration: iter,
+      role: "worker",
+      workerId: fixer.modelId,
+      artifact: lastArtifact,
+      proposal: lastProposal,
+    });
+    renderProposal(stream, lastProposal, fixableVerdict.issues);
 
     // Capture this round's rebuttals against the verdict that was fed in, so
     // the next reviewer pass cannot send the same finding back through the
     // loop. `force-fix-all` opts out.
     if (!forceFixAll) {
-      for (const d of parseDisagreements(lastFixProposal)) {
-        const issue = verdict.issues[d.id - 1];
+      for (const fix of lastProposal.fixes) {
+        if (fix.status !== "disagree") continue;
+        const issue = fixableVerdict.issues[fix.findingId - 1];
         if (!issue) continue;
         const fp = issueFingerprint(issue);
         if (!rejectedFingerprints.has(fp)) {
           rejectedFingerprints.add(fp);
-          cumulativeDisagreements.push({ ...d, fingerprint: fp });
+          cumulativeDisagreements.push({
+            id: fix.findingId,
+            heading: issue.where,
+            rebuttal: fix.explanation,
+          });
         }
       }
     }
@@ -627,15 +616,15 @@ async function handleReviewBranch(
     stream.markdown(`#### Reviewer re-judging\n\n`);
     stream.progress(`Reviewer \`${reviewer.modelId}\` checking fixes\u2026`);
     // The reviewer is judging a proposal, not re-reading the branch: send only
-    // the files its own findings cited.
-    const scoped = scopePatchToPaths(diff, Array.from(harvested));
+    // the files the proposal's own edits touch.
+    const scoped = scopePatchToPaths(diff, Array.from(new Set(editsFrom(lastProposal).map((e) => e.path))));
     const reviewArtifact = buildRereviewInput({
       taskHeader,
       diffDescription,
       diffBody: `\`\`\`diff\n${scoped.patch}\n\`\`\``,
       omittedFiles: scoped.omitted,
       priorVerdict: verdict,
-      fixProposal: lastFixProposal,
+      fixProposal: lastArtifact,
     });
     try {
       verdict = await reviewer.judge(reviewArtifact, { signal });
@@ -718,9 +707,10 @@ async function handleReviewBranch(
     );
   }
 
-  if (lastFixProposal) {
+  if (lastProposal) {
+    const editCount = editsFrom(lastProposal).length;
     stream.markdown(
-      `**Next:** apply the patches in the fix proposal below. ` +
+      `**Next:** apply the ${editCount} edit(s) in the fix proposal below. ` +
         (outcome === "approved"
           ? `The reviewer is satisfied; once applied, run \`git diff\` and commit.\n\n`
           : outcome === "defended"
@@ -728,8 +718,8 @@ async function handleReviewBranch(
             : `Then re-run \`/review-branch\` to address any residual findings, raise \`codecrosscheck.maxIters\` for more rounds, or scope the prompt down.\n\n`),
     );
     stream.button({ command: APPLY_COMMAND, title: "Apply this fix proposal", arguments: [] });
-    stream.markdown(`### Final fix proposal\n\n<details${outcome === "approved" ? " open" : ""}><summary>${lastFixProposal.length} chars</summary>\n\n`);
-    stream.markdown(`\`\`\`markdown\n${lastFixProposal}\n\`\`\`\n\n</details>\n\n`);
+    stream.markdown(`### Final fix proposal\n\n<details${outcome === "approved" ? " open" : ""}><summary>${editCount} edit(s)</summary>\n\n`);
+    stream.markdown(`\`\`\`markdown\n${lastArtifact}\n\`\`\`\n\n</details>\n\n`);
   } else if (outcome !== "approved" && outcome !== "defended") {
     stream.markdown(
       `**Next steps:** raise \`codecrosscheck.maxIters\`, scope the prompt, or address the findings manually.\n\n`,
@@ -756,21 +746,19 @@ async function handleReviewBranch(
     );
   }
 
-  // Surface dodge patterns (sketches, "Data I need", "I cannot produce") that
-  // look like fixes but produce nothing applicable.
-  const blocked: BlockedFinding[] = lastFixProposal ? parseBlockedFindings(lastFixProposal) : [];
-  if (blocked.length > 0) {
-    stream.markdown(`### \ud83d\udeab ${blocked.length} finding(s) the worker did not produce a real patch for\n\n`);
+  // Surface findings the worker itself marked as neither fixed nor rebutted.
+  const unaddressed = lastProposal?.fixes.filter((f) => f.status === "unaddressed") ?? [];
+  if (unaddressed.length > 0) {
+    stream.markdown(`### \ud83d\udeab ${unaddressed.length} finding(s) the worker could not produce a patch for\n\n`);
     stream.markdown(
-      "For these issues the worker emitted prose, sketches, or requests for more source files instead of a concrete patch. " +
-        "`/apply-review` will produce zero edits for them.\n\n",
+      "The worker marked these `unaddressed`: it could neither fix nor rebut them. " +
+        "No edits will be applied for them.\n\n",
     );
-    for (const b of blocked) {
-      stream.markdown(`- **${b.id}. ${b.heading}** \u2014 ${b.reason}\n`);
+    for (const f of unaddressed) {
+      stream.markdown(`- **Finding ${f.findingId}** \u2014 ${escapeHtml(f.explanation)}\n`);
     }
     stream.markdown(
-      "\n**Likely cause:** the cited file lives outside the current workspace root, so the file-context injector could not read it. " +
-        "Open the parent multi-project folder as the workspace and re-run `/review-branch`, or re-run with `force-fix-all` to require concrete fixes.\n\n",
+      "\nRe-run with `force-fix-all` to require a concrete fix, or address them by hand.\n\n",
     );
   }
 
@@ -787,7 +775,7 @@ async function handleReviewBranch(
     metadata: {
       outcome,
       command: "review-branch",
-      hasFixProposal: lastFixProposal.length > 0,
+      hasFixProposal: editsFrom(lastProposal ?? { summary: "", fixes: [] }).length > 0,
       iterations: iter,
     },
   };
@@ -824,15 +812,13 @@ async function tokenPreflight(
 }
 
 /**
- * /apply-review handler: read the latest review transcript, derive concrete
- * file edits from the worker's last fix proposal, and apply them. The handler
- * is the apply step of a /review-branch -> /apply-review -> git diff loop.
+ * /apply-review handler: read the latest review transcript and apply the edits
+ * the worker already produced. It is the user-confirmation checkpoint of the
+ * /review-branch -> /apply-review -> git diff loop, and calls no model.
  */
 async function handleApplyReview(
-  request: vscode.ChatRequest,
   stream: vscode.ChatResponseStream,
   cfg: ResolvedConfig,
-  signal: AbortSignal,
 ): Promise<vscode.ChatResult> {
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!ws) {
@@ -850,8 +836,8 @@ async function handleApplyReview(
     );
     return failure("No review transcript found.", "apply-review");
   }
-  const fixProposal = await extractFixProposal(transcriptPath, nodeFs);
-  if (!fixProposal) {
+  const stored = await extractFixProposal(transcriptPath, nodeFs);
+  if (!stored) {
     stream.markdown(
       `\u274c Transcript [${path.basename(transcriptPath)}](${vscode.Uri.file(transcriptPath).toString()}) ` +
         "has no worker fix proposal to apply. Re-run `/review-branch`.\n",
@@ -859,76 +845,43 @@ async function handleApplyReview(
     return failure("Transcript has no worker fix proposal.", "apply-review");
   }
 
-  const referenced = parseReferencedFiles(fixProposal.proposal);
+  // Transcripts written before structured proposals carry only Markdown. There
+  // is no longer a model call that turns prose into edits, so say so plainly
+  // rather than applying nothing and calling it success.
+  if (!stored.proposal) {
+    stream.markdown(
+      `\u26a0\ufe0f [${path.basename(transcriptPath)}](${vscode.Uri.file(transcriptPath).toString()}) ` +
+        `predates structured fix proposals, so it carries prose rather than edits. ` +
+        `Re-run \`/review-branch\` to produce an applicable proposal. The stored proposal is below.\n\n`,
+    );
+    stream.markdown(`<details><summary>${stored.artifact.length} chars</summary>\n\n\`\`\`markdown\n${stored.artifact}\n\`\`\`\n\n</details>\n\n`);
+    return failure("Transcript predates structured fix proposals.", "apply-review");
+  }
+
+  const edits = editsFrom(stored.proposal);
+  const unaddressed = stored.proposal.fixes.filter((f) => f.status !== "fixed");
   stream.markdown(
     `\ud83d\udcc4 Applying fix proposal from [${path.basename(transcriptPath)}](${vscode.Uri.file(transcriptPath).toString()}) ` +
-      `(iter ${fixProposal.iteration}, ${referenced.length} file(s) referenced).\n\n`,
+      `(iter ${stored.iteration}, ${edits.length} edit(s)).\n\n`,
   );
-
-  const { inventory, missing } = await buildFileInventory(ws, referenced, nodeFs);
-  if (missing.length > 0) {
+  if (unaddressed.length > 0) {
     stream.markdown(
-      `\u26a0\ufe0f Skipped ${missing.length} unreadable path(s): ${missing.map((m) => `\`${m}\``).join(", ")}.\n\n`,
-    );
-  }
-  if (referenced.length > 0 && !inventory.includes("```")) {
-    stream.markdown(
-      `\u26a0\ufe0f None of the ${referenced.length} referenced path(s) yielded any source. ` +
-        `The worker has nothing to anchor edits against and will likely return none. ` +
-        `Check the path directives in the fix proposal.\n\n`,
+      `_${unaddressed.length} finding(s) carry no edits (${unaddressed.map((f) => `${f.findingId}: ${f.status}`).join(", ")})._\n\n`,
     );
   }
 
-  const { worker: workerClient } = resolveClients(cfg, request.model);
-
-  const userExtra = request.prompt.trim();
-  const attached = await readAttachments(request, stream);
-  const composed = composeApplyInput(
-    [fixProposal.proposal, userExtra ? `# Additional instructions from user\n\n${userExtra}` : "", attached]
-      .filter(Boolean)
-      .join("\n\n"),
-    inventory,
-  );
-
-  let systemPrompt: string;
-  try {
-    systemPrompt = loadPromptByName("apply_review_worker");
-  } catch (err) {
-    const message = `Could not load apply prompt: ${(err as Error).message}`;
-    stream.markdown(`\u274c ${message}\n`);
-    return failure(message, "apply-review");
-  }
-
-  stream.progress(`Worker \`${workerClient.modelId}\` deriving edits\u2026`);
-  let edits;
-  try {
-    edits = await deriveEdits(workerClient, systemPrompt, composed, { signal });
-  } catch (err) {
-    if (err instanceof ReviewCancelledError) throw err;
-    const message = `Worker failed to produce structured edits: ${(err as Error).message}`;
-    stream.markdown(`\u274c ${message}\n`);
-    return failure(message, "apply-review");
-  }
-
-  // Persist a debug artifact next to the source transcript so failures are
-  // diagnosable after the fact (the Chat session itself doesn't show the
-  // worker's raw oldString/newString).
   const applyLogPath = transcriptPath.replace(/\.jsonl$/i, "-apply.json");
 
   if (edits.length === 0) {
-    stream.markdown("\u26a0\ufe0f Worker returned zero edits. Nothing to apply.\n");
+    stream.markdown("\u26a0\ufe0f The proposal contains zero edits. Nothing to apply.\n");
     await nodeFs.writeFile(
       applyLogPath,
-      JSON.stringify(
-        { transcriptPath, iteration: fixProposal.iteration, referenced, missing, edits, outcomes: [] },
-        null,
-        2,
-      ),
+      JSON.stringify({ transcriptPath, iteration: stored.iteration, edits, outcomes: [] }, null, 2),
     );
     stream.markdown(`\ud83d\udcc4 Debug log: [${path.basename(applyLogPath)}](${vscode.Uri.file(applyLogPath).toString()})\n`);
     return { metadata: { outcome: "exhausted", command: "apply-review", hasFixProposal: true, iterations: 0 } };
   }
-  stream.markdown(`Worker proposed **${edits.length}** edit(s)${cfg.dryRun ? " (dry-run mode)" : ""}.\n\n`);
+  stream.markdown(`Applying **${edits.length}** edit(s)${cfg.dryRun ? " (dry-run mode)" : ""}.\n\n`);
 
   const outcomes: ApplyOutcome[] = await applyEdits(ws, edits, nodeFs, {
     dryRun: cfg.dryRun,
@@ -938,11 +891,7 @@ async function handleApplyReview(
 
   await nodeFs.writeFile(
     applyLogPath,
-    JSON.stringify(
-      { transcriptPath, iteration: fixProposal.iteration, referenced, missing, edits, outcomes },
-      null,
-      2,
-    ),
+    JSON.stringify({ transcriptPath, iteration: stored.iteration, edits, outcomes }, null, 2),
   );
 
   const appliedCount = outcomes.filter((o) => o.status === "applied").length;
@@ -1070,7 +1019,6 @@ function buildFixerInput(args: {
   currentVerdict: Verdict;
   priorFixProposal: string;
   round: number;
-  fileContextBlock?: string;
   forceFixAll?: boolean;
 }): string {
   const issues = args.currentVerdict.issues
@@ -1082,15 +1030,13 @@ function buildFixerInput(args: {
   const priorBlock = args.priorFixProposal
     ? `\n\n# Your prior fix proposal (reviewer was not satisfied)\n\n${args.priorFixProposal}`
     : "";
-  const ctxBlock = args.fileContextBlock ? `\n\n${args.fileContextBlock}` : "";
   const overrideBlock = args.forceFixAll
-    ? "\n\n# User override\n\nThe user has explicitly overridden any rebuttals. You MUST produce a concrete fix for every reviewer finding above. Do NOT use `**Fix:** Disagree:` in this proposal."
+    ? "\n\n# User override\n\nThe user has explicitly overridden any rebuttals. You MUST produce a concrete fix for every reviewer finding above. `disagree` is not available in this round."
     : "";
   return [
     args.taskHeader,
     "",
     args.diffBlock,
-    ctxBlock,
     "",
     "# Reviewer findings to address",
     issues,
@@ -1101,11 +1047,7 @@ function buildFixerInput(args: {
   ].join("\n");
 }
 
-function buildTriageInput(args: {
-  verdict: Verdict;
-  fileContextBlock: string;
-  diffDescription: string;
-}): string {
+function buildTriageInput(args: { verdict: Verdict; diffDescription: string }): string {
   const findings = args.verdict.issues
     .map(
       (it, idx) =>
@@ -1117,11 +1059,9 @@ function buildTriageInput(args: {
     "",
     `A reviewer produced these findings against ${args.diffDescription}.`,
     "Judge each one. You are judging the CLAIM, not the proposed remedy.",
+    "Read whatever source you need through the tools before deciding.",
     "",
     findings,
-    "",
-    args.fileContextBlock ||
-      "_No repository file context was available. Any finding that needs source you were not given is `uncertain`._",
   ].join("\n");
 }
 
@@ -1222,11 +1162,75 @@ function renderVerdict(stream: vscode.ChatResponseStream, v: Verdict): void {
   }
 }
 
-function renderWorkerArtifact(stream: vscode.ChatResponseStream, artifact: string): void {
-  const max = 4000;
-  const truncated = artifact.length > max;
-  const shown = truncated ? artifact.slice(0, max) + "\n\n... (truncated, see transcript) ..." : artifact;
-  stream.markdown(`<details><summary>Fix proposal (${artifact.length} chars)</summary>\n\n${shown}\n\n</details>\n\n`);
+function renderProposal(stream: vscode.ChatResponseStream, proposal: FixProposal, issues: Issue[]): void {
+  const icons = { fixed: "\u2705", disagree: "\ud83e\udd1d", unaddressed: "\ud83d\udeab" } as const;
+  const counts = { fixed: 0, disagree: 0, unaddressed: 0 };
+  for (const fix of proposal.fixes) counts[fix.status]++;
+  stream.markdown(
+    `${counts.fixed} fixed \u00b7 ${counts.disagree} disagreed \u00b7 ${counts.unaddressed} unaddressed\n\n` +
+      `> ${escapeHtml(proposal.summary).replace(/\n/g, "\n> ")}\n\n`,
+  );
+  for (const fix of proposal.fixes) {
+    const where = issues[fix.findingId - 1]?.where ?? `finding ${fix.findingId}`;
+    stream.markdown(
+      `${icons[fix.status]} **${fix.findingId}. ${fix.status}** \u2014 \`${escapeHtml(where)}\`\n\n` +
+        `> ${escapeHtml(fix.explanation).replace(/\n/g, "\n> ")}\n\n`,
+    );
+    for (const edit of fix.edits) {
+      stream.markdown(`  - \`${edit.path}\` \u2014 ${escapeHtml(edit.why)}\n`);
+    }
+    if (fix.edits.length > 0) stream.markdown("\n");
+  }
+}
+
+/**
+ * Grant an agent the workspace toolset for one turn, streaming each call to the
+ * user and recording it in the transcript. A tool call the user cannot see is a
+ * file read they did not authorise.
+ */
+function makeToolContext(
+  toolset: WorkspaceToolset,
+  stream: vscode.ChatResponseStream,
+  transcript: Transcript,
+  agent: string,
+  limits: { maxCalls: number; deadlineMs: number },
+): ToolContext {
+  return {
+    specs: toolset.specs,
+    maxCalls: limits.maxCalls,
+    deadlineMs: limits.deadlineMs,
+    invoke: (call) => toolset.invoke(call),
+    onCall(call, result) {
+      const detail = summariseToolInput(call.input);
+      stream.progress(`${agent}: ${call.name}${detail ? ` ${detail}` : ""}`);
+      transcript.write({
+        event: "tool-call",
+        agent,
+        tool: call.name,
+        input: call.input,
+        isError: result.isError === true,
+        resultChars: result.content.length,
+      });
+    },
+    onFinish(info) {
+      transcript.write({ event: "tool-loop-done", agent, ...info });
+      if (info.stop !== "final") {
+        stream.markdown(
+          `\u26a0\ufe0f \`${agent}\` hit the tool ${info.stop === "budget-exhausted" ? "call budget" : "time limit"} ` +
+            `after ${info.callCount} call(s) and had to answer from what it had. ` +
+            `Raise \`codecrosscheck.tools.${info.stop === "budget-exhausted" ? "maxCalls" : "deadlineMs"}\` if this recurs.\n\n`,
+        );
+      }
+    },
+  };
+}
+
+function summariseToolInput(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const obj = input as { path?: unknown; query?: unknown };
+  if (typeof obj.path === "string") return `\`${obj.path}\``;
+  if (typeof obj.query === "string") return `\`${obj.query}\``;
+  return "";
 }
 
 

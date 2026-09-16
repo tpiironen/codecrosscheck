@@ -1,6 +1,11 @@
 import * as path from "node:path";
-import type { ChatClient, ChatMessage, SendOptions } from "./clients/ChatClient.js";
-import { ApplyReviewSchema, type ApplyEdit, type Verdict } from "./schemas.js";
+import {
+  FixProposalSchema,
+  type ApplyEdit,
+  type FixProposal,
+  type Issue,
+  type Verdict,
+} from "./schemas.js";
 
 /**
  * Pure orchestration for the `/apply-review` slash command. All filesystem
@@ -16,9 +21,11 @@ export interface FsLike {
   exists(p: string): Promise<boolean>;
 }
 
-export interface FixProposal {
-  /** The worker's most recent fix-proposal Markdown artifact. */
-  proposal: string;
+export interface StoredFixProposal {
+  /** The structured proposal, or null for a transcript written before 0.6. */
+  proposal: FixProposal | null;
+  /** Markdown rendition — derived for new runs, the worker's own prose for legacy ones. */
+  artifact: string;
   /** The reviewer verdict that prompted that proposal, if available. */
   verdict: Verdict | null;
   /** Iteration number recorded in the transcript (best effort). */
@@ -130,12 +137,16 @@ export async function pruneTranscripts(
  * Parse a transcript JSONL and return the last `review-branch-iter` event with
  * `role: "worker"` (the final fix proposal). Also returns the most recent
  * preceding reviewer verdict, when present.
+ *
+ * Transcripts written before structured proposals carry only the Markdown
+ * artifact; those are returned with a null `proposal` so the caller can say so
+ * rather than silently applying nothing.
  */
-export async function extractFixProposal(transcriptPath: string, fs: FsLike): Promise<FixProposal | null> {
+export async function extractFixProposal(transcriptPath: string, fs: FsLike): Promise<StoredFixProposal | null> {
   const text = await fs.readFile(transcriptPath);
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
 
-  let lastWorker: { artifact: string; iteration: number } | null = null;
+  let lastWorker: { artifact: string; proposal: FixProposal | null; iteration: number } | null = null;
   let lastVerdict: Verdict | null = null;
 
   for (const line of lines) {
@@ -150,8 +161,10 @@ export async function extractFixProposal(transcriptPath: string, fs: FsLike): Pr
     if (ev.event !== "review-branch-iter") continue;
     const role = ev.role;
     if (role === "worker" && typeof ev.artifact === "string") {
+      const parsed = ev.proposal ? FixProposalSchema.safeParse(ev.proposal) : null;
       lastWorker = {
         artifact: ev.artifact,
+        proposal: parsed?.success ? parsed.data : null,
         iteration: typeof ev.iteration === "number" ? ev.iteration : 0,
       };
     } else if (role === "reviewer" && ev.verdict && typeof ev.verdict === "object") {
@@ -162,60 +175,11 @@ export async function extractFixProposal(transcriptPath: string, fs: FsLike): Pr
 
   if (!lastWorker) return null;
   return {
-    proposal: lastWorker.artifact,
+    proposal: lastWorker.proposal,
+    artifact: lastWorker.artifact,
     verdict: lastVerdict,
     iteration: lastWorker.iteration,
   };
-}
-
-/** A single worker rebuttal extracted from a fix proposal. */
-export interface Disagreement {
-  /** 1-based index matching the issue number in the proposal. */
-  id: number;
-  /** The "Issue N: ..." heading, used to tie back to the reviewer finding. */
-  heading: string;
-  /** The worker's rebuttal paragraph (everything after `**Fix:** Disagree:`). */
-  rebuttal: string;
-}
-
-/**
- * Parse `**Fix:** Disagree: ...` rebuttals out of a fixer proposal Markdown.
- * Returns one entry per Issue section whose Fix paragraph starts with "Disagree:".
- */
-interface IssueSection {
-  id: number;
-  heading: string;
-  body: string;
-}
-
-/** Split a fix proposal into its `### Issue N: …` sections. */
-function parseIssueSections(proposal: string): IssueSection[] {
-  const sectionRe = /^###\s+Issue\s+(\d+)[^\n]*$/gm;
-  const heads: Array<{ id: number; heading: string; start: number }> = [];
-  let m: RegExpExecArray | null;
-  while ((m = sectionRe.exec(proposal)) !== null) {
-    const id = Number.parseInt(m[1] ?? "", 10);
-    if (!Number.isFinite(id)) continue;
-    heads.push({ id, heading: m[0].replace(/^###\s+/, "").trim(), start: m.index });
-  }
-  return heads.map((h, i) => ({
-    id: h.id,
-    heading: h.heading,
-    body: proposal.slice(h.start, heads[i + 1]?.start ?? proposal.length),
-  }));
-}
-
-export function parseDisagreements(proposal: string): Disagreement[] {
-  const out: Disagreement[] = [];
-  for (const section of parseIssueSections(proposal)) {
-    // Look for "**Fix:** Disagree:" (allow whitespace variations).
-    const fixMatch = section.body.match(
-      /\*\*Fix:\*\*\s*Disagree\s*:\s*([\s\S]*?)(?=\n\n\*\*|\n###|\n```|$)/i,
-    );
-    if (!fixMatch?.[1]) continue;
-    out.push({ id: section.id, heading: section.heading, rebuttal: fixMatch[1].trim() });
-  }
-  return out;
 }
 
 /**
@@ -331,150 +295,6 @@ export async function runBuildGate(opts: RunBuildGateOptions): Promise<BuildGate
   });
 }
 
-/** A finding the worker effectively skipped without using the explicit `Disagree:` token. */
-export interface BlockedFinding {
-  /** 1-based index matching the issue number in the proposal. */
-  id: number;
-  /** The "Issue N: ..." heading. */
-  heading: string;
-  /** Short reason describing which dodge pattern matched. */
-  reason: string;
-}
-
-/**
- * Detect per-issue sections where the worker dodged producing a concrete
- * patch — e.g. responded with `**Data I need:**`, `(sketch — pending current
- * source)`, or `I cannot produce the unified-diff hunk` — but did not use
- * the explicit `**Fix:** Disagree:` token. These look like real fixes at a
- * glance but are not actionable, so we surface them alongside disagreements
- * for adjudication. Issues that already match `parseDisagreements` are
- * excluded so they aren't reported twice.
- */
-export function parseBlockedFindings(proposal: string): BlockedFinding[] {
-  const out: BlockedFinding[] = [];
-  const disagreedIds = new Set(parseDisagreements(proposal).map((d) => d.id));
-  const dodgePatterns: { re: RegExp; reason: string }[] = [
-    { re: /\*\*Data I need(?: to produce the patch)?[:*]/i, reason: "asks for more source files" },
-    { re: /\(sketch\s*[\u2014-]\s*pending current source/i, reason: "code block marked sketch / pending current source" },
-    { re: /I cannot produce (?:the |a )?(?:unified-diff hunk|patch|fix)/i, reason: "explicitly refuses to produce a patch" },
-    { re: /pending (?:the )?(?:current )?source(?:\s+(?:of|for))?/i, reason: "deferred pending source" },
-  ];
-  for (const section of parseIssueSections(proposal)) {
-    if (disagreedIds.has(section.id)) continue;
-    for (const { re, reason } of dodgePatterns) {
-      if (re.test(section.body)) {
-        out.push({ id: section.id, heading: section.heading, reason });
-        break;
-      }
-    }
-  }
-  return out;
-}
-
-/** Extract unique workspace-relative paths from `// path: <file>` directives in the proposal. */
-export function parseReferencedFiles(proposal: string): string[] {
-  const re = /^\s*\/\/\s*path:\s*([^\s].*?)\s*$/gm;
-  const found = new Set<string>();
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(proposal)) !== null) {
-    const cleaned = normalizeReferencedPath(m[1] ?? "");
-    if (cleaned.length > 0) found.add(cleaned);
-  }
-  return Array.from(found);
-}
-
-/**
- * Extract any plausible workspace-relative file paths from arbitrary text —
- * used to harvest paths from reviewer findings (`where` fields) and from the
- * worker's prose ("Data I need: full current contents of …").
- *
- * Heuristic: token contains a `/`, ends in a recognised source extension,
- * does not start with `http://` or absolute drive prefix.
- */
-export function harvestPathsFromText(text: string): string[] {
-  const found = new Set<string>();
-  // Match runs of non-whitespace, non-quote characters that look like a path.
-  const re = /([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+\.(?:cs|ts|tsx|js|jsx|mjs|cjs|json|md|py|go|rs|java|kt|rb|sql|yml|yaml|bicep|csproj|sln|xml|cshtml|razor|css|scss))(?::\d+(?:-\d+)?)?/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    // Reject when preceded by URL scheme `://`, drive prefix `:/` or `:\`,
-    // or the substring forms part of a URL host (`<ident>://`).
-    const start = m.index;
-    const before2 = start >= 2 ? text.slice(start - 2, start) : "";
-    const before3 = start >= 3 ? text.slice(start - 3, start) : "";
-    if (before2 === "//" || before2 === ":/" || before2 === ":\\") continue;
-    if (before3.endsWith("://")) continue;
-    // Reject "host.tld/path.ext" patterns by skipping if first segment looks
-    // like a hostname (contains a dot, the matched path itself starts with the
-    // hostname). Heuristic: if the first segment before the first slash has a
-    // dot AND is followed by no further dot-extension before the slash, treat
-    // as host. Simpler: reject if the captured path's first segment ends with
-    // a known TLD-ish pattern AND is followed by `/`.
-    let p = (m[1] ?? "").replace(/\\/g, "/");
-    const firstSlash = p.indexOf("/");
-    if (firstSlash > 0) {
-      const head = p.slice(0, firstSlash);
-      if (/^[A-Za-z0-9-]+\.(com|org|net|io|dev|ai|co|gov|edu|uk|de|fr)$/i.test(head)) {
-        continue;
-      }
-    }
-    if (/^[A-Za-z]+:\/\//.test(p)) continue;
-    if (/^[A-Za-z]:\//.test(p)) continue;
-    p = normalizeReferencedPath(p);
-    if (p.length > 0) found.add(p);
-  }
-  return Array.from(found);
-}
-
-/**
- * Strip annotations the worker commonly tacks onto path directives:
- *  - trailing parenthetical comments: `foo.cs (excerpt)`, `foo.cs (new file)`
- *  - line-number suffixes: `foo.cs:21`, `foo.cs:21-30`
- *  - symbol suffixes: `foo.ts:someFunction`
- *  - surrounding backticks
- */
-export function normalizeReferencedPath(raw: string): string {
-  let p = raw.trim();
-  // Strip wrapping backticks.
-  p = p.replace(/^`+|`+$/g, "").trim();
-  // Strip a single trailing parenthetical annotation ("(excerpt)", "(new file)", ...).
-  p = p.replace(/\s*\([^)]*\)\s*$/, "").trim();
-  // Strip a trailing :line or :line-line suffix.
-  p = p.replace(/:\d+(?:-\d+)?$/, "").trim();
-  // Strip a trailing :symbol suffix, including call syntax as reviewers write
-  // it (`src/extension.ts:workspaceEditHost().commit`). Anchored on a known
-  // source extension so a Windows drive letter or a URL scheme is left intact
-  // for `resolveSafePath` to reject.
-  p = p.replace(/(\.[A-Za-z0-9]{1,10}):[A-Za-z_$][\w$.()]*$/, "$1").trim();
-  return p;
-}
-
-/**
- * If `candidate` doesn't exist directly under `workspaceRoot`, progressively
- * drop leading path segments and return the first variant that exists. This
- * recovers from worker-supplied repo-relative paths when the workspace is
- * actually a subdirectory of the repo (very common in monorepos).
- */
-export async function resolveReferencedPath(
-  workspaceRoot: string,
-  candidate: string,
-  fs: FsLike,
-): Promise<string> {
-  const safe = resolveSafePath(workspaceRoot, candidate);
-  if (safe.ok && (await fs.exists(safe.abs))) return candidate;
-
-  // Try dropping leading segments one at a time.
-  const parts = candidate.split(/[\\/]/).filter((s) => s.length > 0);
-  for (let i = 1; i < parts.length; i++) {
-    const trimmed = parts.slice(i).join("/");
-    const trySafe = resolveSafePath(workspaceRoot, trimmed);
-    if (trySafe.ok && (await fs.exists(trySafe.abs))) {
-      return trimmed;
-    }
-  }
-  return candidate;
-}
-
 /**
  * Validate a proposed edit's path: must resolve under `workspaceRoot` after
  * normalisation, must not be absolute, must not escape via `..`. Returns the
@@ -495,7 +315,7 @@ export function resolveSafePath(workspaceRoot: string, candidate: string): { ok:
 
 /**
  * Keep the head and tail of `text` within `budget`, marking the elision. A
- * finding may cite a symbol anywhere in the file, so a head-only cut would
+ * caller may cite a symbol anywhere in the file, so a head-only cut would
  * systematically hide the end.
  */
 export function truncateMiddle(text: string, budget: number): string {
@@ -507,119 +327,36 @@ export function truncateMiddle(text: string, budget: number): string {
   return text.slice(0, head) + marker + (tail > 0 ? text.slice(text.length - tail) : "");
 }
 
+/** Every edit in a fix proposal, in the order the worker listed them. */
+export function editsFrom(proposal: FixProposal): ApplyEdit[] {
+  return proposal.fixes.flatMap((f) => f.edits);
+}
+
 /**
- * Split `budget` across `sizes`, smallest first so a file shorter than its
- * equal share leaves the remainder to the others. Returns chars per index.
+ * Render a structured fix proposal as Markdown, for display and for the
+ * reviewer's re-review pass. The model no longer writes this prose — it is
+ * derived from the structured response, so the two cannot disagree.
  */
-export function allocateBudget(sizes: number[], budget: number): number[] {
-  const out = new Array<number>(sizes.length).fill(0);
-  const smallestFirst = sizes.map((size, index) => ({ size, index })).sort((a, b) => a.size - b.size);
-  let remaining = budget;
-  let left = smallestFirst.length;
-  for (const { size, index } of smallestFirst) {
-    const take = Math.min(size, Math.floor(remaining / left));
-    out[index] = take;
-    remaining -= take;
-    left--;
+export function renderFixProposal(proposal: FixProposal, issues: Issue[] = []): string {
+  const label = { fixed: "Fixed", disagree: "Disagree", unaddressed: "Unaddressed" } as const;
+  const parts: string[] = ["## Summary", "", proposal.summary];
+  for (const fix of proposal.fixes) {
+    const issue = issues[fix.findingId - 1];
+    const heading = issue ? `${fix.findingId}: ${issue.where}` : `${fix.findingId}`;
+    parts.push("", `### Finding ${heading} — ${label[fix.status]}`, "", fix.explanation);
+    for (const edit of fix.edits) {
+      parts.push(
+        "",
+        `**Edit** \`${edit.path}\` — ${edit.why}`,
+        "",
+        "```diff",
+        ...edit.oldString.split("\n").map((l) => `-${l}`),
+        ...edit.newString.split("\n").map((l) => `+${l}`),
+        "```",
+      );
+    }
   }
-  return out;
-}
-
-type InventoryItem =
-  | { kind: "note"; text: string }
-  | { kind: "file"; rel: string; effective: string; content: string };
-
-/** Read each referenced file (annotating missing ones as "to be created") and return a Markdown inventory. */
-export async function buildFileInventory(
-  workspaceRoot: string,
-  paths: string[],
-  fs: FsLike,
-  opts: { budget?: number } = {},
-): Promise<{ inventory: string; missing: string[]; resolved: Map<string, string> }> {
-  const items: InventoryItem[] = [];
-  const missing: string[] = [];
-  const resolved = new Map<string, string>();
-  for (const rel of paths) {
-    // A colon survives normalisation only when the reference is not a
-    // workspace path. Treating it as a file to create invites a phantom file
-    // and hides the malformed reference behind a plausible-looking note.
-    if (rel.includes(":")) {
-      missing.push(`${rel} (not a workspace-relative path)`);
-      continue;
-    }
-    // Try to resolve repo-prefixed paths to actual workspace-relative paths.
-    const effective = await resolveReferencedPath(workspaceRoot, rel, fs);
-    resolved.set(rel, effective);
-    const safe = resolveSafePath(workspaceRoot, effective);
-    if (!safe.ok) {
-      missing.push(`${rel} (${safe.reason})`);
-      continue;
-    }
-    if (!(await fs.exists(safe.abs))) {
-      // File doesn't exist yet — surface to the worker so it can emit a
-      // creation edit (oldString="") if the proposal calls for it.
-      items.push({
-        kind: "note",
-        text: `## File: ${effective} (does not exist yet — emit a creation edit with oldString="" to create it, or skip if the proposal doesn't call for a new file)`,
-      });
-      continue;
-    }
-    items.push({ kind: "file", rel, effective, content: await fs.readFile(safe.abs) });
-  }
-
-  const files = items.filter((i): i is Extract<InventoryItem, { kind: "file" }> => i.kind === "file");
-  // Budgeting per file, not one slice over the concatenation: a single large
-  // file used to consume the whole cap and drop every later file silently.
-  const shares =
-    opts.budget && opts.budget > 0
-      ? allocateBudget(files.map((f) => f.content.length), opts.budget)
-      : files.map((f) => f.content.length);
-
-  let fileIndex = 0;
-  const parts = items.map((item) => {
-    if (item.kind === "note") return item.text;
-    const share = shares[fileIndex++] ?? item.content.length;
-    const partial = share < item.content.length;
-    const body = partial ? truncateMiddle(item.content, share) : item.content;
-    const origin =
-      item.effective === item.rel
-        ? ""
-        : ` (proposal referenced as \`${item.rel}\` — use the resolved path \`${item.effective}\` in your edits)`;
-    const note = partial
-      ? ` (PARTIAL — ${body.length.toLocaleString("en-US")} of ${item.content.length.toLocaleString("en-US")} chars; a middle section is elided)`
-      : "";
-    return `## File: ${item.effective}${origin}${note}\n\n\`\`\`\n${body}\n\`\`\``;
-  });
-
-  return { inventory: parts.join("\n\n"), missing, resolved };
-}
-
-/** Compose the worker user message from the fix proposal and file inventory. */
-export function composeApplyInput(proposal: string, inventory: string): string {
-  return [
-    "# Fix proposal",
-    "",
-    proposal,
-    "",
-    "# Current file contents",
-    "",
-    inventory.length > 0 ? inventory : "_(no files supplied — return empty edits)_",
-  ].join("\n");
-}
-
-/** Call the worker model and return validated edits. */
-export async function deriveEdits(
-  client: ChatClient,
-  systemPrompt: string,
-  userInput: string,
-  opts?: SendOptions,
-): Promise<ApplyEdit[]> {
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userInput },
-  ];
-  const result = await client.sendStructured(messages, ApplyReviewSchema, "ApplyReview", opts);
-  return result.edits;
+  return parts.join("\n");
 }
 
 /** Apply a single edit. Returns outcome; never throws on validation failures. */
@@ -652,121 +389,27 @@ export async function applyEdit(
   }
   const original = await fs.readFile(safe.abs);
 
-  // Try the model's oldString as-is, then a sequence of safety-net repairs:
-  // 1. Strip diff markers (the worker pasted unified-diff lines).
-  // 2. Normalise CRLF / leading-tab vs leading-spaces drift.
-  const candidates = buildOldStringCandidates(edit.oldString);
-  let matchedOld: string | null = null;
-  for (const cand of candidates) {
-    const c = countOccurrences(original, cand);
-    if (c === 1) {
-      matchedOld = cand;
-      break;
-    }
+  // Exact match only. The worker reads files through the workspace toolset and
+  // returns edits as structured data, so there is no Markdown round trip left
+  // to corrupt line endings or leave diff markers behind — a near-miss now
+  // means the worker got it wrong, and guessing would hide that.
+  const occurrences = countOccurrences(original, edit.oldString);
+  if (occurrences === 0) {
+    return { path: edit.path, status: "skipped", reason: "oldString not found", why: edit.why };
   }
-  if (matchedOld === null) {
-    // Diagnose with the original oldString so the message is meaningful.
-    const c = countOccurrences(original, edit.oldString);
-    if (c === 0) {
-      return { path: edit.path, status: "skipped", reason: "oldString not found", why: edit.why };
-    }
-    return { path: edit.path, status: "skipped", reason: `oldString matches ${c} times`, why: edit.why };
+  if (occurrences > 1) {
+    return { path: edit.path, status: "skipped", reason: `oldString matches ${occurrences} times`, why: edit.why };
   }
-
-  // Pair newString with the same repair that worked for oldString.
-  const repairedNew = repairNewStringFor(matchedOld, edit.oldString, edit.newString);
 
   if (options.dryRun) {
     return { path: edit.path, status: "dry-run", why: edit.why };
   }
   // Splice by index rather than String.replace: GetSubstitution expands `$$`,
   // `$&`, "$`" and `$'` in the replacement even for a string search value.
-  const at = original.indexOf(matchedOld);
-  const updated = original.slice(0, at) + repairedNew + original.slice(at + matchedOld.length);
+  const at = original.indexOf(edit.oldString);
+  const updated = original.slice(0, at) + edit.newString + original.slice(at + edit.oldString.length);
   await fs.writeFile(safe.abs, updated);
   return { path: edit.path, status: "applied", why: edit.why };
-}
-
-/**
- * Build candidate forms of `oldString` to try against the file. Order matters
- * — first match wins, so list more conservative repairs first.
- */
-export function buildOldStringCandidates(raw: string): string[] {
-  const out: string[] = [];
-  const add = (s: string): void => {
-    if (s.length > 0 && !out.includes(s)) out.push(s);
-  };
-  add(raw);
-  // CRLF/CR -> LF normalisation (file has LF, worker emitted CRLF).
-  const lf = raw.replace(/\r\n?/g, "\n");
-  add(lf);
-  // LF -> CRLF (file has CRLF, worker emitted LF — common on Windows repos).
-  add(lf.replace(/\n/g, "\r\n"));
-  // Diff-style: keep ' ' + '-' lines, strip the one-char marker (LF form).
-  const stripped = stripDiffMarkers(lf, "old");
-  if (stripped !== lf) {
-    add(stripped);
-    add(stripped.replace(/\n/g, "\r\n"));
-  }
-  return out;
-}
-
-/**
- * Pair `newString` with the same repair that produced `matchedOld`. If the
- * old candidate that matched was the diff-stripped variant, strip diff markers
- * from `newString` too. If it was the CRLF variant, emit CRLF in newString too.
- */
-export function repairNewStringFor(matchedOld: string, originalOld: string, originalNew: string): string {
-  const lfNew = originalNew.replace(/\r\n?/g, "\n");
-  const lfOld = originalOld.replace(/\r\n?/g, "\n");
-
-  const wasStripped = matchedOld === stripDiffMarkers(lfOld, "old") && matchedOld !== lfOld;
-  const usesCrlf = matchedOld.includes("\r\n");
-
-  let result = wasStripped ? stripDiffMarkers(lfNew, "new") : lfNew;
-  if (usesCrlf) {
-    result = result.replace(/\n/g, "\r\n");
-  }
-  return result;
-}
-
-/**
- * Strip unified-diff line markers from a multi-line string.
- *
- * `mode === "old"`: keep lines starting with ` ` (context) or `-` (removed); drop `+` lines.
- *                    Strip the leading marker character.
- * `mode === "new"`: keep lines starting with ` ` (context) or `+` (added); drop `-` lines.
- *                    Strip the leading marker character.
- *
- * Returns the input unchanged if it doesn't look like diff (no line starts with `-` or `+`,
- * or any non-empty line starts with a character outside `[ +\-]`).
- */
-export function stripDiffMarkers(text: string, mode: "old" | "new"): string {
-  const lines = text.split("\n");
-  let hasMarker = false;
-  for (const line of lines) {
-    if (line.length === 0) continue;
-    const ch = line[0];
-    if (ch !== " " && ch !== "+" && ch !== "-") {
-      // Not diff-shaped — bail out.
-      return text;
-    }
-    if (ch === "-" || ch === "+") hasMarker = true;
-  }
-  if (!hasMarker) return text;
-
-  const keep = mode === "old" ? new Set([" ", "-"]) : new Set([" ", "+"]);
-  const out: string[] = [];
-  for (const line of lines) {
-    if (line.length === 0) {
-      out.push("");
-      continue;
-    }
-    const ch = line[0];
-    if (ch === undefined || !keep.has(ch)) continue;
-    out.push(line.slice(1));
-  }
-  return out.join("\n");
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -837,6 +480,3 @@ export async function applyEdits(
 
 // Exposed for tests.
 export const __test = { countOccurrences };
-
-// Re-export schema for convenience.
-export { ApplyReviewSchema };

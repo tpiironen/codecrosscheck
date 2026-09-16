@@ -46,9 +46,39 @@ export const ApplyEditSchema = z.object({
   why: z.string().min(1).describe("One-line justification tying this edit to a reviewer finding."),
 });
 
-export const ApplyReviewSchema = z.object({
-  edits: z.array(ApplyEditSchema),
+export type ApplyEdit = z.infer<typeof ApplyEditSchema>;
+
+export const FixSchema = z.object({
+  findingId: z
+    .number()
+    .int()
+    .min(1)
+    .describe("1-based index of the reviewer finding this responds to."),
+  status: z
+    .enum(["fixed", "disagree", "unaddressed"])
+    .describe(
+      "fixed: the edits below resolve the finding. disagree: the finding is wrong and `explanation` rebuts it. unaddressed: you could neither fix nor rebut it; `explanation` says what stopped you.",
+    ),
+  explanation: z
+    .string()
+    .min(1)
+    .describe(
+      "Why this status. For `disagree`, the rebuttal with evidence. For `unaddressed`, what blocked you.",
+    ),
+  edits: z
+    .array(ApplyEditSchema)
+    .describe("Exact edits that resolve the finding. MUST be empty unless status is `fixed`."),
 });
 
-export type ApplyEdit = z.infer<typeof ApplyEditSchema>;
-export type ApplyReview = z.infer<typeof ApplyReviewSchema>;
+/**
+ * The fixer's whole response. Edits travel as structured data rather than as
+ * Markdown a second model has to re-derive them from, and `status` replaces
+ * the English-phrase regexes that used to guess whether a fix was real.
+ */
+export const FixProposalSchema = z.object({
+  summary: z.string().min(1).describe("One paragraph covering what you changed and what you did not."),
+  fixes: z.array(FixSchema),
+});
+
+export type Fix = z.infer<typeof FixSchema>;
+export type FixProposal = z.infer<typeof FixProposalSchema>;

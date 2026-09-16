@@ -356,47 +356,45 @@ flowchart TB
   participant streams a warning before running the loop.
 - **`/review-branch [extra]`** runs a dedicated reviewer-first dialogue
   loop (not `runPipeline`). Iteration 1 calls the CODE reviewer directly
-  on the diff. Iterations 2..N call the worker with the
-  [`review_branch_fixer`](../src/prompts/review_branch_fixer.md) prompt to
-  produce concrete fixes for the prior findings, then have the reviewer
-  re-judge whether those fixes resolve the issues. The worker uses
-  `ChatClient.sendText` (plain Markdown, no JSON envelope) because fix
-  proposals contain code blocks that large-context models drop from
-  structured wrappers. Two pieces of feedback flow back into each fixer
-  iteration:
-  - **Repository file context.** Before each iteration ≥ 2 the handler
-    runs `harvestPathsFromText` over every reviewer finding's `where` /
-    `suggestion` and over the prior fix proposal, reads those files via
-    `buildFileInventory`, and injects them as a `# Repository file
-    context` section in the fixer input (capped at 60 000 characters).
-    This eliminates the "I need the source of X" dodge for files that
-    live outside the diff. URLs, absolute Windows paths, and
-    host-prefixed paths are filtered out.
-  - **Worker disagreement adjudication.** The fixer prompt allows a
-    push-back via `**Fix:** Disagree: <rebuttal>` per issue. After the
-    final iteration the handler runs `parseDisagreements` over the
-    proposal and renders any rebuttals at the end of the chat output as
-    a numbered, blockquoted decision block. The user adjudicates by
-    accepting (run `/apply-review` — rebutted findings emit no edits)
-    or overriding: re-run with `force-fix-all` anywhere in the prompt
-    (whole-word, case-insensitive) to append a `# User override`
-    section that requires a concrete fix for every finding and forbids
-    `Disagree:` in that round.
-  - **Blocked-finding detection.** A complementary `parseBlockedFindings`
-    helper flags issue sections where the worker dodged via prose
-    ("Data I need", `(sketch — pending current source)`, "I cannot
-    produce a patch") without using the explicit `Disagree:` token.
-    Such issues look like fixes at a glance but produce zero edits, so
-    they are rendered as a separate `🚫 N finding(s) the worker did
-    not produce a real patch for` block, naming the likely cause (the
-    cited file lives outside the workspace root, so the file-context
-    injector could not read it) and pointing at the workspace-switch /
-    `force-fix-all` remedies. Disagreement-captured issues are
-    excluded so they aren't reported twice.
+  on the diff. Iterations 2..N triage the findings, then call the worker with
+  the [`review_branch_fixer`](../src/prompts/review_branch_fixer.md) prompt to
+  produce concrete fixes for the confirmed findings, then have the reviewer
+  re-judge whether those fixes resolve the issues. The fixer returns a
+  schema-validated `FixProposal` — one entry per finding carrying a status, an
+  explanation and exact edits — and the Markdown shown to the user and sent to
+  the reviewer is *derived* from that structure, so prose and edits cannot
+  disagree.
+  - **Workspace toolset.** The triager and the fixer are given a read-only
+    toolset (`read_file`, `search_workspace`, `list_directory`) from
+    [`src/tools/workspaceTools.ts`](../src/tools/workspaceTools.ts) and fetch
+    what they need mid-turn. This replaced a pre-computed harvesting pass:
+    measured on the 2026-09-16 dogfood run, the file the triager turned out to
+    need was named nowhere in the finding, so no amount of pre-computation
+    could have supplied it. Every path is validated with `resolveSafePath`,
+    filtered through a denylist (VCS metadata, build output, dependency trees,
+    credential files) and then through `git check-ignore` when the workspace is
+    a repository. Each loop is bounded by `codecrosscheck.tools.maxCalls` and
+    `codecrosscheck.tools.deadlineMs`; on exhaustion the client withdraws the
+    tools, tells the model so, and takes one final answer. Every call is
+    streamed to the user and written to the transcript as a `tool-call` event.
+  - **Worker disagreement adjudication.** A fix with status `disagree` is a
+    push-back, and its `explanation` is the rebuttal. After the final iteration
+    the handler renders any rebuttals at the end of the chat output as a
+    numbered, blockquoted decision block. The user adjudicates by accepting
+    (run `/apply-review` — a rebutted finding carries no edits) or overriding:
+    re-run with `force-fix-all` anywhere in the prompt (whole-word,
+    case-insensitive) to append a `# User override` section that requires a
+    concrete fix for every finding and withdraws the `disagree` status.
+  - **Unaddressed findings.** A fix with status `unaddressed` is one the worker
+    could neither fix nor rebut. These are rendered as a separate
+    `🚫 N finding(s) the worker could not produce a patch for` block quoting
+    the worker's own reason. This replaced a set of English-phrase regexes
+    (`**Data I need`, `pending current source`) that had obvious false
+    positives in ordinary prose.
   - **Reviewer exhaustiveness and complete-round rule.** The reviewer
     prompt requires every finding to be listed (high → low →
     file/line) with no arbitrary cap. The fixer prompt requires each
-    round to be a complete, self-contained proposal: any hunk from
+    round to be a complete, self-contained proposal: any edit from
     round N that is still needed must be repeated verbatim in round
     N+1, since `/apply-review` consumes only the final round.
   - **Per-invocation iteration cap.** The handler parses
@@ -409,32 +407,31 @@ flowchart TB
     proposal exists (converged or not) the summary points the user at
     `/apply-review`. The manual-only fallback only renders when no
     proposal exists at all.
-- **`/apply-review [extra]`** is the apply step of the review loop and
+- **`/apply-review`** is the apply step of the review loop and
   lives in a dedicated handler in
   [`src/extension.ts`](../src/extension.ts) backed by the pure
   [`src/applyReview.ts`](../src/applyReview.ts) module. Flow: locate the
   newest `.codecrosscheck/runs/*.jsonl` containing a `review-branch-done`
-  event → extract the last `review-branch-iter` event with
-  `role: "worker"` (the final fix proposal) → parse `// path:` directives
-  to determine which files to read → call the worker with the
-  [`apply_review_worker`](../src/prompts/apply_review_worker.md) prompt
-  using `ChatClient.sendStructured` and the `ApplyReviewSchema`
-  (`{edits: [{path, oldString, newString, why}]}`) → for each edit,
-  validate the path resolves under the workspace root, then run a
-  deterministic candidate sequence on `oldString` (literal → CRLF↔LF
-  normalisation → unified-diff stripping) and apply the first variant
-  that matches uniquely, with the `newString` paired to the same
-  repair, then write via `vscode.workspace.fs`. An empty `oldString`
-  means create-mode (refuses to overwrite). Every run persists a debug
-  log at `<workspace>/.codecrosscheck/runs/<iso>-apply.json` containing
-  the source transcript, harvested paths, raw worker `edits`, and
-  per-edit `outcomes` — linked from chat output even on zero-edit
-  runs so worker stalls are diagnosable. Apply is a separate slash
-  command (not part of `/review-branch`) so the review loop stays
-  read-only and safe to run on any branch; applying is the explicit,
-  opt-in "do it" step. Settings `codecrosscheck.applyReview.dryRun`
-  and `codecrosscheck.applyReview.testCommand` control preview-only
-  mode and an optional follow-up test invocation.
+  event → extract the structured proposal from the last
+  `review-branch-iter` event with `role: "worker"` → for each edit, validate
+  the path resolves under the workspace root, require `oldString` to occur
+  exactly once byte for byte, then write via `vscode.workspace.fs`. **It calls
+  no model.** The second model hop that used to re-derive `oldString` /
+  `newString` from Markdown existed only because prose could not be trusted to
+  carry exact strings; with structured edits there is nothing to re-derive, and
+  with it went the CRLF-and-diff-marker repair machinery — a near-miss now
+  means the edit is wrong, and repairing it would hide that. An empty
+  `oldString` means create-mode (refuses to overwrite). A transcript written
+  before structured proposals is reported as such rather than silently
+  applying nothing. Every run persists a debug log at
+  `<workspace>/.codecrosscheck/runs/<iso>-apply.json` containing the source
+  transcript, the `edits`, and per-edit `outcomes` — linked from chat output
+  even on zero-edit runs. Apply is a separate slash command (not part of
+  `/review-branch`) so the review loop stays read-only and safe to run on any
+  branch; applying is the explicit, opt-in "do it" step. Settings
+  `codecrosscheck.applyReview.dryRun` and
+  `codecrosscheck.applyReview.testCommand` control preview-only mode and an
+  optional follow-up test invocation.
 - **`installSkill` command** copies the bundled
   `dist/assets/skills/codecrosscheck-delegate/SKILL.md` to either
   `<workspace>/.github/skills/` or `<homedir>/.agents/skills/`. Refuses

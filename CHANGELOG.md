@@ -27,7 +27,68 @@ OpenSpec changes:
 [`add-finding-triage`](openspec/changes/add-finding-triage/proposal.md),
 [`replace-github-models-with-openai-compatible`](openspec/changes/replace-github-models-with-openai-compatible/proposal.md),
 [`fix-referenced-path-normalisation`](openspec/changes/fix-referenced-path-normalisation/proposal.md),
-[`budget-file-context-per-file`](openspec/changes/budget-file-context-per-file/proposal.md).
+[`budget-file-context-per-file`](openspec/changes/budget-file-context-per-file/proposal.md),
+[`replace-context-harvest-with-tools`](openspec/changes/replace-context-harvest-with-tools/proposal.md).
+
+### Added
+
+- **Agents can now ask for files instead of being handed a guess.** `ChatClient`
+  supports a tool-call round trip, implemented identically by the in-editor
+  (`vscode.lm`) and OpenAI-compatible (CLI) transports, and the triager and
+  fixer are given a read-only workspace toolset: `read_file`,
+  `search_workspace`, `list_directory`. Every path is confined to the workspace
+  root by `resolveSafePath`, screened by a denylist (VCS metadata, build
+  output, dependency trees, `.env` / `*.pem` / `id_rsa` and similar), and then
+  by `git check-ignore` when the workspace is a repository. The toolset exposes
+  no operation that writes, creates or deletes. Each loop is bounded by
+  `codecrosscheck.tools.maxCalls` (default 24) and
+  `codecrosscheck.tools.deadlineMs` (default 180 000); on exhaustion the client
+  withdraws the tools, tells the model, and takes one final answer. Every call
+  is streamed to the user and recorded in the transcript as a `tool-call`
+  event.
+
+  This closes the defect that motivated the change. On the 2026-09-16 dogfood
+  run the triager needed `src/applyReview.ts` to judge a finding that cited
+  only `src/extension.ts`, could not ask for it, and returned `uncertain`;
+  nothing was fixed. Both pre-computed alternatives were measured and rejected:
+  symbol-directed harvesting would have found nothing (every identifier the
+  finding named is defined in `extension.ts` itself), and one-hop import
+  closure would have pulled 121 671 chars against a 60 000 budget, halving both
+  files that mattered to make room for eight nobody asked about. The need was
+  discovered *during reasoning* — only letting the model ask can supply it.
+
+### Changed
+
+- **The fixer returns structured edits; `/apply-review` no longer calls a
+  model.** `/review-branch` now produces a schema-validated `FixProposal`: one
+  entry per finding with a `status` (`fixed` / `disagree` / `unaddressed`), an
+  explanation, and exact `oldString` / `newString` edits. The Markdown shown in
+  chat and sent to the reviewer for re-review is derived from that structure,
+  so the prose and the edits cannot disagree. `/apply-review` reads those edits
+  from the transcript and applies them — it is now purely the user-confirmation
+  checkpoint, with dry-run, path validation and the build gate intact.
+- **Edits apply verbatim or not at all.** With the Markdown round trip gone,
+  the CRLF-normalisation and unified-diff-marker repair candidates are gone
+  too: a near-miss now means the edit is wrong, and repairing it would hide
+  that. A non-matching edit is skipped with a reason and the file is untouched.
+- **Worker push-back and dodges are structural, not textual.** A rebuttal is
+  `status: "disagree"` rather than the string `**Fix:** Disagree:`, and a
+  finding the worker could not patch is `status: "unaddressed"` rather than a
+  regex match on `**Data I need` or `pending current source` — phrases that
+  occur in ordinary prose.
+- `scripts/copy-assets.mjs` clears the destination before copying. `cpSync`
+  merges, so a deleted prompt survived in `dist/` and shipped in the VSIX.
+
+### Removed
+
+- `harvestPathsFromText`, `resolveReferencedPath`, `normalizeReferencedPath`,
+  `buildFileInventory`, `allocateBudget`, `parseReferencedFiles`,
+  `composeApplyInput`, `deriveEdits`, `parseDisagreements`,
+  `parseBlockedFindings`, `buildOldStringCandidates`, `repairNewStringFor`,
+  `stripDiffMarkers`, `buildWorkerWithPrompt`, `ApplyReviewSchema`, and
+  `src/prompts/apply_review_worker.md`. Every one of them compensated for the
+  model not being able to fetch a file or carry an exact string.
+- The `# Repository file context` block and its 60 000-character cap.
 
 ### Fixed
 

@@ -1,9 +1,7 @@
 # Replace regex context harvesting with model tool calls
 
-> **Status: proposed, not implemented.** This change is deliberately left
-> unimplemented. It is the largest architectural item identified in the
-> 0.5.0 review and deserves its own implementation cycle rather than being
-> folded into a batch of fixes.
+> **Status: implemented, pending archive.** See `tasks.md`; E2 (corpus
+> before/after) is deliberately still open and needs a live model run.
 
 ## Why
 

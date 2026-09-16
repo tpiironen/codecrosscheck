@@ -242,6 +242,18 @@
           "type": "boolean",
           "default": false,
           "description": "When true, /apply-review prints planned edits without writing to disk."
+        },
+        "codecrosscheck.tools.maxCalls": {
+          "type": "integer",
+          "default": 24,
+          "minimum": 0,
+          "description": "Maximum workspace tool calls (read_file, search_workspace, list_directory) one agent may make per turn. When the budget runs out the agent is told so and must answer from what it already has. Set to 0 to disable tool access."
+        },
+        "codecrosscheck.tools.deadlineMs": {
+          "type": "integer",
+          "default": 180000,
+          "minimum": 1000,
+          "description": "Wall-clock limit (milliseconds) on one agent's tool-gathering phase, so a model that keeps asking for files cannot stall a run."
         }
       }
     }

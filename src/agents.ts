@@ -2,7 +2,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ChatClient, ChatMessage, SendOptions } from "./clients/ChatClient.js";
-import { VerdictSchema, TriageSchema, type Stage, type Triage, type Verdict } from "./schemas.js";
+import {
+  FixProposalSchema,
+  VerdictSchema,
+  TriageSchema,
+  type FixProposal,
+  type Stage,
+  type Triage,
+  type Verdict,
+} from "./schemas.js";
 
 const PROMPTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "prompts");
 
@@ -42,19 +50,17 @@ export interface Triager {
   triage(input: string, opts?: SendOptions): Promise<Triage>;
 }
 
+/** Produces the response to a set of reviewer findings, edits included. */
+export interface Fixer {
+  readonly modelId: string;
+  propose(input: string, opts?: SendOptions): Promise<FixProposal>;
+}
+
 function messagesFor(system: string, user: string): ChatMessage[] {
   return [
     { role: "system", content: system },
     { role: "user", content: user },
   ];
-}
-
-/** Build a worker with a caller-provided system prompt (used outside the Stage pipeline). */
-export function buildWorkerWithPrompt(system: string, client: ChatClient): Worker {
-  return {
-    modelId: client.modelId,
-    produce: (input, opts) => client.sendText(messagesFor(system, input), opts),
-  };
 }
 
 /**
@@ -86,5 +92,14 @@ export function buildTriager(client: ChatClient): Triager {
     modelId: client.modelId,
     triage: (input, opts) =>
       client.sendStructured(messagesFor(system, input), TriageSchema, "Triage", opts),
+  };
+}
+
+export function buildFixer(client: ChatClient): Fixer {
+  const system = loadPromptByName("review_branch_fixer");
+  return {
+    modelId: client.modelId,
+    propose: (input, opts) =>
+      client.sendStructured(messagesFor(system, input), FixProposalSchema, "FixProposal", opts),
   };
 }

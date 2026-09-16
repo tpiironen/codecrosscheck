@@ -1,10 +1,15 @@
 import { z } from "zod";
 import {
   ReviewCancelledError,
+  budgetExceeded,
+  openToolBudget,
   throwIfAborted,
+  toolBudgetNudge,
+  toolsEnabled,
   type ChatClient,
   type ChatMessage,
   type SendOptions,
+  type ToolCall,
 } from "./ChatClient.js";
 import { describeSchema, explainFailure } from "./schemaText.js";
 
@@ -21,7 +26,7 @@ interface LmChat {
     messages: never[],
     options: Record<string, never>,
     token: never,
-  ): PromiseLike<{ text: AsyncIterable<string> }>;
+  ): PromiseLike<{ text: AsyncIterable<string>; stream?: AsyncIterable<unknown> }>;
 }
 
 export interface VscodeLmOptions {
@@ -81,11 +86,71 @@ export class VscodeLmClient implements ChatClient {
     throwIfAborted(opts?.signal, this.modelId);
     const vscode = await import("vscode");
     const model = await this.select();
-    const lmMessages = messages.map((m) =>
+    const history: unknown[] = messages.map((m) =>
       m.role === "assistant"
         ? vscode.LanguageModelChatMessage.Assistant(m.content)
         : vscode.LanguageModelChatMessage.User(m.content),
     );
+
+    const tools = opts?.tools;
+    if (!toolsEnabled(tools)) {
+      return (await this.request(vscode, model, history, {}, opts)).text;
+    }
+
+    const budget = openToolBudget(tools);
+    const declared = {
+      tools: tools.specs.map((s) => ({
+        name: s.name,
+        description: s.description,
+        inputSchema: s.inputSchema,
+      })),
+      toolMode: vscode.LanguageModelChatToolMode.Auto,
+    };
+
+    for (;;) {
+      const stop = budgetExceeded(budget);
+      if (stop) {
+        history.push(vscode.LanguageModelChatMessage.User(toolBudgetNudge(stop, budget)));
+        const cut = await this.request(vscode, model, history, {}, opts);
+        tools.onFinish?.({ stop, callCount: budget.calls });
+        return cut.text;
+      }
+
+      const res = await this.request(vscode, model, history, declared, opts);
+      if (res.calls.length === 0) {
+        tools.onFinish?.({ stop: "final", callCount: budget.calls });
+        return res.text;
+      }
+
+      // Every requested call must be answered or the next request is malformed,
+      // so a turn that overshoots the budget still runs; the check above ends
+      // the loop before another turn is granted.
+      history.push(vscode.LanguageModelChatMessage.Assistant(res.parts as never));
+      const answers: unknown[] = [];
+      for (const call of res.calls) {
+        throwIfAborted(opts?.signal, this.modelId);
+        budget.calls++;
+        const result = await tools.invoke(call);
+        tools.onCall?.(call, result);
+        answers.push(
+          new vscode.LanguageModelToolResultPart(call.callId, [
+            new vscode.LanguageModelTextPart(result.content),
+          ]),
+        );
+      }
+      history.push(vscode.LanguageModelChatMessage.User(answers as never));
+    }
+  }
+
+  /** One request/response turn. Splits the stream into text, tool calls, and the raw parts to echo back. */
+  private async request(
+    vscode: typeof import("vscode"),
+    model: LmChat,
+    history: unknown[],
+    requestOptions: Record<string, unknown>,
+    opts: SendOptions | undefined,
+  ): Promise<{ text: string; calls: ToolCall[]; parts: unknown[] }> {
+    throwIfAborted(opts?.signal, this.modelId);
 
     // One source per call, cancelled by the caller's signal and always
     // disposed. The previous implementation created a source nobody could
@@ -95,16 +160,29 @@ export class VscodeLmClient implements ChatClient {
     opts?.signal?.addEventListener("abort", onAbort, { once: true });
     try {
       const response = await model.sendRequest(
-        lmMessages as never[],
-        {} as Record<string, never>,
+        history as never[],
+        requestOptions as Record<string, never>,
         source.token as never,
       );
-      let buf = "";
-      for await (const chunk of response.text) {
-        buf += chunk;
+      let text = "";
+      const calls: ToolCall[] = [];
+      const parts: unknown[] = [];
+      if (response.stream) {
+        for await (const part of response.stream) {
+          parts.push(part);
+          if (part instanceof vscode.LanguageModelToolCallPart) {
+            calls.push({ callId: part.callId, name: part.name, input: part.input });
+          } else if (part instanceof vscode.LanguageModelTextPart) {
+            text += part.value;
+          }
+        }
+      } else {
+        for await (const chunk of response.text) {
+          text += chunk;
+        }
       }
       throwIfAborted(opts?.signal, this.modelId);
-      return buf;
+      return { text, calls, parts };
     } catch (err) {
       if (opts?.signal?.aborted) throw new ReviewCancelledError(this.modelId);
       throw err;
@@ -164,7 +242,9 @@ export class VscodeLmClient implements ChatClient {
     ];
     let retryRaw = "";
     try {
-      retryRaw = await this.sendRaw(retryMessages, opts);
+      // No tools on the retry: the reminder is about JSON shape, not missing
+      // data, and re-running the loop would spend a second budget on it.
+      retryRaw = await this.sendRaw(retryMessages, { ...opts, tools: undefined });
       return tryParseOrRefuse(retryRaw);
     } catch (err) {
       if (err instanceof ReviewCancelledError) throw err;

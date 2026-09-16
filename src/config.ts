@@ -22,6 +22,8 @@ export const DEFAULTS = {
   "applyReview.buildCommand": "",
   "applyReview.buildTimeoutMs": 300_000,
   "applyReview.dryRun": false,
+  "tools.maxCalls": 24,
+  "tools.deadlineMs": 180_000,
 } as const;
 
 export interface ResolvedConfig {
@@ -36,6 +38,8 @@ export interface ResolvedConfig {
   buildCommand: string;
   buildTimeoutMs: number;
   dryRun: boolean;
+  toolMaxCalls: number;
+  toolDeadlineMs: number;
 }
 
 /** Minimal shape of `vscode.WorkspaceConfiguration`, so this module is testable. */
@@ -73,6 +77,8 @@ export function readConfig(cfg: ConfigSource): ResolvedConfig {
     buildCommand: (cfg.get<string>("applyReview.buildCommand") ?? "").trim(),
     buildTimeoutMs: num(cfg, "applyReview.buildTimeoutMs"),
     dryRun: bool(cfg, "applyReview.dryRun"),
+    toolMaxCalls: num(cfg, "tools.maxCalls"),
+    toolDeadlineMs: num(cfg, "tools.deadlineMs"),
   };
 }
 
