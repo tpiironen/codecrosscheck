@@ -26,6 +26,7 @@ import {
   extractFixProposal,
   filterRejectedIssues,
   findLatestTranscript,
+  isApplied,
   issueFingerprint,
   pruneTranscripts,
   renderFixProposal,
@@ -914,7 +915,8 @@ async function handleApplyReview(
     JSON.stringify({ transcriptPath, iteration: stored.iteration, edits, outcomes }, null, 2),
   );
 
-  const appliedCount = outcomes.filter((o) => o.status === "applied").length;
+  const appliedCount = outcomes.filter(isApplied).length;
+  const unsavedCount = outcomes.filter((o) => o.status === "unsaved").length;
   const dryCount = outcomes.filter((o) => o.status === "dry-run").length;
   const skippedCount = outcomes.filter((o) => o.status === "skipped").length;
 
@@ -924,9 +926,27 @@ async function handleApplyReview(
       `\ud83d\udd0d **Dry run** \u2014 would apply ${dryCount} edit(s), skip ${skippedCount}. ` +
         "Set `codecrosscheck.applyReview.dryRun` to `false` to write changes.\n\n",
     );
+  } else if (unsavedCount > 0) {
+    // Saying "applied" alone reads as "on disk", and it is not: `git status`
+    // stays clean and closing without saving discards the batch.
+    stream.markdown(
+      `\u2705 Changed **${unsavedCount}** file(s) in the editor; skipped **${skippedCount}**. ` +
+        `Undo reverts the whole batch.\n\n` +
+        `\u26a0\ufe0f **Nothing is on disk yet** \u2014 these are unsaved editor changes. ` +
+        `Save them to write the files.\n\n`,
+    );
+    stream.button({
+      command: "workbench.action.files.saveAll",
+      title: `Save ${unsavedCount} changed file(s)`,
+      arguments: [],
+    });
+    stream.markdown(
+      "\n**Next steps:** save, then run `git diff` to inspect and commit. " +
+        "Re-run `/review-branch` to verify findings are closed.\n\n",
+    );
   } else {
     stream.markdown(
-      `\u2705 Applied **${appliedCount}** edit(s); skipped **${skippedCount}**. Undo reverts the whole batch.\n\n` +
+      `\u2705 Wrote **${appliedCount}** edit(s) to disk; skipped **${skippedCount}**.\n\n` +
         "**Next steps:** run `git diff` to inspect, then commit. Re-run `/review-branch` to verify findings are closed.\n\n",
     );
   }
@@ -1023,12 +1043,16 @@ function workspaceEditHost(): EditHost {
 }
 
 function renderApplyOutcomes(stream: vscode.ChatResponseStream, outcomes: ApplyOutcome[]): void {
+  const verbs = {
+    written: "written to disk",
+    unsaved: "changed in the editor (unsaved)",
+    "dry-run": "would apply",
+    skipped: "skipped",
+  } as const;
   for (const o of outcomes) {
-    const icon =
-      o.status === "applied" ? "\u2705" : o.status === "dry-run" ? "\ud83d\udd0d" : "\u26a0\ufe0f";
+    const icon = isApplied(o) ? "\u2705" : o.status === "dry-run" ? "\ud83d\udd0d" : "\u26a0\ufe0f";
     const tail = o.reason ? ` \u2014 ${o.reason}` : "";
-    const verb = o.status === "dry-run" ? "would apply" : o.status;
-    stream.markdown(`- ${icon} \`${o.path}\` \u2014 ${verb}${tail}\n  - **why:** ${o.why}\n`);
+    stream.markdown(`- ${icon} \`${o.path}\` \u2014 ${verbs[o.status]}${tail}\n  - **why:** ${o.why}\n`);
   }
   stream.markdown("\n");
 }

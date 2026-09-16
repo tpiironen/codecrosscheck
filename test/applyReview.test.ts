@@ -302,7 +302,7 @@ describe("applyReview.applyEdit", () => {
       fs,
       { dryRun: false },
     );
-    expect(result.status).toBe("applied");
+    expect(result.status).toBe("written");
     expect(files.get(r("src/new.ts"))).toBe("hello");
   });
 
@@ -363,7 +363,7 @@ describe("applyReview.applyEdit", () => {
       fs,
       { dryRun: false },
     );
-    expect(result.status).toBe("applied");
+    expect(result.status).toBe("written");
     expect(files.get(r("src/a.ts"))).toBe("before\nnew\nafter");
   });
 
@@ -560,7 +560,7 @@ describe("applyReview.applyEdit — line-ending drift", () => {
       { dryRun: false },
     );
 
-    expect(result.status).toBe("applied");
+    expect(result.status).toBe("written");
     const after = files.get(r("src/schemas.ts"))!;
     expect(after).toContain(".refine((f) => f.status === \"fixed\"");
     // The patched region must not smuggle LF into a CRLF file.
@@ -578,7 +578,7 @@ describe("applyReview.applyEdit — line-ending drift", () => {
       { dryRun: false },
     );
 
-    expect(result.status).toBe("applied");
+    expect(result.status).toBe("written");
     expect(files.get(r("a.ts"))).not.toContain("\r");
   });
 
@@ -642,7 +642,7 @@ describe("applyReview.applyEdit — no repair guessing", () => {
       fs,
       { dryRun: false },
     );
-    expect(result.status).toBe("applied");
+    expect(result.status).toBe("written");
     expect(files.get(r("a.cs"))).toBe("ALPHA\r\nBETA\r\ngamma\r\n");
   });
 });

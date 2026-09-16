@@ -34,9 +34,15 @@ export interface StoredFixProposal {
 
 export interface ApplyOutcome {
   path: string;
-  status: "applied" | "skipped" | "dry-run";
+  /** `unsaved` is a success: the edit is in an editor buffer but not yet on disk. */
+  status: "written" | "unsaved" | "skipped" | "dry-run";
   reason?: string;
   why: string;
+}
+
+/** Whether an outcome changed the file, on disk or in a buffer. */
+export function isApplied(o: ApplyOutcome): boolean {
+  return o.status === "written" || o.status === "unsaved";
 }
 
 /** Marks a completed `/review-branch` or `/openspec-review` run. */
@@ -420,7 +426,7 @@ export async function applyEdit(
       return { path: edit.path, status: "dry-run", why: edit.why };
     }
     await fs.writeFile(safe.abs, edit.newString);
-    return { path: edit.path, status: "applied", why: edit.why };
+    return { path: edit.path, status: "written", why: edit.why };
   }
 
   if (!exists) {
@@ -441,7 +447,7 @@ export async function applyEdit(
   const updated =
     original.slice(0, match.at) + match.replacement + original.slice(match.at + match.matched.length);
   await fs.writeFile(safe.abs, updated);
-  return { path: edit.path, status: "applied", why: edit.why };
+  return { path: edit.path, status: "written", why: edit.why };
 }
 
 /** `oldString` as written, and its pure-LF and pure-CRLF forms. Most literal first. */
@@ -551,9 +557,10 @@ export async function applyEdits(
   if (writes.length === 0) return results;
   if (options.host) {
     await options.host.commit(writes);
-  } else {
-    for (const w of writes) await fs.writeFile(w.path, w.content);
+    // The host mutates open documents; nothing is on disk until the user saves.
+    return results.map((o) => (o.status === "written" ? { ...o, status: "unsaved" as const } : o));
   }
+  for (const w of writes) await fs.writeFile(w.path, w.content);
   return results;
 }
 

@@ -62,7 +62,7 @@ describe("applyEdits: replacement text is written literally", () => {
         fs,
         { dryRun: false },
       );
-      expect(outcomes[0].status).toBe("applied");
+      expect(outcomes[0].status).toBe("written");
       expect(files.get(r("a.txt"))).toBe(`AAA ${newString} ZZZ`);
     });
   }
@@ -111,8 +111,43 @@ describe("applyEdits: batch semantics", () => {
       fs,
       { dryRun: false },
     );
-    expect(outcomes.map((o) => o.status)).toEqual(["applied", "applied"]);
+    expect(outcomes.map((o) => o.status)).toEqual(["written", "written"]);
     expect(files.get(r("a.ts"))).toBe("ALPHA BETA");
+  });
+
+  it("reports host-committed edits as unsaved, not written", async () => {
+    // The host mutates open documents; nothing reaches disk until the user
+    // saves. Reporting these as written cost two round trips on 2026-09-16,
+    // because `git status` stayed clean after a run that said "applied".
+    const { fs, files } = makeFakeFs({ files: { [r("a.ts")]: "one", [r("b.ts")]: "two" } });
+    const host: EditHost = { async commit() {} };
+    const outcomes = await applyEdits(
+      WS,
+      [
+        { path: "a.ts", oldString: "one", newString: "1", why },
+        { path: "b.ts", oldString: "two", newString: "2", why },
+      ],
+      fs,
+      { dryRun: false, host },
+    );
+    expect(outcomes.map((o) => o.status)).toEqual(["unsaved", "unsaved"]);
+    // The host swallowed the writes, so the backing files are untouched.
+    expect(files.get(r("a.ts"))).toBe("one");
+  });
+
+  it("leaves a skipped edit skipped when a host is used", async () => {
+    const { fs } = makeFakeFs({ files: { [r("a.ts")]: "keep" } });
+    const host: EditHost = { async commit() {} };
+    const outcomes = await applyEdits(
+      WS,
+      [
+        { path: "a.ts", oldString: "keep", newString: "kept", why },
+        { path: "a.ts", oldString: "absent", newString: "x", why },
+      ],
+      fs,
+      { dryRun: false, host },
+    );
+    expect(outcomes.map((o) => o.status)).toEqual(["unsaved", "skipped"]);
   });
 
   it("writes nothing when a later edit fails to match", async () => {

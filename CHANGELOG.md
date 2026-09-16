@@ -13,22 +13,30 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
-OpenSpec changes:
-[`fix-edit-application-and-verdict-honesty`](openspec/changes/fix-edit-application-and-verdict-honesty/proposal.md),
-[`harden-trust-and-sandbox`](openspec/changes/harden-trust-and-sandbox/proposal.md),
-[`add-cancellation-and-worktree-diff`](openspec/changes/add-cancellation-and-worktree-diff/proposal.md),
-[`modernize-chat-surface`](openspec/changes/modernize-chat-surface/proposal.md),
-[`modernize-toolchain`](openspec/changes/modernize-toolchain/proposal.md),
-[`update-default-model-pair`](openspec/changes/update-default-model-pair/proposal.md),
-[`raise-review-branch-diff-budget`](openspec/changes/raise-review-branch-diff-budget/proposal.md),
-[`trim-rereview-diff-context`](openspec/changes/trim-rereview-diff-context/proposal.md),
-[`flush-transcript-before-return`](openspec/changes/flush-transcript-before-return/proposal.md),
-[`pin-vscode-api-floor`](openspec/changes/pin-vscode-api-floor/proposal.md),
-[`add-finding-triage`](openspec/changes/add-finding-triage/proposal.md),
-[`replace-github-models-with-openai-compatible`](openspec/changes/replace-github-models-with-openai-compatible/proposal.md),
-[`fix-referenced-path-normalisation`](openspec/changes/fix-referenced-path-normalisation/proposal.md),
-[`budget-file-context-per-file`](openspec/changes/budget-file-context-per-file/proposal.md),
-[`replace-context-harvest-with-tools`](openspec/changes/replace-context-harvest-with-tools/proposal.md).
+## [0.5.0] — 2026-09-16
+
+OpenSpec changes (all archived under `openspec/changes/archive/2026-09-16-*`):
+[`fix-edit-application-and-verdict-honesty`](openspec/changes/archive/2026-09-16-fix-edit-application-and-verdict-honesty/proposal.md),
+[`harden-trust-and-sandbox`](openspec/changes/archive/2026-09-16-harden-trust-and-sandbox/proposal.md),
+[`add-cancellation-and-worktree-diff`](openspec/changes/archive/2026-09-16-add-cancellation-and-worktree-diff/proposal.md),
+[`modernize-chat-surface`](openspec/changes/archive/2026-09-16-modernize-chat-surface/proposal.md),
+[`modernize-toolchain`](openspec/changes/archive/2026-09-16-modernize-toolchain/proposal.md),
+[`update-default-model-pair`](openspec/changes/archive/2026-09-16-update-default-model-pair/proposal.md),
+[`raise-review-branch-diff-budget`](openspec/changes/archive/2026-09-16-raise-review-branch-diff-budget/proposal.md),
+[`trim-rereview-diff-context`](openspec/changes/archive/2026-09-16-trim-rereview-diff-context/proposal.md),
+[`flush-transcript-before-return`](openspec/changes/archive/2026-09-16-flush-transcript-before-return/proposal.md),
+[`pin-vscode-api-floor`](openspec/changes/archive/2026-09-16-pin-vscode-api-floor/proposal.md),
+[`add-finding-triage`](openspec/changes/archive/2026-09-16-add-finding-triage/proposal.md),
+[`replace-github-models-with-openai-compatible`](openspec/changes/archive/2026-09-16-replace-github-models-with-openai-compatible/proposal.md),
+[`fix-referenced-path-normalisation`](openspec/changes/archive/2026-09-16-fix-referenced-path-normalisation/proposal.md),
+[`budget-file-context-per-file`](openspec/changes/archive/2026-09-16-budget-file-context-per-file/proposal.md),
+[`replace-context-harvest-with-tools`](openspec/changes/archive/2026-09-16-replace-context-harvest-with-tools/proposal.md),
+[`report-applied-edits-as-unsaved`](openspec/changes/archive/2026-09-16-report-applied-edits-as-unsaved/proposal.md).
+
+**Known gap:** the planted-flaw corpus comparison for
+`replace-context-harvest-with-tools` (task E2) has not been run. It needs
+`RUN_LIVE_TESTS=1` and a configured model endpoint. Nothing in this release
+should be read as evidence about the corpus pass rate.
 
 ### Added
 
@@ -81,6 +89,14 @@ OpenSpec changes:
   occur in ordinary prose.
 - `scripts/copy-assets.mjs` clears the destination before copying. `cpSync`
   merges, so a deleted prompt survived in `dist/` and shipped in the VSIX.
+- **`/apply-review` no longer calls an unsaved buffer "applied".** Edits are
+  committed through `vscode.workspace.applyEdit` so one undo reverts the batch,
+  which means nothing reaches disk until the files are saved — but the report
+  said `✅ applied` and the debug log agreed. During this release's own
+  dogfooding that read as a broken apply path twice in one hour, `git status`
+  showing a clean tree after a run that claimed 12 edits. Outcomes now
+  distinguish `written` from `unsaved`, the summary says plainly that nothing
+  is on disk yet, and it offers a Save button.
 
 ### Removed
 
