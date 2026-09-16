@@ -2,20 +2,40 @@
 
 ## MODIFIED Requirements
 
-### Requirement: The sandbox SHALL NOT claim unimplemented isolation
+### Requirement: Sandboxed execution
 
-The EXECUTE sandbox SHALL isolate the working directory, scrub the
-environment to an allowlist, and enforce a hard timeout. It SHALL NOT claim
-any isolation property it does not enforce.
+Code executed in the `EXECUTE` stage SHALL run in a temporary working directory
+under `os.tmpdir()`, with a hard timeout, and with the environment scrubbed to
+an allowlist. It SHALL NOT claim any isolation property it does not enforce.
 
 Specifically, the sandbox SHALL NOT set `NO_PROXY` as a network-denial
 mechanism. `NO_PROXY` instructs clients to bypass a proxy and does not deny
 network access, so presenting it as an `allowNetwork: false` implementation
 misrepresents the boundary. The `allowNetwork` option SHALL be removed rather
-than retained with no effect.
+than retained with no effect, and network access SHALL be documented as
+unrestricted.
 
 Documentation and setting descriptions SHALL state plainly that generated code
 runs with the invoking user's filesystem privileges.
+
+#### Scenario: Timeout enforced
+
+- **GIVEN** `timeoutMs: 1000`
+- **WHEN** the executed code runs an infinite loop
+- **THEN** the process is killed within 2000 ms
+- **AND** `runSandboxed` returns with a non-zero `exitCode`
+
+#### Scenario: Tempdir isolation
+
+- **WHEN** the executed code writes to its current working directory
+- **THEN** the writes occur under `os.tmpdir()`
+- **AND** the tempdir is removed after `runSandboxed` returns
+
+#### Scenario: Environment scrubbed
+
+- **GIVEN** the calling process has `SECRET_KEY=hunter2` in its environment
+- **WHEN** the executed code prints its environment
+- **THEN** the output does not contain `SECRET_KEY` or `hunter2`
 
 #### Scenario: Sandbox does not set proxy-bypass variables
 
@@ -23,16 +43,7 @@ runs with the invoking user's filesystem privileges.
 - **THEN** the child environment contains no `NO_PROXY` or `no_proxy` entry
   introduced by the sandbox
 
-#### Scenario: Environment remains allowlisted
-
-- **WHEN** code is executed through the sandbox
-- **THEN** the child environment contains only variables on the allowlist, and
-  no other variable from the parent process
-
-#### Scenario: Timeout is still enforced
-
-- **WHEN** executed code exceeds the configured timeout
-- **THEN** the child is killed and the result reports `timedOut: true`
+## ADDED Requirements
 
 ### Requirement: Subprocess invocation SHALL NOT shell-interpret a command string
 

@@ -1,6 +1,6 @@
 # chat-loop spec delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: The structured-output retry SHALL show the model its failure
 

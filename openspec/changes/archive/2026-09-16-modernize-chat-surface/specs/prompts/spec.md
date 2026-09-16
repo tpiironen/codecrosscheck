@@ -1,6 +1,6 @@
 # prompts spec delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Markdown-producing workers SHALL return plain text
 

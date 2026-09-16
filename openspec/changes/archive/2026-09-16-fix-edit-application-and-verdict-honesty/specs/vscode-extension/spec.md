@@ -1,6 +1,6 @@
 # vscode-extension spec delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Applied edits SHALL be written byte-for-byte
 

@@ -911,3 +911,364 @@ transcript event, including each finding's id, status and evidence.
 - **THEN** a `review-branch-triage` transcript event records each finding's id,
   status and evidence
 
+### Requirement: Command-executing settings SHALL NOT be workspace-overridable
+
+Any setting whose value is executed as a command SHALL be contributed with
+`"scope": "machine"` so a workspace `.vscode/settings.json` cannot supply it.
+This applies to `codecrosscheck.applyReview.buildCommand`,
+`codecrosscheck.applyReview.testCommand`, and any future setting with the same
+property.
+
+The extension manifest SHALL additionally declare
+`capabilities.untrustedWorkspaces` explicitly rather than relying on the
+absence of the field to imply `supported: false`.
+
+#### Scenario: Workspace settings cannot supply a build command
+
+- **WHEN** a workspace `.vscode/settings.json` sets
+  `codecrosscheck.applyReview.buildCommand`
+- **THEN** the value is not returned to the extension, and `/apply-review`
+  behaves as though no build command is configured
+
+#### Scenario: Manifest states its trust posture
+
+- **WHEN** the extension manifest is inspected
+- **THEN** it contains a `capabilities.untrustedWorkspaces` entry with an
+  explicit `supported` value and a description
+
+### Requirement: Command execution SHALL require a trusted workspace
+
+`/apply-review` SHALL check `vscode.workspace.isTrusted` before running a
+configured build or test command. When the workspace is not trusted the
+handler SHALL skip both steps and SHALL say so in chat rather than failing
+silently.
+
+#### Scenario: Untrusted workspace skips the build gate
+
+- **WHEN** `/apply-review` applies edits in a workspace that is not trusted
+  and a build command is configured
+- **THEN** the command is not executed and the chat output states that command
+  execution requires a trusted workspace
+
+#### Scenario: Trusted workspace runs the gate as before
+
+- **WHEN** the workspace is trusted and a build command is configured
+- **THEN** the build gate runs and reports its exit code as before
+
+### Requirement: The transcript directory SHALL be self-ignoring and bounded
+
+On creating the transcript directory the extension SHALL ensure a
+`.gitignore` exists inside it that ignores the directory's own contents, so a
+consumer repository cannot commit review transcripts by accident.
+
+The extension SHALL prune transcripts beyond a retention limit, oldest first,
+so the directory does not grow without bound.
+
+#### Scenario: Transcript directory ignores itself on creation
+
+- **WHEN** the transcript directory is created for the first time in a
+  workspace
+- **THEN** it contains a `.gitignore` whose rules exclude the transcripts from
+  version control
+
+#### Scenario: Old transcripts are pruned
+
+- **WHEN** the number of transcripts exceeds the retention limit
+- **THEN** the oldest transcripts beyond the limit are deleted and the newest
+  are retained
+
+### Requirement: Transcript discovery SHALL NOT scan whole files
+
+`findLatestTranscript` SHALL identify the newest completed transcript without
+reading every candidate file in full. Because the terminating event is the
+last record written, inspecting the tail is sufficient.
+
+Detection SHALL match a parsed terminating event rather than a raw substring.
+A substring test over the whole file matches any worker artifact that merely
+quotes the event name — including a review of this codebase.
+
+Transcript writes SHALL NOT block the extension host with synchronous
+filesystem calls for every event.
+
+#### Scenario: An artifact quoting the event name is not mistaken for a completed run
+
+- **WHEN** a transcript's worker artifact text contains the terminating event
+  name but the run never completed
+- **THEN** that transcript is not selected as the latest completed one
+
+#### Scenario: The newest completed transcript is selected
+
+- **WHEN** several transcripts exist and more than one completed
+- **THEN** the most recently modified completed transcript is returned
+
+#### Scenario: Event writes do not block the host
+
+- **WHEN** a run writes transcript events
+- **THEN** the writes are performed without synchronous filesystem calls on the
+  extension host
+
+### Requirement: The verdict webview SHALL restrict its own capabilities
+
+The verdict webview SHALL declare `localResourceRoots: []` and SHALL emit a
+`Content-Security-Policy` meta tag that denies scripts and restricts every
+other directive to `'none'` except inline styles. This applies to the webview
+created by `codecrosscheck.reviewSelection` and
+`codecrosscheck.reviewActiveFile`.
+
+Model-produced text rendered into that document SHALL continue to be HTML
+escaped.
+
+#### Scenario: Webview denies script execution
+
+- **WHEN** the verdict webview is opened
+- **THEN** its HTML contains a Content-Security-Policy meta tag with
+  `default-src 'none'` and no `script-src` permitting execution
+
+#### Scenario: Model text is escaped
+
+- **WHEN** a verdict field contains `<script>` or `&`
+- **THEN** the rendered HTML contains the escaped entity form, not live markup
+
+### Requirement: Chat handlers SHALL honour the request cancellation token
+
+Every chat request handler SHALL pass the `CancellationToken` it receives into
+the work it starts, so that stopping the response stops the underlying model
+calls. No handler SHALL discard the token.
+
+A cancelled run SHALL be reported distinctly from an approved, rebutted, or
+exhausted one, and SHALL still link the transcript written so far.
+
+#### Scenario: Stopping the response stops the loop
+
+- **WHEN** the user cancels a `/review-branch` response mid-dialogue
+- **THEN** no further worker or reviewer call is issued
+
+#### Scenario: Cancelled runs are reported as cancelled
+
+- **WHEN** a run is cancelled
+- **THEN** the summary states the run was cancelled, reports how many
+  iterations completed, and links the transcript
+
+#### Scenario: Cancellation is recorded in the transcript
+
+- **WHEN** a run is cancelled
+- **THEN** the terminating transcript event records the cancelled outcome
+
+### Requirement: Configuration SHALL have a single source of defaults
+
+All `codecrosscheck.*` settings SHALL be read through one module that declares
+exactly one default per setting. Handlers SHALL NOT restate defaults inline.
+
+The declared defaults SHALL match the values contributed in the extension
+manifest. A test SHALL assert that agreement so the two cannot drift.
+
+Dead routing entries SHALL be removed; a command that returns before the stage
+list is read SHALL NOT appear in the stage map.
+
+#### Scenario: Reviewer fallback is not the worker's default
+
+- **WHEN** configuration resolution is inspected for any handler
+- **THEN** the reviewer default is the configured cross-vendor reviewer family
+  and never the worker's default family
+
+#### Scenario: Manifest and code defaults agree
+
+- **WHEN** the settings contributed in the manifest are compared with the
+  defaults declared in the configuration module
+- **THEN** every shared key has an identical default value
+
+#### Scenario: Iteration cap has one default
+
+- **WHEN** `maxIters` is resolved with no user configuration present
+- **THEN** every surface — chat participant, CLI, and documentation — reports
+  the same value
+
+### Requirement: Model families SHALL be discovered, not enumerated
+
+The extension SHALL NOT contribute a fixed enumeration of model families.
+`codecrosscheck.workerModel` and `codecrosscheck.reviewerModel` SHALL be
+free-text settings.
+
+The extension SHALL contribute a command that lists the families actually
+available via `vscode.lm.selectChatModels` and writes the user's choice to the
+corresponding setting.
+
+When a configured family matches no available model, the failure message SHALL
+name the families that *are* available.
+
+#### Scenario: Picker offers only available families
+
+- **WHEN** the model picker command runs
+- **THEN** the offered choices are derived from `vscode.lm.selectChatModels`
+  and not from a hardcoded list
+
+#### Scenario: Unknown family reports the available set
+
+- **WHEN** a configured family matches no available model
+- **THEN** the error names the configured family and lists the available ones
+
+### Requirement: Handlers SHALL use the modern chat response surface
+
+Chat request handlers SHALL return a `ChatResult`. When a run fails, the result
+SHALL carry `errorDetails` rather than only prose in the stream.
+
+Handlers SHALL register a followup provider offering the next actions a run
+implies — at minimum applying a fix proposal, re-running with `force-fix-all`,
+and raising the iteration cap after a non-converged run.
+
+Where the response recommends running another command, it SHALL expose that
+command as a button in addition to naming it.
+
+#### Scenario: Fix proposal offers an apply followup
+
+- **WHEN** `/review-branch` finishes with a fix proposal available
+- **THEN** the response offers a followup and a button that invoke
+  `/apply-review`
+
+#### Scenario: Non-converged run offers a retry followup
+
+- **WHEN** a run ends because the iteration cap was reached
+- **THEN** the response offers a followup that re-runs with a higher cap
+
+#### Scenario: Failures surface as result error details
+
+- **WHEN** a handler aborts because the diff is empty, too large, or the model
+  call failed
+- **THEN** the returned `ChatResult` carries `errorDetails` describing the
+  cause
+
+### Requirement: Files attached to the request SHALL be used
+
+Handlers SHALL read `ChatRequest.references` and incorporate the referenced
+file or selection contents into the prompt they assemble. Attached context
+SHALL NOT be silently discarded.
+
+The response SHALL state which attachments were used, and SHALL count their
+size against the same character budget that guards the diff.
+
+#### Scenario: Attached file is included in the prompt
+
+- **WHEN** the user attaches a file to a `/code` or `/review-branch` request
+- **THEN** its contents appear in the prompt sent to the model and the response
+  names the attachment
+
+#### Scenario: Attachments count against the budget
+
+- **WHEN** the diff plus attachments exceed the configured character cap
+- **THEN** the handler aborts with the same guidance it gives for an oversized
+  diff
+
+### Requirement: Applied edits SHALL be written byte-for-byte
+
+`/apply-review` SHALL write `newString` into the target file exactly as the
+worker produced it. The replacement SHALL NOT be interpreted for `$`
+substitution patterns, HTML entities, or any other escape convention.
+
+Implementations SHALL NOT use `String.prototype.replace` with a string
+search value for this purpose, because `GetSubstitution` expands `$$`, `$&`,
+`` $` `` and `$'` in the replacement regardless of the search value's type.
+Because `applyEdit` has already established that `oldString` matches exactly
+once, splicing on `indexOf` is both sufficient and unambiguous.
+
+#### Scenario: Replacement containing the whole-match pattern is written literally
+
+- **WHEN** an edit's `newString` contains `$&`
+- **THEN** the file on disk contains the literal characters `$&` and NOT the
+  text that `oldString` matched
+
+#### Scenario: Replacement containing prefix, suffix and escape patterns is written literally
+
+- **WHEN** an edit's `newString` contains any of `` $` ``, `$'`, or `$$`
+- **THEN** the file on disk contains those characters literally, and the
+  outcome is reported as `applied`
+
+#### Scenario: Ordinary replacements are unaffected
+
+- **WHEN** an edit's `newString` contains no `$` character
+- **THEN** the resulting file content is identical to the previous
+  implementation's output
+
+### Requirement: Applied edits SHALL be undoable and SHALL respect open editors
+
+`/apply-review` SHALL apply its edits through `vscode.workspace.applyEdit` so
+the whole batch lands as one entry on the undo stack and a single undo reverts
+the run.
+
+Writing directly to disk bypasses the editor's document model: edits made
+under a dirty buffer produce a file-changed-on-disk conflict, and the user has
+no undo path for a batch of model-authored changes. Path validation, existence
+checks, and occurrence counting remain unchanged; only the write mechanism
+does.
+
+When no workspace edit host is available — the CLI, or tests — the
+implementation SHALL fall back to the injected filesystem.
+
+#### Scenario: A batch of edits undoes in one step
+
+- **WHEN** `/apply-review` applies three edits across two files
+- **THEN** a single undo reverts all three
+
+#### Scenario: Edits apply to a file with unsaved changes
+
+- **WHEN** a target file has unsaved editor changes and an edit applies to it
+- **THEN** the edit is applied to the document rather than overwriting it on
+  disk, and no file-changed-on-disk conflict is raised
+
+#### Scenario: Dry run writes nothing
+
+- **WHEN** `/apply-review` runs with `dryRun` enabled
+- **THEN** no workspace edit is applied and no file is written
+
+### Requirement: A suppressed-findings exit SHALL NOT be reported as approval
+
+`/review-branch` SHALL track how its dialogue terminated and SHALL
+distinguish at least three outcomes:
+
+- `approved` — the reviewer returned `verdict: "approve"` on its own.
+- `rebutted` — the loop ended because every remaining finding matched a
+  fingerprint the worker had previously rebutted.
+- `exhausted` — the iteration cap was reached with findings outstanding.
+
+The summary SHALL render `rebutted` distinctly from `approved`, SHALL NOT use
+the approval icon or the phrase "Reviewer is satisfied" for it, and SHALL
+state that the outstanding findings await user adjudication.
+
+#### Scenario: Reviewer approves on its own
+
+- **WHEN** the reviewer returns `verdict: "approve"` with no rebuttal
+  filtering applied
+- **THEN** the summary reports approval and attributes it to the reviewer
+
+#### Scenario: All findings suppressed by worker rebuttals
+
+- **WHEN** every outstanding finding matches a fingerprint the worker rebutted
+  in an earlier round, so the filtered issue list is empty
+- **THEN** the summary SHALL NOT claim the reviewer approved, and SHALL
+  direct the user to the listed rebuttals for adjudication
+
+#### Scenario: Iteration cap reached with findings outstanding
+
+- **WHEN** the loop reaches `maxIters` while the reviewer still reports issues
+  that were not suppressed
+- **THEN** the summary reports non-convergence, unchanged from current
+  behaviour
+
+### Requirement: Rejected-issue filtering SHALL be side-effect free
+
+`filterRejectedIssues` SHALL return a description of what it filtered rather
+than deciding the verdict on the caller's behalf. It SHALL NOT mutate the
+verdict it was given, and SHALL NOT reach a `"approve"` value through a type
+assertion that bypasses the declared generic.
+
+#### Scenario: Filtering reports an emptied issue list without asserting approval
+
+- **WHEN** filtering removes every issue from the verdict
+- **THEN** the return value signals that the list was emptied by suppression,
+  and the caller decides how to terminate and how to report it
+
+#### Scenario: Input verdict is not mutated
+
+- **WHEN** `filterRejectedIssues` drops one or more issues
+- **THEN** the verdict object passed in is unchanged, and the returned
+  verdict is a distinct object
+
