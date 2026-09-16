@@ -8,7 +8,8 @@ Live-mode reviewer evaluation. Each subdirectory contains:
 Run with:
 
 ```bash
-RUN_LIVE_TESTS=1 GITHUB_TOKEN=ghp_xxx npm test -- corpus
+RUN_LIVE_TESTS=1 CODECROSSCHECK_BASE_URL=https://api.openai.com/v1 \
+  CODECROSSCHECK_API_KEY=sk-xxx npm test -- corpus
 ```
 
 The harness skips when `RUN_LIVE_TESTS` is unset so CI without secrets stays green.

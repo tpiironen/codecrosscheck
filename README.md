@@ -33,12 +33,9 @@ npm ci
 npm run build
 
 # 1. VS Code extension (chat participant @codecrosscheck)
-npx vsce package --allow-missing-repository `
-  --baseContentUrl https://example.invalid/ `
-  --baseImagesUrl  https://example.invalid/ `
-  --out codecrosscheck-0.2.0.vsix
+npx vsce package --no-dependencies
 & "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd" `
-  --install-extension .\codecrosscheck-0.2.0.vsix --force
+  --install-extension .\codecrosscheck-0.5.0.vsix --force
 
 # 2. CLI — link the local checkout, no registry needed
 npm link              # exposes `codecrosscheck` and `ccc` globally
@@ -131,33 +128,44 @@ Activate with `@codecrosscheck` in chat. Slash commands:
 - `/review-branch [extra instructions]` — worker↔reviewer dialogue on the
   current branch diff (vs `origin/main` or `origin/master` merge-base).
   Add `diff-base=<ref>` to override (e.g. `diff-base=HEAD~3`,
-  `diff-base=empty`). Iteration 1: reviewer
-  reads the diff and emits findings (every finding it can identify, ordered
-  high → low). Iterations 2..N: worker proposes a complete, self-contained
-  fix proposal for every finding, reviewer re-judges. Capped by
-  `codecrosscheck.maxIters`, or per-invocation by adding
-  `max-iters=N` / `iters=N` (range 1..20) to the prompt. The worker may
-  push back on a finding by writing `**Fix:** Disagree: …`; such
-  rebuttals are surfaced at the end of the run and the user adjudicates
-  by either accepting (run `/apply-review` — rebutted findings produce
-  no edits) or overriding (re-run with `force-fix-all` anywhere in the
-  prompt to require a concrete fix for every finding). Issues where
-  the worker dodged via prose / sketches without using the explicit
-  `Disagree:` token are surfaced as a separate "🚫 finding(s) the
-  worker did not produce a real patch for" block. When the reviewer
-  cites a file outside the diff, the next iteration auto-injects the
-  current contents of the cited files into the fixer input so it can
-  produce real patches.
-- `/apply-review [extra instructions]` — apply the latest `/review-branch`
-  fix proposal to the working tree. Reads the most recent review
-  transcript, has the worker derive structured `{path, oldString, newString}`
-  edits, validates each path stays under the workspace root and each
-  `oldString` is unique, and writes via `vscode.workspace.fs`. Includes
-  safety-net repairs (CRLF↔LF normalisation and unified-diff stripping)
-  so worker output that's slightly off still applies, and a create-mode
-  (empty `oldString`) for new files. Every run writes a debug log at
-  `<workspace>/.codecrosscheck/runs/<iso>-apply.json`. Recommended
-  loop: `/review-branch` → `/apply-review` → `git diff` → commit. Use
+  `diff-base=empty`). Iteration 1: reviewer reads the diff and emits findings
+  (every finding it can identify, ordered high → low). Iterations 2..N: the
+  findings are triaged, then the worker answers each surviving one, and the
+  reviewer re-judges. Capped by `codecrosscheck.maxIters`, or per-invocation by
+  adding `max-iters=N` / `iters=N` (range 1..20) to the prompt.
+
+  The worker answers every finding with a status:
+
+  | Status | Meaning |
+  |---|---|
+  | `fixed` | Carries exact edits that resolve the finding |
+  | `disagree` | The finding is wrong; the explanation is the rebuttal, and no edits are produced |
+  | `unaddressed` | Real or not, the worker could not produce an edit, and says what stopped it |
+
+  Rebuttals are surfaced at the end of the run for you to adjudicate: accept
+  them by running `/apply-review` (a rebutted finding carries no edits), or
+  override by re-running with `force-fix-all` anywhere in the prompt, which
+  requires a concrete fix for every finding and withdraws `disagree`.
+
+  The triager and the worker have **read-only access to the workspace** —
+  `read_file`, `search_workspace`, `list_directory` — and fetch whatever source
+  they need mid-reasoning. Every call is shown in the progress stream and
+  recorded in the transcript. See [Workspace toolset](#workspace-toolset).
+- `/apply-review` — apply the latest `/review-branch` fix proposal to the
+  working tree. It reads the edits the worker already produced from the review
+  transcript and applies them; **it calls no model**. Each path is validated to
+  resolve under the workspace root, and each `oldString` must occur exactly
+  once. Line endings are the only difference repaired — a model reads a CRLF
+  file correctly and still emits LF in its JSON — so an `oldString` that
+  differs by anything else is skipped with a reason rather than guessed at.
+  An empty `oldString` creates a new file.
+
+  Edits land through `vscode.workspace.applyEdit`, so the whole batch is one
+  undo step and files with unsaved changes are edited in the document. That
+  also means **nothing is on disk until you save** — the summary says so and
+  offers a Save button. Every run writes a debug log at
+  `<workspace>/.codecrosscheck/runs/<iso>-apply.json`. Recommended loop:
+  `/review-branch` → `/apply-review` → save → `git diff` → commit. Use
   `codecrosscheck.applyReview.dryRun` to preview without writing.
 - `/openspec-init`, `/openspec-new <id>`, `/openspec-review <id>`,
   `/openspec-archive <id>` — see [Spec-driven implementation](#spec-driven-implementation) below.
@@ -175,10 +183,9 @@ the two-step workflow is:
    writes a transcript to `.codecrosscheck/runs/<iso>.jsonl`. The
    EXECUTE stage is skipped (the sandbox can never reproduce a real
    workspace, so its verdict would be misleading).
-2. `@codecrosscheck /apply-review` — reads the transcript, derives
-   structured `{path, oldString, newString}` edits from the CODE-stage
-   artifact, validates each path under the workspace root, and writes
-   the edits via `vscode.workspace.fs`. Optionally runs the configured
+2. `@codecrosscheck /apply-review` — reads the transcript and applies the
+   edits the worker already produced, validating each path under the
+   workspace root. No model call. Optionally runs the configured
    `applyReview.buildCommand` as a gate. Use
    `codecrosscheck.applyReview.dryRun` to preview without writing.
 
@@ -190,6 +197,34 @@ Editor commands (Command Palette):
 
 - **CodeCrossCheck: Review Selection** — single-shot reviewer on selection
 - **CodeCrossCheck: Review Active File** — single-shot reviewer on whole file
+
+### Workspace toolset
+
+During `/review-branch`, the triager and the worker are given a **read-only**
+view of the workspace and fetch what they need while reasoning:
+
+| Tool | Purpose |
+|---|---|
+| `read_file` | Read a file, optionally a line range |
+| `search_workspace` | Find a symbol or pattern, returning `path:line: text` |
+| `list_directory` | List a directory's entries |
+
+This replaced a pass that scraped likely file paths out of the reviewer's prose
+and pre-injected their contents. That could not work: the file an agent turns
+out to need is often one the finding never mentions, which is only discovered
+mid-reasoning.
+
+The toolset exposes **no operation that writes, creates or deletes**. Every
+path is confined to the workspace root, screened against a denylist (VCS
+metadata, build output, dependency trees, and credential files such as `.env`,
+`*.pem`, `id_rsa`), and then checked against the repository's own ignore rules
+via `git check-ignore` when the workspace is a git repository. Each agent's
+gathering phase is bounded by `codecrosscheck.tools.maxCalls` and
+`codecrosscheck.tools.deadlineMs`; when a budget runs out the model is told so
+and must answer from what it has. Set `maxCalls` to `0` to disable tools.
+
+Every call is streamed to the chat progress line and recorded in the run
+transcript as a `tool-call` event, so a file read is never invisible.
 
 ### Settings
 
@@ -207,6 +242,8 @@ Editor commands (Command Palette):
 | `codecrosscheck.applyReview.buildTimeoutMs` | `300000` |
 | `codecrosscheck.applyReview.testCommand` | `""` (machine-scoped) |
 | `codecrosscheck.applyReview.dryRun` | `false` |
+| `codecrosscheck.tools.maxCalls` | `24` (`0` disables tool access) |
+| `codecrosscheck.tools.deadlineMs` | `180000` |
 | `codecrosscheck.execute.timeoutMs` | `30000` |
 
 `buildCommand` and `testCommand` are **machine-scoped**: a workspace cannot set
@@ -235,7 +272,7 @@ to the same model, the participant prints a warning. Set
 ```bash
 nvm use            # Node 20
 npm install
-npm run build      # tsc + copy prompts + skills
+npm run build      # tsc + copy prompts/skills + bundle the extension
 npm test           # vitest, no network
 RUN_LIVE_TESTS=1 npm test    # opt-in live integration; needs CODECROSSCHECK_BASE_URL
 npm run selftest             # end-to-end PLAN→CODE→EXECUTE; skips without an endpoint
@@ -249,15 +286,22 @@ src/
   cli.ts               # commander entry, JSONL transcript
   extension.ts         # chat participant + editor commands
   install.ts           # installer bin (VSIX + delegation skill)
-  agents.ts            # buildWorker / buildReviewer
+  agents.ts            # buildWorker / buildReviewer / buildTriager / buildFixer
   loop.ts              # reviewLoop + preReview hook
   pipeline.ts          # plan→code→execute orchestration
-  sandbox.ts           # spawn-based sandbox (network deny by default)
-  schemas.ts           # zod Issue / Verdict / Stage
+  sandbox.ts           # spawn-based sandbox (temp cwd, env allowlist, hard
+                       # timeout — containment, NOT a security boundary:
+                       # generated code runs with your privileges and
+                       # unrestricted network)
+  schemas.ts           # zod Issue / Verdict / Triage / FixProposal / ApplyEdit
+  applyReview.ts       # transcript discovery, edit matching + application
   clients/
-    ChatClient.ts          # interface
+    ChatClient.ts          # interface, tool-call contract, budgets
     openaiCompatible.ts    # CLI client (global fetch + json_schema)
     vscodeLm.ts            # extension client (vscode.lm + extractJson)
+  tools/
+    workspaceTools.ts      # read-only read_file / search_workspace /
+                           # list_directory, path-confined and ignore-aware
   openspec/
     loader.ts              # findOpenSpecRoot / loadChange / renderChangeFrame
     validate.ts            # `openspec validate --strict` wrapper (regex-guarded)
@@ -269,6 +313,7 @@ scripts/
   selftest-openspec.mjs    # end-to-end live with --openspec fixture
   release.mjs              # publish guard (clean tree, branch=main, registry check)
   publish-vsix.mjs         # az artifacts universal publish wrapper
+  bundle-extension.mjs     # esbuild bundle of the extension entry point
 docs/
   ARCHITECTURE.md          # component + sequence diagrams, deep dive
 openspec/
@@ -293,7 +338,7 @@ registry.
 nvm use            # Node 20
 npm install
 # edit src/, src/prompts/, package.json, etc.
-npm run build      # tsc + copy prompts + skills
+npm run build      # tsc + copy prompts/skills + bundle the extension
 npm test           # vitest, must stay green
 ```
 
@@ -311,10 +356,12 @@ If you changed behaviour, also update:
 
 ### 2. Try it in the Extension Development Host
 
-Press `F5` in VS Code (or **Run and Debug → Launch Extension**) to open
-an EDH window with your local build loaded. This is the fastest inner
+Press `F5` in VS Code (or **Run and Debug → Run CodeCrossCheck Extension**) to
+open an EDH window with your local build loaded. This is the fastest inner
 loop — no packaging, no install, edits to `dist/` are picked up after a
-rebuild + reload.
+rebuild + reload. Note that the host window inherits your installed
+extensions, so uninstall any released build that shares the participant id if
+you need certainty about which one answered.
 
 ### 3. Bump the version
 
@@ -322,28 +369,25 @@ Pick a version per [SemVer](https://semver.org/) (pre-1.0: minor for
 breaking changes, patch for fixes):
 
 ```bash
-npm version patch --no-git-tag-version   # 0.2.0 -> 0.2.1
+npm version patch --no-git-tag-version   # 0.5.0 -> 0.5.1
 # or: npm version minor --no-git-tag-version
 ```
 
 This rewrites `package.json` `"version"`. Move the `[Unreleased]`
-section in `CHANGELOG.md` under a new `[0.2.1] - YYYY-MM-DD` heading
+section in `CHANGELOG.md` under a new `[0.5.1] - YYYY-MM-DD` heading
 and start a fresh `[Unreleased]` block.
 
 ### 4. Build the VSIX
 
 ```bash
 npm run build
-npx vsce package --allow-missing-repository `
-  --baseContentUrl https://example.invalid/ `
-  --baseImagesUrl  https://example.invalid/ `
-  --out codecrosscheck-<version>.vsix
+npx vsce package --no-dependencies
 ```
 
-The base-URL stubs are only needed because this VSIX is not published
-to the Marketplace and `vsce` insists on a repo origin for relative
-links in `README.md`. Replace them with your real Azure DevOps repo URL
-once the `repository.url` field in `package.json` is updated.
+The VSIX is not published to the Marketplace; it is installed from the
+local file. Verify a fresh build actually contains your change rather than
+trusting the version string — unzip it and grep `extension/dist/extension.cjs`
+for a symbol you just added.
 
 ### 5. Install into your VS Code
 
@@ -363,7 +407,7 @@ running VS Code instance):
 ```powershell
 Get-ChildItem "$env:USERPROFILE\.vscode\extensions" -Directory |
   Where-Object Name -match codecrosscheck
-# expect: internal.codecrosscheck-<version>
+# expect: tpiironen.codecrosscheck-<version>
 ```
 
 Then **fully close all VS Code windows** and reopen, or run
@@ -377,10 +421,10 @@ To uninstall:
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd" `
-  --uninstall-extension internal.codecrosscheck
+  --uninstall-extension tpiironen.codecrosscheck
 ```
 
-(`internal` is the `publisher` field in `package.json`; the extension
+(`tpiironen` is the `publisher` field in `package.json`; the extension
 id is `<publisher>.<name>`.)
 
 ### 6. Hand it to a teammate

@@ -390,7 +390,7 @@ should be read as evidence about the corpus pass rate.
 
 ## [0.3.1] — 2026-05-27
 
-OpenSpec change: [`guard-oversized-review-prompts`](openspec/changes/guard-oversized-review-prompts/proposal.md).
+OpenSpec change: [`guard-oversized-review-prompts`](openspec/changes/archive/2026-09-11-guard-oversized-review-prompts/proposal.md).
 
 ### Added
 
@@ -440,7 +440,7 @@ OpenSpec change: [`guard-oversized-review-prompts`](openspec/changes/guard-overs
 
 ## [0.3.0] — 2026-05-19
 
-OpenSpec change: [`rename-openspec-implement-to-review`](openspec/changes/rename-openspec-implement-to-review/proposal.md).
+OpenSpec change: [`rename-openspec-implement-to-review`](openspec/changes/archive/2026-09-11-rename-openspec-implement-to-review/proposal.md).
 
 ### Changed
 
@@ -452,7 +452,7 @@ OpenSpec change: [`rename-openspec-implement-to-review`](openspec/changes/rename
 
 ## [0.2.10] — 2026-05-19
 
-OpenSpec change: [`fix-model-refusal-detection`](openspec/changes/fix-model-refusal-detection/proposal.md).
+OpenSpec change: [`fix-model-refusal-detection`](openspec/changes/archive/2026-09-11-fix-model-refusal-detection/proposal.md).
 
 ### Fixed
 
@@ -695,7 +695,7 @@ and the supporting `applyReview.ts` toolkit.
 
 ## [0.2.0] — 2026-04-28
 
-OpenSpec change: [`add-chat-picker-and-delegation`](openspec/changes/add-chat-picker-and-delegation/proposal.md).
+OpenSpec change: [`add-chat-picker-and-delegation`](openspec/changes/archive/2026-09-11-add-chat-picker-and-delegation/proposal.md).
 
 ### Added
 
@@ -755,7 +755,7 @@ OpenSpec change: [`add-chat-picker-and-delegation`](openspec/changes/add-chat-pi
 ## [0.1.0] — 2026-04-26
 
 Initial internal release. OpenSpec change:
-[`add-codecrosscheck`](openspec/changes/add-codecrosscheck/proposal.md).
+[`add-codecrosscheck`](openspec/changes/archive/2026-09-11-add-codecrosscheck/proposal.md).
 
 ### Added
 
@@ -814,6 +814,7 @@ Initial internal release. OpenSpec change:
 - Reviewer: `anthropic/claude-opus-4.5`
 
 [Unreleased]: ./CHANGELOG.md
+[0.5.0]: ./CHANGELOG.md#050--2026-09-16
 [0.4.0]: ./CHANGELOG.md#040--2026-05-29
 [0.3.1]: ./CHANGELOG.md#031--2026-05-27
 [0.3.0]: ./CHANGELOG.md#030--2026-05-19
