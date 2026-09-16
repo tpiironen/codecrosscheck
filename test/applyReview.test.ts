@@ -11,9 +11,10 @@ import {
   resolveSafePath,
   runBuildGate,
   truncateMiddle,
+  validateFixCoverage,
   type FsLike,
 } from "../src/applyReview.js";
-import type { FixProposal } from "../src/schemas.js";
+import { FixProposalSchema, type FixProposal } from "../src/schemas.js";
 
 /**
  * Use a platform-correct workspace root so path.resolve produces matching keys
@@ -170,6 +171,44 @@ describe("applyReview.editsFrom + renderFixProposal", () => {
     expect(editsFrom(proposal).map((e) => e.path)).toEqual(["src/a.ts"]);
   });
 
+  it("ignores edits attached to a non-fixed status", () => {
+    // The schema refuses these, but a transcript written before that rule (or
+    // hand-edited) must not apply an edit the UI presents as rebutted.
+    const smuggled: FixProposal = {
+      summary: "s",
+      fixes: [
+        {
+          findingId: 1,
+          status: "disagree",
+          explanation: "reviewer is wrong",
+          edits: [{ path: "src/evil.ts", oldString: "a", newString: "b", why: "w" }],
+        },
+        {
+          findingId: 2,
+          status: "unaddressed",
+          explanation: "blocked",
+          edits: [{ path: "src/also-evil.ts", oldString: "a", newString: "b", why: "w" }],
+        },
+      ],
+    };
+    expect(editsFrom(smuggled)).toEqual([]);
+  });
+
+  it("is rejected by the schema before it can be stored", () => {
+    const result = FixProposalSchema.safeParse({
+      summary: "s",
+      fixes: [
+        {
+          findingId: 1,
+          status: "disagree",
+          explanation: "reviewer is wrong",
+          edits: [{ path: "src/evil.ts", oldString: "a", newString: "b", why: "w" }],
+        },
+      ],
+    });
+    expect(result.success).toBe(false);
+  });
+
   it("renders every fix, its status and its edits", () => {
     const md = renderFixProposal(proposal, [
       { severity: "high", where: "src/a.ts:1", why: "w", suggestion: "s" },
@@ -180,6 +219,34 @@ describe("applyReview.editsFrom + renderFixProposal", () => {
     expect(md).toContain("Finding 2: src/b.ts:2 — Disagree");
     expect(md).toContain("already handled at line 12");
     expect(md).toContain("`src/a.ts` — guard");
+  });
+});
+
+describe("applyReview.validateFixCoverage", () => {
+  const fix = (findingId: number) => ({
+    findingId,
+    status: "fixed" as const,
+    explanation: "e",
+    edits: [],
+  });
+
+  it("accepts one entry per finding", () => {
+    expect(validateFixCoverage({ summary: "s", fixes: [fix(1), fix(2)] }, 2)).toBeNull();
+  });
+
+  it("reports a finding with no entry", () => {
+    const problem = validateFixCoverage({ summary: "s", fixes: [fix(1)] }, 3);
+    expect(problem).toContain("no entry for finding(s) 2, 3");
+  });
+
+  it("reports a duplicated findingId", () => {
+    const problem = validateFixCoverage({ summary: "s", fixes: [fix(1), fix(1)] }, 1);
+    expect(problem).toContain("appears more than once");
+  });
+
+  it("reports an out-of-range findingId", () => {
+    const problem = validateFixCoverage({ summary: "s", fixes: [fix(1), fix(7)] }, 2);
+    expect(problem).toContain("outside 1..2");
   });
 });
 

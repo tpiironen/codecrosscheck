@@ -50,6 +50,14 @@ export interface ToolContext {
   onFinish?(info: { stop: ToolLoopStop; callCount: number }): void;
 }
 
+/**
+ * Answer given to a tool call the model requested after the budget was spent.
+ * The call must still be answered — a provider rejects a follow-up request
+ * that leaves one unanswered — but it is not executed.
+ */
+export const TOOL_BUDGET_REFUSAL =
+  "Not executed: the tool-call budget for this turn is exhausted. Answer from what you already have.";
+
 export const DEFAULT_TOOL_MAX_CALLS = 24;
 export const DEFAULT_TOOL_DEADLINE_MS = 180_000;
 

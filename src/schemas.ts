@@ -68,7 +68,13 @@ export const FixSchema = z.object({
   edits: z
     .array(ApplyEditSchema)
     .describe("Exact edits that resolve the finding. MUST be empty unless status is `fixed`."),
-});
+})
+  // A rebutted or unaddressed finding that still carries edits would be
+  // applied by /apply-review while the chat output says nothing was done.
+  .refine((f) => f.status === "fixed" || f.edits.length === 0, {
+    message: "edits must be empty unless status is `fixed`",
+    path: ["edits"],
+  });
 
 /**
  * The fixer's whole response. Edits travel as structured data rather than as

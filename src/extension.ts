@@ -29,6 +29,7 @@ import {
   issueFingerprint,
   pruneTranscripts,
   renderFixProposal,
+  validateFixCoverage,
   runBuildGate,
   type ApplyOutcome,
   type EditHost,
@@ -572,8 +573,26 @@ async function handleReviewBranch(
       round: iter - 1,
       forceFixAll,
     });
+    let proposal: FixProposal | undefined;
     try {
-      lastProposal = await fixer.propose(fixerInput, { signal, tools: toolsFor("fixer") });
+      proposal = await fixer.propose(fixerInput, { signal, tools: toolsFor("fixer") });
+      // The schema cannot know how many findings were sent, so coverage is
+      // checked here. One reprompt naming the exact problem, then give up:
+      // a proposal that skips or duplicates a finding would be rendered as if
+      // it were complete.
+      let problem = validateFixCoverage(proposal, fixableVerdict.issues.length);
+      if (problem) {
+        stream.markdown(`\u26a0\ufe0f Fix proposal did not cover every finding (${problem}) \u2014 asking again.\n\n`);
+        proposal = await fixer.propose(
+          `${fixerInput}\n\n# Your previous response was rejected\n\n${problem}\nReturn one entry per finding, in order.`,
+          { signal, tools: toolsFor("fixer") },
+        );
+        problem = validateFixCoverage(proposal, fixableVerdict.issues.length);
+      }
+      if (problem) {
+        stream.markdown(`\u274c Worker could not produce a proposal covering every finding: ${problem}\n\n`);
+        break;
+      }
     } catch (err) {
       if (err instanceof ReviewCancelledError) {
         outcome = "cancelled";
@@ -582,6 +601,7 @@ async function handleReviewBranch(
       stream.markdown(`\u274c Worker call failed: \`${(err as Error).message}\`\n\n`);
       break;
     }
+    lastProposal = proposal;
     lastArtifact = renderFixProposal(lastProposal, fixableVerdict.issues);
     transcript.write({
       event: "review-branch-iter",

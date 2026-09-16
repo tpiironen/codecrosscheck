@@ -32,6 +32,13 @@ nothing to parse.
 - **WHEN** a model requests several tools in one turn
 - **THEN** each call receives a result before the next request is issued
 
+#### Scenario: A single turn cannot exceed the call budget
+
+- **WHEN** one turn requests more tools than the remaining budget allows
+- **THEN** only the calls within budget are executed
+- **AND** each remaining call is answered with a budget-exhausted result rather
+  than being invoked
+
 #### Scenario: Call budget terminates the loop
 
 - **WHEN** a model issues more tool calls than the configured budget allows
@@ -110,6 +117,15 @@ cannot disagree.
 
 - **WHEN** a fix has status `disagree` or `unaddressed`
 - **THEN** its edit list is empty
+- **AND** the response fails validation if it is not
+
+#### Scenario: Every finding is answered exactly once
+
+- **WHEN** the fixer responds to N findings
+- **THEN** the response carries exactly N entries whose `findingId` values are
+  `1..N`, each used once
+- **AND** a response that misses, duplicates or invents a `findingId` is
+  rejected and the fixer is asked again
 
 #### Scenario: Rendered Markdown is derived, not authored
 

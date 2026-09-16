@@ -6,6 +6,8 @@ import {
   resolveBaseUrl,
   BASE_URL_ENV,
 } from "../src/clients/openaiCompatible.js";
+import { satisfiesStrictMode, toProviderJsonSchema } from "../src/clients/schemaText.js";
+import { FixProposalSchema, TriageSchema, VerdictSchema } from "../src/schemas.js";
 
 const ok = (content: string) =>
   new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
@@ -108,5 +110,37 @@ describe("OpenAiCompatibleClient", () => {
     await expect(client.sendText([{ role: "user", content: "x" }])).rejects.toThrow(
       /https:\/\/api\.test\/v1\/chat\/completions.*502/s,
     );
+  });
+});
+
+describe("structured-output schema generation", () => {
+  // FixProposalSchema carries a `.refine` that JSON Schema cannot express. The
+  // provider request is built from `toProviderJsonSchema`, so if generation
+  // threw or mis-reported strict mode, every CLI fixer call would fail at
+  // runtime with nothing catching it here.
+  it("generates a provider schema for every schema sent to a provider", () => {
+    for (const [name, schema] of [
+      ["FixProposal", FixProposalSchema],
+      ["Verdict", VerdictSchema],
+      ["Triage", TriageSchema],
+    ] as const) {
+      const generated = toProviderJsonSchema(schema, name);
+      expect(generated.title, name).toBe(name);
+      expect(generated.type, name).toBe("object");
+    }
+  });
+
+  it("keeps FixProposal eligible for strict mode", () => {
+    const generated = toProviderJsonSchema(FixProposalSchema, "FixProposal");
+    expect(satisfiesStrictMode(generated)).toBe(true);
+    const props = Object.keys(generated.properties as Record<string, unknown>);
+    expect(props.sort()).toEqual(["fixes", "summary"]);
+  });
+
+  it("does not claim the refinement is enforced by the provider", () => {
+    // The empty-edits invariant is a zod check, not a JSON Schema constraint:
+    // the provider cannot enforce it, so the runtime gate must stay.
+    const generated = toProviderJsonSchema(FixProposalSchema, "FixProposal");
+    expect(JSON.stringify(generated)).not.toContain("must be empty unless");
   });
 });

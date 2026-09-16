@@ -327,9 +327,48 @@ export function truncateMiddle(text: string, budget: number): string {
   return text.slice(0, head) + marker + (tail > 0 ? text.slice(text.length - tail) : "");
 }
 
-/** Every edit in a fix proposal, in the order the worker listed them. */
+/**
+ * Every applicable edit in a fix proposal, in the order the worker listed
+ * them. Only `fixed` entries contribute: the schema already refuses edits on
+ * any other status, and this second gate means a transcript written before
+ * that rule — or a hand-edited one — still cannot apply an edit the UI
+ * presents as rebutted or unaddressed.
+ */
 export function editsFrom(proposal: FixProposal): ApplyEdit[] {
-  return proposal.fixes.flatMap((f) => f.edits);
+  return proposal.fixes.filter((f) => f.status === "fixed").flatMap((f) => f.edits);
+}
+
+/**
+ * Check that a proposal answers exactly the findings it was given: one entry
+ * per finding, each `findingId` in `1..findingCount`, each used once. The
+ * schema cannot express this — it does not know how many findings there were —
+ * so a model can otherwise drop a finding silently or answer one twice, and
+ * the rendered Markdown would look complete.
+ *
+ * Returns null when the proposal is well-formed, or a one-line problem
+ * description suitable for a reprompt.
+ */
+export function validateFixCoverage(proposal: FixProposal, findingCount: number): string | null {
+  const problems: string[] = [];
+  const seen = new Set<number>();
+  for (const fix of proposal.fixes) {
+    if (fix.findingId < 1 || fix.findingId > findingCount) {
+      problems.push(`findingId ${fix.findingId} is outside 1..${findingCount}`);
+      continue;
+    }
+    if (seen.has(fix.findingId)) {
+      problems.push(`findingId ${fix.findingId} appears more than once`);
+      continue;
+    }
+    seen.add(fix.findingId);
+  }
+  const missing: number[] = [];
+  for (let id = 1; id <= findingCount; id++) {
+    if (!seen.has(id)) missing.push(id);
+  }
+  if (missing.length > 0) problems.push(`no entry for finding(s) ${missing.join(", ")}`);
+  if (problems.length === 0) return null;
+  return `Expected exactly ${findingCount} fix entries, one per finding, with findingId 1..${findingCount} used once each: ${problems.join("; ")}.`;
 }
 
 /**

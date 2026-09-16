@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   ReviewCancelledError,
+  TOOL_BUDGET_REFUSAL,
   budgetExceeded,
   openToolBudget,
   throwIfAborted,
@@ -161,18 +162,23 @@ export class OpenAiCompatibleClient implements ChatClient {
         return message.content;
       }
 
-      // Every requested call must be answered or the next request is malformed,
-      // so a turn that overshoots the budget still runs; the check above ends
-      // the loop before another turn is granted.
+      // Every requested call must be answered or the next request is
+      // malformed, so each one gets a `role: "tool"` reply — but the budget is
+      // a hard cap on work actually done: once it is spent the remaining calls
+      // in this turn are refused rather than invoked.
       history.push(message);
       for (const raw of requested) {
         throwIfAborted(opts?.signal, this.modelId);
-        budget.calls++;
         const call: ToolCall = {
           callId: raw.id,
           name: raw.function.name,
           input: decodeArguments(raw.function.arguments),
         };
+        if (budget.calls >= budget.maxCalls) {
+          history.push({ role: "tool", tool_call_id: raw.id, content: TOOL_BUDGET_REFUSAL });
+          continue;
+        }
+        budget.calls++;
         const result = await tools.invoke(call);
         tools.onCall?.(call, result);
         history.push({ role: "tool", tool_call_id: raw.id, content: result.content });

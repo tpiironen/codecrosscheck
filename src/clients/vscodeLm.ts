@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   ReviewCancelledError,
+  TOOL_BUDGET_REFUSAL,
   budgetExceeded,
   openToolBudget,
   throwIfAborted,
@@ -122,13 +123,22 @@ export class VscodeLmClient implements ChatClient {
         return res.text;
       }
 
-      // Every requested call must be answered or the next request is malformed,
-      // so a turn that overshoots the budget still runs; the check above ends
-      // the loop before another turn is granted.
+      // Every requested call must be answered or the next request is
+      // malformed, so each one gets a result part — but the budget is a hard
+      // cap on work actually done: once it is spent the remaining calls in this
+      // turn are refused rather than invoked.
       history.push(vscode.LanguageModelChatMessage.Assistant(res.parts as never));
       const answers: unknown[] = [];
       for (const call of res.calls) {
         throwIfAborted(opts?.signal, this.modelId);
+        if (budget.calls >= budget.maxCalls) {
+          answers.push(
+            new vscode.LanguageModelToolResultPart(call.callId, [
+              new vscode.LanguageModelTextPart(TOOL_BUDGET_REFUSAL),
+            ]),
+          );
+          continue;
+        }
         budget.calls++;
         const result = await tools.invoke(call);
         tools.onCall?.(call, result);
