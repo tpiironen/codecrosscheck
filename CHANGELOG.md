@@ -13,12 +13,26 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
+## [0.5.1-rc.2] — 2026-09-21
+
 - **The reviewer corpus no longer runs nightly.** Every run sends planted-flaw
   fixtures to a live model, so the schedule billed for runs nobody requested —
   and since `CCC_BASE_URL`/`CCC_API_KEY` were never configured on the
   repository, each one failed with `CODECROSSCHECK_BASE_URL required` rather
   than gating anything. The job is now reachable by manual dispatch only;
   dispatch it after touching `src/prompts/`.
+- **A diff path containing a space or a non-ASCII byte is no longer dropped.**
+  `blockPath` read the `diff --git` header with `^diff --git a/(\S+) b/(\S+)`,
+  which is wrong twice over: an unquoted path may contain spaces, and git
+  C-quotes any path holding spaces or non-ASCII bytes. It now reads the `+++`,
+  `---` and `rename to` marker lines first and falls back to the header only
+  for a mode-only block, decoding git's quoting either way. Found by running
+  `/review-branch` on the branch that introduced the scope block — where a
+  dropped path is worse than cosmetic, because every finding against that file
+  then reads as out of scope.
+- **The scope threading is pinned by tests.** `test/extensionScope.test.ts`
+  asserts the changed-file list reaches the reviewer, triager, fixer and
+  re-review prompts, and that the listing cap reports its remainder.
 
 ## [0.5.1-rc.1] — 2026-09-17
 

@@ -1083,7 +1083,9 @@ block of file contents. Neither agent's prompt SHALL carry a
 `# Repository file context` section.
 
 Every tool call SHALL be surfaced in the chat progress stream naming the agent
-and the tool, and recorded in the run transcript.
+and the tool, and recorded in the run transcript. The progress line SHALL be
+emitted before the call runs, so a call that takes a long time is visible for
+the whole time it takes rather than only once it returns.
 
 When an agent's tool budget or deadline is exhausted, the extension SHALL say
 so in the chat output, naming the setting that raises the limit.
@@ -1107,6 +1109,11 @@ so in the chat output, naming the setting that raises the limit.
 - **THEN** each call appears in the chat progress stream with the agent and
   tool name
 - **AND** each call is recorded in the run transcript
+
+#### Scenario: A slow call is visible while it is slow
+
+- **WHEN** an agent invokes a tool that takes a long time to return
+- **THEN** its progress line appears before the call runs, not after it returns
 
 #### Scenario: Exhausted budget is reported to the user
 
