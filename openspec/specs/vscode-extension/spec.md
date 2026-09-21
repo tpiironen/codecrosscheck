@@ -52,13 +52,20 @@ The extension SHALL register two Command Palette commands — `CodeCrossCheck: R
 
 ### Requirement: VS Code settings
 
-The extension SHALL contribute the following settings under the `codecrosscheck.*` namespace, each with a default value AND a user-visible description:
+The extension SHALL contribute at least the following settings under the `codecrosscheck.*` namespace, each with a default value AND a user-visible description:
 
 - `codecrosscheck.workerModel`
 - `codecrosscheck.reviewerModel`
 - `codecrosscheck.maxIters`
 - `codecrosscheck.execute.timeoutMs`
-- `codecrosscheck.execute.allowNetwork`
+
+This list is a minimum, not the complete contributed set. Settings added by
+later changes SHALL NOT require an amendment here, but a setting named here
+SHALL exist.
+
+`codecrosscheck.execute.allowNetwork` SHALL NOT be contributed. The sandbox
+does not restrict network access, so the setting would advertise a boundary
+that does not exist.
 
 #### Scenario: Setting overrides default model
 
@@ -575,10 +582,11 @@ larger reviewer via `codecrosscheck.reviewerModel`, or split the branch).
 ### Requirement: review-branch re-review diff scoping
 
 The extension SHALL scope the branch diff sent to the reviewer on re-review
-passes (iteration ≥ 2) of `/review-branch` to only those files cited by the
-prior findings and by the worker's fix proposal. The cited paths SHALL be the
-same set already harvested for the fixer's repository file context, derived
-from each finding's `where` and `suggestion` fields and from the fix proposal.
+passes (iteration ≥ 2) of `/review-branch` to only those files touched by the
+worker's fix proposal. The cited paths SHALL be the distinct `path` values of
+the proposal's edits. The reviewer on a re-review pass is judging a proposal,
+not re-reading the branch, so files the proposal does not edit are not part of
+what it has to decide.
 
 The initial review pass SHALL continue to receive the complete branch diff.
 
@@ -670,9 +678,11 @@ Findings with status `rejected` or `uncertain` SHALL be reported to the user
 with their evidence, and SHALL NOT produce fix text. A finding the worker
 cannot support must not become an edit.
 
-The triage step SHALL receive the repository file context already harvested for
-the cited paths, so that it judges against current source rather than from the
-finding's wording alone.
+The triage step SHALL be granted the workspace toolset, so that it reads the
+cited paths from current source rather than judging from the finding's wording
+alone. Its prompt input SHALL carry the verdict, the diff description and the
+scope block; the source itself SHALL be obtained through tool calls, which are
+subject to the same confinement, budget and auditing as any other agent's.
 
 When the `force-fix-all` directive is present, triage SHALL be bypassed and
 every finding SHALL be treated as confirmed. The directive exists for the user

@@ -239,18 +239,23 @@ export class VscodeLmClient implements ChatClient {
 
     // Show the model what it actually returned and why that failed. A reminder
     // that only names the schema gives it nothing to correct against.
-    const retryMessages: ChatMessage[] = [
-      ...messages,
-      { role: "assistant", content: firstRaw },
-      {
-        role: "system",
-        content:
-          `That response is not valid JSON for schema "${schemaName}". ` +
-          `It failed with: ${explainFailure(firstError)}. ` +
-          `Reply with ONLY a JSON object validating against this JSON Schema, and nothing else:\n` +
-          describeSchema(schema as z.ZodType<unknown>, schemaName),
-      },
-    ];
+    // An attempt that threw before returning text produced nothing to correct,
+    // so the retry re-sends the original prompt rather than describing a
+    // response the model never made.
+    const retryMessages: ChatMessage[] = firstRaw
+      ? [
+          ...messages,
+          { role: "assistant", content: firstRaw },
+          {
+            role: "system",
+            content:
+              `That response is not valid JSON for schema "${schemaName}". ` +
+              `It failed with: ${explainFailure(firstError)}. ` +
+              `Reply with ONLY a JSON object validating against this JSON Schema, and nothing else:\n` +
+              describeSchema(schema as z.ZodType<unknown>, schemaName),
+          },
+        ]
+      : messages;
     let retryRaw = "";
     try {
       // No tools on the retry: the reminder is about JSON shape, not missing

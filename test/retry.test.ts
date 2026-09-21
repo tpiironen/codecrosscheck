@@ -93,6 +93,59 @@ describe("structured-output retry shows the model its own failure", () => {
   });
 });
 
+describe("a first attempt that produced nothing is re-sent, not described", () => {
+  /** First `sendRequest` throws before yielding text; the second succeeds. */
+  function makeThrowingThenOkLm(error: Error, then: string) {
+    const sent: Array<Array<{ role: string; content: string }>> = [];
+    const model = {
+      vendor: "stub",
+      family: "stub-family",
+      sendRequest: (msgs: Array<{ role: string; content: string }>) => {
+        sent.push(msgs);
+        if (sent.length === 1) throw error;
+        return {
+          text: (async function* () {
+            yield then;
+          })(),
+        };
+      },
+    };
+    return { lm: { selectChatModels: async () => [model] } as never, sent };
+  }
+
+  // Wording must not collide with the oversized-prompt or refusal patterns,
+  // which short-circuit the retry before it is ever built.
+  const transportFailure = () => new Error("Model request failed (503): upstream unavailable");
+
+  it("re-sends the original messages, inventing no turn and no failure", async () => {
+    const { lm, sent } = makeThrowingThenOkLm(transportFailure(), '{"artifact":"ok"}');
+    const client = new VscodeLmClient({ family: "stub-family", lm });
+
+    const result = await client.sendStructured(
+      [{ role: "user", content: "hi" }],
+      Schema,
+      "WorkerOutput",
+    );
+
+    expect(result.artifact).toBe("ok");
+    expect(sent).toHaveLength(2);
+    // Strict equality is the real assertion; the two named ones below say
+    // which defect each half of it guards against.
+    expect(sent[1]).toEqual(sent[0]);
+    expect(sent[1]!.some((m) => m.role === "assistant")).toBe(false);
+    expect(sent[1]!.some((m) => m.content.includes("not valid JSON"))).toBe(false);
+  });
+
+  it("still reports the originating failure when the retry also fails", async () => {
+    const { lm } = makeThrowingThenOkLm(transportFailure(), "still not json");
+    const client = new VscodeLmClient({ family: "stub-family", lm });
+
+    await expect(
+      client.sendStructured([{ role: "user", content: "hi" }], Schema, "WorkerOutput"),
+    ).rejects.toThrow(/upstream unavailable/);
+  });
+});
+
 describe("schemaText helpers", () => {
   it("describeSchema generates a description from the schema itself", () => {
     const text = describeSchema(Schema, "WorkerOutput");

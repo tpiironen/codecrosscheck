@@ -612,6 +612,14 @@ particular, an implementation SHALL NOT fall back to prose such as "the
 previously stated structured-verdict schema" when the schema object carries no
 description — it SHALL generate the description from the schema.
 
+When the first attempt produced **no response text at all** — because it threw
+before returning, for example on a transport error or an empty message body —
+there is no failed response to echo. In that case the retry SHALL re-send the
+original messages unchanged. It SHALL NOT append an empty assistant turn, and
+it SHALL NOT assert that a response failed to parse. A prompt that describes a
+response the model never produced is a false premise, and the transport error
+that actually occurred cannot be corrected by a schema reminder.
+
 #### Scenario: Retry echoes the failed response
 
 - **WHEN** a first structured attempt returns unparseable output and a retry is
@@ -629,6 +637,14 @@ description — it SHALL generate the description from the schema.
 - **WHEN** the retry reminder is built for a schema with no `description`
 - **THEN** the reminder contains a generated description of the schema's shape
   and not a generic placeholder sentence
+
+#### Scenario: No response produced means the original messages are re-sent
+
+- **GIVEN** a first structured attempt that throws before returning any text
+- **WHEN** the retry is issued
+- **THEN** the retry messages are identical to the original messages
+- **AND** they contain no empty assistant turn
+- **AND** they contain no reminder claiming the response was not valid JSON
 
 ### Requirement: Text-producing agents SHALL not impose a JSON envelope
 

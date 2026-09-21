@@ -33,17 +33,18 @@ The same engine ships as both a Node CLI (`codecrosscheck`, alias `ccc`) and a V
 
 ## Audience & distribution
 
-- Internal team only. **Not** published to public npm or the VS Code Marketplace.
-- Repo: Azure DevOps Repos, project `codecrosscheck`.
+- Repo: the public GitHub repository named by `package.json` `repository.url`,
+  MIT licensed, CI on GitHub Actions (Ubuntu + Windows).
 - **Distribution: local-only.** Users clone the repo, run `npm ci && npm run build`,
   package the VSIX with `npx vsce package` and install with
   `code --install-extension`; the CLI is exposed via `npm link` from the
-  checkout. No registry / no Azure Artifacts feed is required for ordinary use.
-- The `scripts/release.mjs` + `scripts/publish-vsix.mjs` + `.npmrc.template`
-  hooks remain in the tree as scaffolding for an *optional* future internal
-  Azure Artifacts feed (`codecrosscheck-npm` / `codecrosscheck-universal`),
-  but are inert in the default flow.
-- CI/CD: manual `npm run release` for now; no pipeline triggers.
+  checkout. Nothing is published to any registry.
+- `package.json` sets `"private": true`. That is what enforces local-only:
+  it is the only thing standing between a stray `npm publish` and the public
+  registry.
+- `scripts/release.mjs` is a pre-package gate only — clean tree, branch `main`,
+  package name, `private`, and a green `npm run verify`. It publishes nothing.
+- CI/CD: manual `npm run release` before packaging; no pipeline triggers.
 
 ## Cross-platform stance
 
@@ -83,7 +84,9 @@ The same engine ships as both a Node CLI (`codecrosscheck`, alias `ccc`) and a V
 
 ## OpenSpec usage
 
-Every change to this codebase MUST start with an OpenSpec proposal. The bootstrapping change `add-codecrosscheck` introduces all six capabilities at once because the tool is greenfield with no users to migrate. **After that change ships, all subsequent work MUST follow the standard one-capability-per-change pattern** — this matches the surrounding monorepo's style and lets CodeCrossCheck self-host on its own future changes.
+Every change to this codebase MUST start with an OpenSpec proposal, and MUST follow the one-capability-per-change pattern. The bootstrapping change `add-codecrosscheck` introduced all six capabilities at once because the tool was greenfield with no users to migrate; it was archived on 2026-09-11 and that exemption ended with it. Self-hosting on its own changes is the point: CodeCrossCheck reviews the proposals for its own work.
+
+`add-sha256-cli` is the one change that stays open indefinitely. It is a selftest fixture pinned by id in `scripts/selftest-openspec.mjs`, not a feature, and must never be implemented or archived.
 
 Capabilities owned by this project:
 

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { z } from "zod";
 import {
   OpenAiCompatibleClient,
   chatCompletionsUrl,
@@ -110,6 +111,56 @@ describe("OpenAiCompatibleClient", () => {
     await expect(client.sendText([{ role: "user", content: "x" }])).rejects.toThrow(
       /https:\/\/api\.test\/v1\/chat\/completions.*502/s,
     );
+  });
+});
+
+describe("structured retry when the first attempt produced no response", () => {
+  const client = () =>
+    new OpenAiCompatibleClient({
+      modelId: "m",
+      env: { [BASE_URL_ENV]: "https://api.test/v1" },
+    });
+
+  const bodyOf = (call: unknown[]) =>
+    JSON.parse((call[1] as RequestInit).body as string) as {
+      messages: Array<{ role: string; content?: string }>;
+    };
+
+  it("re-sends the original messages instead of describing a response that never arrived", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("upstream unavailable", { status: 503 }))
+      .mockResolvedValueOnce(ok('{"artifact":"ok"}'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const schema = z.object({ artifact: z.string().min(1) });
+    const result = await client().sendStructured(
+      [{ role: "user", content: "hi" }],
+      schema,
+      "WorkerOutput",
+    );
+
+    expect(result.artifact).toBe("ok");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const retry = bodyOf(fetchMock.mock.calls[1]!);
+    expect(retry.messages.some((m) => m.role === "assistant")).toBe(false);
+    expect(retry.messages.some((m) => m.content?.includes("not valid JSON"))).toBe(false);
+    expect(retry.messages).toEqual(bodyOf(fetchMock.mock.calls[0]!).messages);
+  });
+
+  it("still echoes the response when the first attempt did return text", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(ok("not json at all"))
+      .mockResolvedValueOnce(ok('{"artifact":"ok"}'));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const schema = z.object({ artifact: z.string().min(1) });
+    await client().sendStructured([{ role: "user", content: "hi" }], schema, "WorkerOutput");
+
+    const retry = bodyOf(fetchMock.mock.calls[1]!);
+    expect(retry.messages.find((m) => m.role === "assistant")?.content).toBe("not json at all");
   });
 });
 

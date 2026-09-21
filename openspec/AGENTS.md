@@ -11,7 +11,9 @@ Instructions for AI coding agents working in this repository.
 
 ## Current state
 
-The repo currently has a single bootstrapping change: **`add-codecrosscheck`**, which introduces all six capabilities at once. This is intentional for the initial build because there are no users yet. Once that change is archived, all subsequent changes MUST follow the standard one-capability-per-change pattern that matches the surrounding monorepo's style.
+The bootstrapping change `add-codecrosscheck`, which introduced all six capabilities at once, was archived on 2026-09-11. Every change since has followed the one-capability-per-change pattern, and all new work MUST continue to.
+
+One change sits permanently under `openspec/changes/`: **`add-sha256-cli`**. It is a test fixture, not a feature — `scripts/selftest-openspec.mjs` pins it by id as the live target of `npm run selftest:openspec`. Never implement, archive or delete it.
 
 ## Capability ownership
 
@@ -23,7 +25,7 @@ When deciding which spec a new requirement belongs to, use this routing:
 | Reviewer prompt content, verdict schema | `prompts` |
 | `@codecrosscheck` chat participant, slash commands, VS Code settings | `vscode-extension` |
 | Tests, fake clients, cross-platform gates | `verification` |
-| Azure DevOps repo, Artifacts feeds, release scripts | `distribution` |
+| Repository hosting, release gate, packaging and install path | `distribution` |
 | `--openspec` flag, validate pre-gate, `/openspec` commands | `openspec-integration` |
 
 ## Implementation conventions
@@ -48,5 +50,5 @@ This dogfoods the tool and catches scope creep early.
 
 - Don't add agent frameworks (LangGraph, AutoGen, MAF). The loop is intentionally framework-free.
 - Don't introduce Python — this is a pure-TS codebase.
-- Don't publish to public npm or the VS Code Marketplace. Internal Azure Artifacts feeds only.
+- Don't publish to any registry. Distribution is local-only: build from a clone, package with `vsce`, install the `.vsix`. `package.json` sets `"private": true` — don't remove it without a `distribution` change that says what replaces it.
 - Don't bypass the sandbox in EXECUTE; route all generated code execution through `src/sandbox.ts`.
