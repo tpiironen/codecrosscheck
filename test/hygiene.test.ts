@@ -82,7 +82,7 @@ describe("distribution is local-only", () => {
   });
 });
 
-describe("release scripts do not shell-interpret commands", () => {
+describe("release scripts pass arguments, never command strings", () => {
   const scripts = fs
     .readdirSync(path.join(root, "scripts"))
     .filter((f) => f.endsWith(".mjs"))
@@ -99,6 +99,36 @@ describe("release scripts do not shell-interpret commands", () => {
     const offenders = scripts
       .filter((f) => /\bexecSync\b/.test(fs.readFileSync(f, "utf8")))
       .map((f) => path.relative(root, f));
+    expect(offenders).toEqual([]);
+  });
+
+  // An unconditional `shell: true` re-parses arguments through cmd.exe or sh
+  // on every platform, with no reason to. The platform-conditional form is
+  // allowed because Node cannot spawn a Windows `.cmd` shim without it
+  // (EINVAL), and is covered by the next test instead.
+  it("never enables shell mode unconditionally", () => {
+    const offenders: string[] = [];
+    for (const f of scripts) {
+      for (const m of fs.readFileSync(f, "utf8").matchAll(/\bshell\s*:\s*true\b/g)) {
+        offenders.push(`${path.relative(root, f)}: ${m[0]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  // Where shell mode is unavoidable it must carry only literal arguments, so
+  // nothing interpolated can reach the shell. A template literal or a `+` in
+  // the argument list is what would make it exploitable.
+  it("passes only literal arguments to shell-enabled calls", () => {
+    const offenders: string[] = [];
+    for (const f of scripts) {
+      const src = fs.readFileSync(f, "utf8");
+      if (!/\bshell\s*:\s*(?!false\b)/.test(src)) continue;
+      for (const m of src.matchAll(/\bspawnSync\s*\(([^)]*)\)/g)) {
+        const call = m[1]!;
+        if (/`|\$\{|\s\+\s/.test(call)) offenders.push(`${path.relative(root, f)}: ${call.trim()}`);
+      }
+    }
     expect(offenders).toEqual([]);
   });
 });

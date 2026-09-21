@@ -21,6 +21,11 @@ function capture(cmd, args) {
   return r.stdout.trim();
 }
 
+// Windows needs shell mode here and only here: `npm` is a `.cmd` shim, and
+// since the CVE-2024-27980 hardening Node rejects spawning one with
+// `shell: false` (verified: EINVAL). Safe because both arguments are literals
+// — nothing interpolated ever reaches cmd.exe. Resolving npm's JS entrypoint
+// instead would hard-code a path that nvm/volta layouts do not guarantee.
 function runInherit(cmd, args) {
   const r = spawnSync(cmd, args, { stdio: "inherit", shell: process.platform === "win32" });
   return r.status ?? 1;
