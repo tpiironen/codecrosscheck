@@ -24,9 +24,21 @@
 - [x] C3 Count walked files rather than opened files against `maxFilesScanned`.
 - [x] C4 Report matches / file-cap / time stops distinctly in the result text.
 
-## D. Verification
+## D. Release bookkeeping
 
-- [x] D1 Red-proof each fix: sabotage it and confirm a targeted test fails.
-- [x] D2 Run the tool-loop scenario table over both transports.
-- [ ] D3 Run `@codecrosscheck /review-branch` on this branch (repo policy for
-      any change under `src/`).
+- [x] D1 Bump `package.json` to `0.5.1-rc.1` and regenerate `package-lock.json`
+      so the lockfile does not disagree with the manifest on install.
+- [x] D2 Add the `0.5.1-rc.1` `CHANGELOG.md` entry, covering this change and
+      `scope-review-to-branch-files`.
+
+## E. Verification
+
+- [x] E1 Red-proof each fix: sabotage it and confirm a targeted test fails.
+- [x] E2 Run the tool-loop scenario table over both transports.
+- [x] E3 Run `@codecrosscheck /review-branch` on this branch (repo policy for
+      any change under `src/`). Run 2026-09-21 against the installed
+      `tpiironen.codecrosscheck@0.5.1-rc.1`, whose bundled `dist/extension.cjs`
+      was verified to contain `buildScopeBlock`, `patchPaths`, `filterIgnored`
+      and `onCallStart` — so the review used this branch's own code, not the
+      build it replaces. Findings applied; `blockPath` hardening and
+      `test/extensionScope.test.ts` came out of it.

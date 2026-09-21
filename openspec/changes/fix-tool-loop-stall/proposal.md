@@ -42,6 +42,15 @@ Three defects compounded:
 - **Affected code**: `src/clients/ChatClient.ts`, `src/clients/vscodeLm.ts`,
   `src/clients/openaiCompatible.ts`, `src/tools/workspaceTools.ts`,
   `src/extension.ts`.
+- **Release artefacts**: `package.json`, `package-lock.json`, `CHANGELOG.md`.
+  This branch ships the fix as `0.5.1-rc.1`, and the repository's release
+  convention is that the version bump, its lockfile mirror and the changelog
+  entry land in the same branch as the change they describe — a changelog
+  written after the fact describes a release nobody can still verify, and a
+  lockfile left at the old version disagrees with `package.json` on install.
+  The `CHANGELOG.md` entry covers both changes on this branch, this one and
+  `scope-review-to-branch-files`; these edits are release bookkeeping only and
+  alter no runtime behaviour.
 - **Risk surface**: `filterIgnored` is optional, so a policy that does not
   implement it keeps the per-path behaviour and stays correct, only slow. The
   deadline makes `search_workspace` return partial results where it previously

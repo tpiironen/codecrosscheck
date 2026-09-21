@@ -456,7 +456,7 @@ async function handleReviewBranch(
     ? `# Reviewer instructions\n${userTask}`
     : `# Reviewer instructions\nReview this branch diff for OWASP issues, dead code, missing tests, and OpenSpec drift. Cite file:line for each issue.`;
   const scopeBlock = buildScopeBlock(patchPaths(diff));
-  const scopedTaskHeader = scopeBlock ? `${taskHeader}\n\n${scopeBlock}` : taskHeader;
+  const scopedTaskHeader = withScope(taskHeader, scopeBlock);
   const diffBody = `\`\`\`diff\n${diff}\n\`\`\``;
   const diffBlock = `# Branch diff (${diffDescription})\n\n${diffBody}`;
   const attachedBlock = attached ? `\n\n${attached}` : "";
@@ -501,7 +501,7 @@ async function handleReviewBranch(
   iter = 1;
   stream.markdown(`---\n\n### Iteration ${iter} / ${maxIters} \u2014 initial review\n\n`);
 
-  const reviewerPrompt = `${scopedTaskHeader}\n\n${diffBlock}${attachedBlock}`;
+  const reviewerPrompt = buildReviewerPrompt({ taskHeader: scopedTaskHeader, diffBlock, attachedBlock });
   const preflight = await tokenPreflight(cfg, reviewerPrompt);
   if (preflight) {
     stream.markdown(
@@ -1059,7 +1059,7 @@ function renderApplyOutcomes(stream: vscode.ChatResponseStream, outcomes: ApplyO
   stream.markdown("\n");
 }
 
-function buildFixerInput(args: {
+export function buildFixerInput(args: {
   taskHeader: string;
   diffBlock: string;
   currentVerdict: Verdict;
@@ -1093,7 +1093,7 @@ function buildFixerInput(args: {
   ].join("\n");
 }
 
-function buildTriageInput(args: { verdict: Verdict; diffDescription: string; scopeBlock?: string }): string {
+export function buildTriageInput(args: { verdict: Verdict; diffDescription: string; scopeBlock?: string }): string {
   const findings = args.verdict.issues
     .map(
       (it, idx) =>
@@ -1119,7 +1119,7 @@ const MAX_LISTED_SCOPE_PATHS = 200;
  * unchanged code — reviewing files the branch never touched, or proposing
  * infrastructure it never implied.
  */
-function buildScopeBlock(paths: string[]): string {
+export function buildScopeBlock(paths: string[]): string {
   if (paths.length === 0) return "";
   const listed = paths.slice(0, MAX_LISTED_SCOPE_PATHS).map((p) => `- \`${p}\``);
   if (paths.length > MAX_LISTED_SCOPE_PATHS) {
@@ -1136,6 +1136,20 @@ function buildScopeBlock(paths: string[]): string {
       "harnesses, indexes or CI machinery that none of these paths implies. If judging a changed " +
       "line depends on code outside the list, cite the changed path and say what you could not verify.",
   ].join("\n");
+}
+
+/** Prefix the scope block onto a task header; a branch with no files leaves it untouched. */
+export function withScope(taskHeader: string, scopeBlock: string): string {
+  return scopeBlock ? `${taskHeader}\n\n${scopeBlock}` : taskHeader;
+}
+
+/** The reviewer's first-pass prompt. A seam so the scope threading is assertable. */
+export function buildReviewerPrompt(args: {
+  taskHeader: string;
+  diffBlock: string;
+  attachedBlock: string;
+}): string {
+  return `${args.taskHeader}\n\n${args.diffBlock}${args.attachedBlock}`;
 }
 
 /** Renders each triage entry and returns the findings that survived. */
@@ -1170,7 +1184,7 @@ function formatVerdictForRereview(v: Verdict): string {
 }
 
 /** The reviewer judges the *proposal*, not the diff — the diff is the before state. */
-function buildRereviewInput(args: {
+export function buildRereviewInput(args: {
   taskHeader: string;
   diffDescription: string;
   diffBody: string;

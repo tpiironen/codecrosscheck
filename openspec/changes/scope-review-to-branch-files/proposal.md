@@ -32,6 +32,12 @@ than better — the scope has to be stated, not implied.
 - **Affected code**: `src/extension.ts` (`buildScopeBlock`, threaded into the
   reviewer, triager and fixer inputs), `src/openspec/diff.ts` (`patchPaths`,
   extracted alongside the existing `filterPatchToScope` path parsing).
+  `blockPath` is hardened while it is being extracted: it reads the `+++`,
+  `---` and `rename to` marker lines before falling back to the `diff --git`
+  header, and decodes git's C-quoting. The former `\S+` header pattern was
+  wrong twice over — an unquoted path may contain spaces, and git quotes any
+  path with spaces or non-ASCII bytes — so a scope list could silently omit
+  such a file and every finding against it would then read as out of scope.
 - **Risk surface**: a real defect in unchanged code that the branch exposes
   will now be reported against the changed path that exposes it rather than
   suppressed — the requirement says to cite the changed path and state what
