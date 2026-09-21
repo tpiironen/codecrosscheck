@@ -13,6 +13,23 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-21
+
+Brings four capability specs level with the code they describe, and settles
+distribution as local-only — enforced by the manifest rather than asserted in
+prose. The one behavioural fix stops a failed model call producing a retry
+that describes a response the model never sent.
+
+Minor rather than patch: the `publish:npm` and `publish:vsix` scripts are
+gone, and `codecrosscheck-install` no longer attempts a download when given no
+subcommand.
+
+OpenSpec changes:
+[`fix-retry-without-response`](openspec/changes/archive/2026-09-21-fix-retry-without-response/proposal.md),
+[`realign-distribution-to-reality`](openspec/changes/archive/2026-09-21-realign-distribution-to-reality/proposal.md),
+[`correct-vscode-extension-spec-drift`](openspec/changes/archive/2026-09-21-correct-vscode-extension-spec-drift/proposal.md),
+[`remove-superseded-live-test-requirement`](openspec/changes/archive/2026-09-21-remove-superseded-live-test-requirement/proposal.md).
+
 ### Fixed
 
 - **A failed model call no longer produces a retry that invents a response.**

@@ -490,7 +490,7 @@ installed directly from a checkout — no registry, no feed:
 | Artifact | Built by | Installed by |
 |---|---|---|
 | `codecrosscheck` CLI (`bin`: `codecrosscheck`, `ccc`) | `npm run build` | `npm link` from the checkout |
-| `codecrosscheck-<ver>.vsix` | `npx vsce package` (see README §4) | `code.cmd --install-extension <path>` |
+| `codecrosscheck-<ver>.vsix` | `npx vsce package` (see README §5) | `code.cmd --install-extension <path>` |
 
 Neither artifact ships to any registry. `package.json` sets
 `"private": true`, which is what stops an accidental `npm publish`.
