@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import { resolveSafePath, truncateMiddle } from "../applyReview.js";
 import { toProviderJsonSchema } from "../clients/schemaText.js";
-import type { ToolCall, ToolResult, ToolSpec } from "../clients/ChatClient.js";
+import type { ToolCall, ToolInvocation, ToolResult, ToolSpec } from "../clients/ChatClient.js";
 
 /**
  * A read-only workspace toolset offered to worker and reviewer agents.
@@ -22,6 +22,12 @@ export interface ToolFs {
 export interface IgnorePolicy {
   /** `rel` is workspace-relative with forward slashes. */
   isIgnored(rel: string): Promise<boolean>;
+  /**
+   * Answer for a whole directory listing at once, returning the ignored subset.
+   * A policy that shells out to git MUST implement this: one process per path
+   * makes a tree walk cost minutes.
+   */
+  filterIgnored?(rels: readonly string[]): Promise<Set<string>>;
 }
 
 export interface WorkspaceToolsetOptions {
@@ -38,7 +44,7 @@ export interface WorkspaceToolsetOptions {
 
 export interface WorkspaceToolset {
   specs: ToolSpec[];
-  invoke(call: ToolCall): Promise<ToolResult>;
+  invoke(call: ToolCall, ctx?: ToolInvocation): Promise<ToolResult>;
 }
 
 const DEFAULT_MAX_FILE_CHARS = 60_000;
@@ -145,7 +151,10 @@ export function createWorkspaceToolset(opts: WorkspaceToolsetOptions): Workspace
     return { content: `${header}\n\n${body}` };
   }
 
-  async function search(input: z.infer<typeof SearchInput>): Promise<ToolResult> {
+  async function search(
+    input: z.infer<typeof SearchInput>,
+    ctx: ToolInvocation | undefined,
+  ): Promise<ToolResult> {
     let matcher: (line: string) => boolean;
     if (input.isRegexp) {
       let re: RegExp;
@@ -162,14 +171,26 @@ export function createWorkspaceToolset(opts: WorkspaceToolsetOptions): Workspace
 
     const limit = Math.min(input.maxResults ?? maxMatches, maxMatches);
     const hits: string[] = [];
+    // `visited` bounds the walk; `scanned` reports the files actually opened.
+    // Counting only the opened ones let a `pathContains` search walk forever.
+    let visited = 0;
     let scanned = 0;
-    let truncated = false;
+    let stop: "matches" | "files" | "time" | null = null;
 
     for await (const rel of walk(opts, "")) {
-      if (hits.length >= limit || scanned >= maxFilesScanned) {
-        truncated = true;
+      if (hits.length >= limit) {
+        stop = "matches";
         break;
       }
+      if (visited >= maxFilesScanned) {
+        stop = "files";
+        break;
+      }
+      if (ctx && Date.now() >= ctx.deadlineAt) {
+        stop = "time";
+        break;
+      }
+      visited++;
       if (input.pathContains && !rel.includes(input.pathContains)) continue;
       const abs = path.resolve(opts.root, rel);
       let content: string;
@@ -186,16 +207,25 @@ export function createWorkspaceToolset(opts: WorkspaceToolsetOptions): Workspace
         if (!matcher(line)) continue;
         hits.push(`${rel}:${i + 1}: ${line.trim().slice(0, 200)}`);
         if (hits.length >= limit) {
-          truncated = true;
+          stop = "matches";
           break;
         }
       }
     }
 
+    const note =
+      stop === "matches"
+        ? `\n\n(stopped at ${hits.length} match(es); narrow the query or set pathContains)`
+        : stop === "files"
+          ? `\n\n(stopped after walking ${visited} file(s); narrow the search with pathContains)`
+          : stop === "time"
+            ? `\n\n(stopped early: the time budget for this call ran out after ${visited} file(s) — ` +
+              `results are partial, narrow the search with pathContains)`
+            : "";
+
     if (hits.length === 0) {
-      return { content: `No matches for ${JSON.stringify(input.query)} in ${scanned} file(s) searched.` };
+      return { content: `No matches for ${JSON.stringify(input.query)} in ${scanned} file(s) searched.${note}` };
     }
-    const note = truncated ? `\n\n(stopped at ${hits.length} match(es); narrow the query or set pathContains)` : "";
     return { content: `${hits.length} match(es):\n\n${hits.join("\n")}${note}` };
   }
 
@@ -215,12 +245,13 @@ export function createWorkspaceToolset(opts: WorkspaceToolsetOptions): Workspace
     } catch (err) {
       return { content: `${label}: not a readable directory (${(err as Error).message})`, isError: true };
     }
-    const kept: string[] = [];
-    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      const rel = requested ? `${label}/${e.name}` : e.name;
-      if (await opts.ignore.isIgnored(rel)) continue;
-      kept.push(e.isDirectory ? `${e.name}/` : e.name);
-    }
+    const allowed = await admitEntries(
+      opts.ignore,
+      entries
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((e) => ({ ...e, rel: requested ? `${label}/${e.name}` : e.name })),
+    );
+    const kept = allowed.map((e) => (e.isDirectory ? `${e.name}/` : e.name));
     return {
       content: kept.length > 0 ? `${label}\n\n${kept.join("\n")}` : `${label}\n\n(empty, or every entry is ignored)`,
     };
@@ -228,7 +259,7 @@ export function createWorkspaceToolset(opts: WorkspaceToolsetOptions): Workspace
 
   return {
     specs,
-    async invoke(call: ToolCall): Promise<ToolResult> {
+    async invoke(call: ToolCall, ctx?: ToolInvocation): Promise<ToolResult> {
       switch (call.name) {
         case "read_file": {
           const parsed = ReadFileInput.safeParse(call.input);
@@ -238,7 +269,7 @@ export function createWorkspaceToolset(opts: WorkspaceToolsetOptions): Workspace
         case "search_workspace": {
           const parsed = SearchInput.safeParse(call.input);
           if (!parsed.success) return inputError(call, parsed.error);
-          return search(parsed.data);
+          return search(parsed.data, ctx);
         }
         case "list_directory": {
           const parsed = ListDirectoryInput.safeParse(call.input);
@@ -262,24 +293,54 @@ function inputError(call: ToolCall, error: z.ZodError): ToolResult {
   return { content: `${call.name}: invalid input — ${detail}. Fix the arguments and call again.`, isError: true };
 }
 
-/** Yield every non-ignored file under `rel`, depth-first. */
-async function* walk(opts: WorkspaceToolsetOptions, rel: string): AsyncGenerator<string> {
-  const abs = rel ? path.resolve(opts.root, rel) : path.resolve(opts.root);
-  let entries: Array<{ name: string; isDirectory: boolean }>;
-  try {
-    entries = await opts.fs.readDir(abs);
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    const child = rel ? `${rel}/${entry.name}` : entry.name;
-    if (await opts.ignore.isIgnored(child)) continue;
-    if (entry.isDirectory) {
-      yield* walk(opts, child);
-    } else {
-      yield child;
+/**
+ * Yield every non-ignored file under the root, one depth level at a time.
+ *
+ * Breadth-first rather than depth-first so a whole level's entries can be
+ * admitted in a single ignore query: a git-backed policy costs one process per
+ * query, and this repository alone has ~130 directories against ~8 levels.
+ */
+async function* walk(opts: WorkspaceToolsetOptions, start: string): AsyncGenerator<string> {
+  let level = [start];
+  while (level.length > 0) {
+    const entries: Array<{ name: string; isDirectory: boolean; rel: string }> = [];
+    for (const dir of level) {
+      const abs = dir ? path.resolve(opts.root, dir) : path.resolve(opts.root);
+      try {
+        for (const e of await opts.fs.readDir(abs)) {
+          entries.push({ ...e, rel: dir ? `${dir}/${e.name}` : e.name });
+        }
+      } catch {
+        continue;
+      }
     }
+    const allowed = await admitEntries(opts.ignore, entries);
+    const next: string[] = [];
+    for (const entry of allowed) {
+      if (entry.isDirectory) next.push(entry.rel);
+      else yield entry.rel;
+    }
+    level = next;
   }
+}
+
+/**
+ * Drop the ignored entries of one batch. The batch path exists so a git-backed
+ * policy answers in one process call instead of one per entry.
+ */
+async function admitEntries<T extends { rel: string }>(
+  ignore: IgnorePolicy,
+  entries: readonly T[],
+): Promise<T[]> {
+  if (ignore.filterIgnored) {
+    const ignored = await ignore.filterIgnored(entries.map((e) => e.rel));
+    return entries.filter((e) => !ignored.has(e.rel));
+  }
+  const kept: T[] = [];
+  for (const e of entries) {
+    if (!(await ignore.isIgnored(e.rel))) kept.push(e);
+  }
+  return kept;
 }
 
 /**
@@ -331,7 +392,7 @@ export function denylistPolicy(): IgnorePolicy {
   };
 }
 
-export type CheckIgnore = (root: string, rel: string) => Promise<boolean>;
+export type CheckIgnore = (root: string, rels: readonly string[]) => Promise<Set<string>>;
 
 /**
  * The denylist plus the repository's own `.gitignore` rules, consulted through
@@ -344,45 +405,71 @@ export function repositoryIgnorePolicy(root: string, checkIgnore: CheckIgnore = 
   const base = denylistPolicy();
   const cache = new Map<string, boolean>();
   let gitUsable = true;
+
+  async function resolve(rels: readonly string[]): Promise<Set<string>> {
+    const ignored = new Set<string>();
+    const ask: string[] = [];
+    for (const rel of rels) {
+      if (await base.isIgnored(rel)) {
+        ignored.add(rel);
+        continue;
+      }
+      const cached = cache.get(rel);
+      if (cached === undefined) {
+        ask.push(rel);
+      } else if (cached) {
+        ignored.add(rel);
+      }
+    }
+    if (ask.length === 0 || !gitUsable) return ignored;
+    let answer: Set<string>;
+    try {
+      answer = await checkIgnore(root, ask);
+    } catch {
+      // Not a repository, or git is not installed. Stop asking.
+      gitUsable = false;
+      return ignored;
+    }
+    for (const rel of ask) {
+      const hit = answer.has(rel);
+      cache.set(rel, hit);
+      if (hit) ignored.add(rel);
+    }
+    return ignored;
+  }
+
   return {
     async isIgnored(rel: string): Promise<boolean> {
-      if (await base.isIgnored(rel)) return true;
-      if (!gitUsable) return false;
-      const cached = cache.get(rel);
-      if (cached !== undefined) return cached;
-      let ignored: boolean;
-      try {
-        ignored = await checkIgnore(root, rel);
-      } catch {
-        // Not a repository, or git is not installed. Stop asking.
-        gitUsable = false;
-        return false;
-      }
-      cache.set(rel, ignored);
-      return ignored;
+      return (await resolve([rel])).has(rel);
     },
+    filterIgnored: resolve,
   };
 }
 
 /**
- * `git check-ignore -q` exits 0 when the path is ignored and 1 when it is not.
- * Any other exit means git could not answer, which is thrown so the caller can
- * fall back rather than treat the path as readable on a technicality.
+ * Ask git which of `rels` are ignored, in one process call. `--stdin` with `-z`
+ * takes NUL-separated paths and echoes back the ignored ones verbatim, so no
+ * path needs quoting and a whole directory listing costs a single spawn.
+ * Exit 0 means at least one path is ignored, 1 means none are; anything else is
+ * thrown so the caller can fall back rather than treat paths as readable on a
+ * technicality.
  */
-export async function gitCheckIgnore(root: string, rel: string): Promise<boolean> {
+export async function gitCheckIgnore(root: string, rels: readonly string[]): Promise<Set<string>> {
+  if (rels.length === 0) return new Set();
   const { execFile } = await import("node:child_process");
-  return await new Promise<boolean>((resolve, reject) => {
-    execFile(
+  return await new Promise<Set<string>>((resolve, reject) => {
+    const child = execFile(
       "git",
-      ["check-ignore", "-q", "--", rel],
-      { cwd: root, windowsHide: true, timeout: 5_000 },
-      (err) => {
-        if (!err) return resolve(true);
-        const code = (err as { code?: number | string }).code;
-        if (code === 1) return resolve(false);
-        reject(err);
+      ["check-ignore", "-z", "--stdin"],
+      { cwd: root, windowsHide: true, timeout: 20_000, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => {
+        const code = (err as { code?: number | string } | null)?.code;
+        if (err && code !== 1) return reject(err);
+        resolve(new Set(stdout.split("\0").filter((p) => p.length > 0)));
       },
     );
+    child.stdin?.on("error", reject);
+    child.stdin?.end(rels.join("\0"));
   });
 }
 

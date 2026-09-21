@@ -71,18 +71,23 @@ function nextTurn(turns: Turn[], toolsOffered: boolean): Turn {
 function recorder() {
   const invoked: ToolCall[] = [];
   const finishes: Array<{ stop: string; callCount: number }> = [];
+  const order: string[] = [];
+  const deadlines: Array<number | undefined> = [];
   const context = (turnsUsed: Partial<ToolContext> = {}): ToolContext => ({
     specs: [SPEC],
     maxCalls: 4,
     deadlineMs: 60_000,
-    async invoke(call): Promise<ToolResult> {
+    async invoke(call, ctx): Promise<ToolResult> {
       invoked.push(call);
+      order.push(`invoke:${call.callId}`);
+      deadlines.push(ctx?.deadlineAt);
       return { content: `contents of ${JSON.stringify(call.input)}` };
     },
+    onCallStart: (call) => void order.push(`start:${call.callId}`),
     onFinish: (info) => void finishes.push(info),
     ...turnsUsed,
   });
-  return { invoked, finishes, context };
+  return { invoked, finishes, order, deadlines, context };
 }
 
 /** vscode.lm transport driven by a scripted turn list. */
@@ -234,6 +239,22 @@ for (const transport of transports) {
 
       expect(result.answer).toBe("grounded");
       expect(rec.invoked).toHaveLength(1);
+    });
+
+    it("announces a call before running it, and hands it the loop deadline", async () => {
+      const client = transport.build([
+        { calls: [{ id: "c1", name: "read_file", input: { path: "a" } }] },
+        { text: "done" },
+      ]);
+      const rec = recorder();
+      const before = Date.now();
+
+      await client.sendText([{ role: "user", content: "go" }], { tools: rec.context({ deadlineMs: 60_000 }) });
+
+      // Announced first: a call reported only once it returns is invisible for
+      // exactly as long as it is slow.
+      expect(rec.order).toEqual(["start:c1", "invoke:c1"]);
+      expect(rec.deadlines[0]).toBeGreaterThanOrEqual(before + 60_000);
     });
 
     it("makes no tool calls when none are offered", async () => {

@@ -37,13 +37,21 @@ export interface ToolResult {
 /** How a tool loop ended. Anything but `final` means the model was cut off. */
 export type ToolLoopStop = "final" | "budget-exhausted" | "deadline-exceeded";
 
+/** Handed to a tool so one that walks the workspace can stop before the loop's own deadline. */
+export interface ToolInvocation {
+  /** Epoch ms at which the tool should abandon further work and return what it has. */
+  deadlineAt: number;
+}
+
 export interface ToolContext {
   specs: ToolSpec[];
-  invoke(call: ToolCall): Promise<ToolResult>;
+  invoke(call: ToolCall, ctx?: ToolInvocation): Promise<ToolResult>;
   /** Hard cap on tool calls for one send. Defaults to `DEFAULT_TOOL_MAX_CALLS`. */
   maxCalls?: number;
   /** Wall-clock cap measured from the first request. Defaults to `DEFAULT_TOOL_DEADLINE_MS`. */
   deadlineMs?: number;
+  /** Invoked before a tool call runs, so a slow call is visible while it is still running. */
+  onCallStart?(call: ToolCall): void;
   /** Invoked after every tool call so the caller can record it. */
   onCall?(call: ToolCall, result: ToolResult): void;
   /** Invoked once when the loop ends, whether or not it ran to completion. */

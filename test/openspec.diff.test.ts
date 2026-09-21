@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { filterPatchToScope, chunkPatch, countPatchFiles, scopePatchToPaths } from "../src/openspec/diff.js";
+import { filterPatchToScope, chunkPatch, countPatchFiles, patchPaths, scopePatchToPaths } from "../src/openspec/diff.js";
 
 const SAMPLE = [
   "diff --git a/src/cli.ts b/src/cli.ts",
@@ -59,6 +59,19 @@ describe("openspec/diff", () => {
     expect(chunks).toHaveLength(1);
     expect(chunks[0]).toContain("a.ts");
     expect(chunks[0]).toContain("c.ts");
+  });
+
+  it("patchPaths lists every changed file in patch order", () => {
+    expect(patchPaths(SAMPLE)).toEqual(["src/cli.ts", "docs/readme.md"]);
+  });
+
+  it("patchPaths takes the post-image path of a rename", () => {
+    const renamed = "diff --git a/src/old.ts b/src/new.ts\nsimilarity index 95%\nrename from src/old.ts\nrename to src/new.ts\n";
+    expect(patchPaths(renamed)).toEqual(["src/new.ts"]);
+  });
+
+  it("patchPaths returns nothing for an empty patch", () => {
+    expect(patchPaths("")).toEqual([]);
   });
 });
 

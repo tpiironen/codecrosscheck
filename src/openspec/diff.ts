@@ -89,14 +89,27 @@ export function filterPatchToScope(patch: string, scopePaths: string[]): string 
   const kept: string[] = [];
   for (const block of blocks) {
     if (!block.trim()) continue;
-    const header = block.split("\n", 1)[0] ?? "";
-    const m = header.match(/^diff --git a\/(\S+) b\/(\S+)/);
-    const file = m?.[2] ?? m?.[1] ?? "";
+    const file = blockPath(block);
     if (scopePaths.some((p) => file === p || file.startsWith(p.endsWith("/") ? p : p + "/"))) {
       kept.push(block);
     }
   }
   return kept.join("");
+}
+
+/** The post-image path of every per-file block in a patch, in patch order. */
+export function patchPaths(patch: string): string[] {
+  return patch
+    .split(/^(?=diff --git )/m)
+    .filter((b) => b.trim())
+    .map(blockPath)
+    .filter((p) => p.length > 0);
+}
+
+function blockPath(block: string): string {
+  const header = block.split("\n", 1)[0] ?? "";
+  const m = header.match(/^diff --git a\/(\S+) b\/(\S+)/);
+  return m?.[2] ?? m?.[1] ?? "";
 }
 
 /** Count the per-file blocks in a unified-diff patch. */

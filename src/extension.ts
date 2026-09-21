@@ -4,7 +4,7 @@ import { readConfig, resolveClients, stripVendor, type ResolvedConfig } from "./
 import { runPipeline, type PipelineEvent } from "./pipeline.js";
 import { loadChange, renderChangeFrame } from "./openspec/loader.js";
 import { validateStrict } from "./openspec/validate.js";
-import { getChangeDiff, scopePatchToPaths } from "./openspec/diff.js";
+import { getChangeDiff, patchPaths, scopePatchToPaths } from "./openspec/diff.js";
 import { createTranscriptWriter, type TranscriptWriter as Transcript } from "./transcript.js";
 import { selectConfirmedFindings } from "./triage.js";
 import type { FixProposal, Issue, Stage, Triage, Verdict } from "./schemas.js";
@@ -455,6 +455,8 @@ async function handleReviewBranch(
   const taskHeader = userTask
     ? `# Reviewer instructions\n${userTask}`
     : `# Reviewer instructions\nReview this branch diff for OWASP issues, dead code, missing tests, and OpenSpec drift. Cite file:line for each issue.`;
+  const scopeBlock = buildScopeBlock(patchPaths(diff));
+  const scopedTaskHeader = scopeBlock ? `${taskHeader}\n\n${scopeBlock}` : taskHeader;
   const diffBody = `\`\`\`diff\n${diff}\n\`\`\``;
   const diffBlock = `# Branch diff (${diffDescription})\n\n${diffBody}`;
   const attachedBlock = attached ? `\n\n${attached}` : "";
@@ -499,7 +501,7 @@ async function handleReviewBranch(
   iter = 1;
   stream.markdown(`---\n\n### Iteration ${iter} / ${maxIters} \u2014 initial review\n\n`);
 
-  const reviewerPrompt = `${taskHeader}\n\n${diffBlock}${attachedBlock}`;
+  const reviewerPrompt = `${scopedTaskHeader}\n\n${diffBlock}${attachedBlock}`;
   const preflight = await tokenPreflight(cfg, reviewerPrompt);
   if (preflight) {
     stream.markdown(
@@ -539,7 +541,7 @@ async function handleReviewBranch(
       stream.progress(`Worker \`${triager.modelId}\` checking whether the findings are real\u2026`);
       let triage: Triage | undefined;
       try {
-        triage = await triager.triage(buildTriageInput({ verdict, diffDescription }), {
+        triage = await triager.triage(buildTriageInput({ verdict, diffDescription, scopeBlock }), {
           signal,
           tools: toolsFor("triager"),
         });
@@ -567,7 +569,7 @@ async function handleReviewBranch(
 
     stream.progress(`Worker \`${fixer.modelId}\` drafting fixes for ${fixableVerdict.issues.length} issue(s)\u2026`);
     const fixerInput = buildFixerInput({
-      taskHeader,
+      taskHeader: scopedTaskHeader,
       diffBlock,
       currentVerdict: fixableVerdict,
       priorFixProposal: lastArtifact,
@@ -640,7 +642,7 @@ async function handleReviewBranch(
     // the files the proposal's own edits touch.
     const scoped = scopePatchToPaths(diff, Array.from(new Set(editsFrom(lastProposal).map((e) => e.path))));
     const reviewArtifact = buildRereviewInput({
-      taskHeader,
+      taskHeader: scopedTaskHeader,
       diffDescription,
       diffBody: `\`\`\`diff\n${scoped.patch}\n\`\`\``,
       omittedFiles: scoped.omitted,
@@ -1091,7 +1093,7 @@ function buildFixerInput(args: {
   ].join("\n");
 }
 
-function buildTriageInput(args: { verdict: Verdict; diffDescription: string }): string {
+function buildTriageInput(args: { verdict: Verdict; diffDescription: string; scopeBlock?: string }): string {
   const findings = args.verdict.issues
     .map(
       (it, idx) =>
@@ -1104,8 +1106,35 @@ function buildTriageInput(args: { verdict: Verdict; diffDescription: string }): 
     `A reviewer produced these findings against ${args.diffDescription}.`,
     "Judge each one. You are judging the CLAIM, not the proposed remedy.",
     "Read whatever source you need through the tools before deciding.",
+    ...(args.scopeBlock ? ["", args.scopeBlock] : []),
     "",
     findings,
+  ].join("\n");
+}
+
+const MAX_LISTED_SCOPE_PATHS = 200;
+
+/**
+ * Name the branch's changed files outright. Without this both agents drift into
+ * unchanged code — reviewing files the branch never touched, or proposing
+ * infrastructure it never implied.
+ */
+function buildScopeBlock(paths: string[]): string {
+  if (paths.length === 0) return "";
+  const listed = paths.slice(0, MAX_LISTED_SCOPE_PATHS).map((p) => `- \`${p}\``);
+  if (paths.length > MAX_LISTED_SCOPE_PATHS) {
+    listed.push(`- …and ${paths.length - MAX_LISTED_SCOPE_PATHS} further changed file(s)`);
+  }
+  return [
+    `# Files under review (${paths.length} changed on this branch)`,
+    "",
+    ...listed,
+    "",
+    "Every finding MUST cite one of these paths. Unchanged code is context you may consult in " +
+      "order to judge a changed line — it is never the subject of a finding in its own right. Do " +
+      "not raise findings about files absent from this list, and do not propose new files, " +
+      "harnesses, indexes or CI machinery that none of these paths implies. If judging a changed " +
+      "line depends on code outside the list, cite the changed path and say what you could not verify.",
   ].join("\n");
 }
 
@@ -1243,10 +1272,14 @@ function makeToolContext(
     specs: toolset.specs,
     maxCalls: limits.maxCalls,
     deadlineMs: limits.deadlineMs,
-    invoke: (call) => toolset.invoke(call),
-    onCall(call, result) {
+    invoke: (call, ctx) => toolset.invoke(call, ctx),
+    onCallStart(call) {
+      // Reported before the call, not after: a search that walks a large
+      // workspace is otherwise invisible for as long as it runs.
       const detail = summariseToolInput(call.input);
       stream.progress(`${agent}: ${call.name}${detail ? ` ${detail}` : ""}`);
+    },
+    onCall(call, result) {
       transcript.write({
         event: "tool-call",
         agent,

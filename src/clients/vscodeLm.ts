@@ -140,7 +140,8 @@ export class VscodeLmClient implements ChatClient {
           continue;
         }
         budget.calls++;
-        const result = await tools.invoke(call);
+        tools.onCallStart?.(call);
+        const result = await tools.invoke(call, { deadlineAt: budget.deadlineAt });
         tools.onCall?.(call, result);
         answers.push(
           new vscode.LanguageModelToolResultPart(call.callId, [
