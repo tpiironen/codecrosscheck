@@ -13,6 +13,13 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
+- **The reviewer corpus no longer runs nightly.** Every run sends planted-flaw
+  fixtures to a live model, so the schedule billed for runs nobody requested —
+  and since `CCC_BASE_URL`/`CCC_API_KEY` were never configured on the
+  repository, each one failed with `CODECROSSCHECK_BASE_URL required` rather
+  than gating anything. The job is now reachable by manual dispatch only;
+  dispatch it after touching `src/prompts/`.
+
 ## [0.5.0] — 2026-09-16
 
 OpenSpec changes (all archived under `openspec/changes/archive/2026-09-16-*`):
