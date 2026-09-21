@@ -29,7 +29,7 @@ npm test
 | `npm run lint` | ESLint + `typescript-eslint` over `src/`, `test/`, `scripts/` |
 | `npm run typecheck` | `src/` **and** `test/` — tests were previously never type-checked |
 | `npm test` | Vitest unit suite |
-| `npm run test:corpus` | Planted-flaw reviewer corpus. Needs `RUN_LIVE_TESTS=1` and `CODECROSSCHECK_BASE_URL`; it spends model tokens, so CI runs it nightly rather than per-PR |
+| `npm run test:corpus` | Planted-flaw reviewer corpus. Needs `RUN_LIVE_TESTS=1` and `CODECROSSCHECK_BASE_URL`; it spends model tokens, so CI never runs it unattended — dispatch the **Reviewer corpus (live models)** job by hand after changing anything under `src/prompts/` |
 
 `typescript` is pinned to `^5.9` on purpose: `typescript-eslint` does not
 support TS 7.0 yet. Do not bump it until that lands, or the lint gate stops

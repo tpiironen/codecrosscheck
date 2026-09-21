@@ -5,9 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    # Nightly reviewer-corpus run; prompt regressions are otherwise uncaught.
-    - cron: "0 3 * * *"
   workflow_dispatch:
 
 jobs:
@@ -61,8 +58,8 @@ jobs:
 
   corpus:
     name: Reviewer corpus (live models)
-    # Only on a schedule or by hand: it spends model tokens and needs a secret.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # By hand only: every run spends model tokens and needs a secret.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
