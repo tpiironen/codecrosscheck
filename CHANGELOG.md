@@ -13,14 +13,24 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
-## [0.5.1-rc.2] — 2026-09-21
+## [0.5.1] — 2026-09-21
 
-- **The reviewer corpus no longer runs nightly.** Every run sends planted-flaw
-  fixtures to a live model, so the schedule billed for runs nobody requested —
-  and since `CCC_BASE_URL`/`CCC_API_KEY` were never configured on the
-  repository, each one failed with `CODECROSSCHECK_BASE_URL required` rather
-  than gating anything. The job is now reachable by manual dispatch only;
-  dispatch it after touching `src/prompts/`.
+Fixes a `/review-branch` run that appeared to hang during triage, a reviewer
+that wandered outside the branch, and a CI job that billed nightly for a gate it
+was never able to run.
+
+- **The reviewer corpus no longer runs nightly — and is recorded as never having
+  run at all.** Every run sends planted-flaw fixtures to a live model, so the
+  schedule billed for runs nobody requested; and since `CCC_BASE_URL`/
+  `CCC_API_KEY` were never configured on the repository, each one failed with
+  `CODECROSSCHECK_BASE_URL required` rather than gating anything. The job is now
+  reachable by manual dispatch only. The deeper problem is that nobody here can
+  dispatch it: the harness needs an OpenAI-compatible HTTP endpoint, this
+  project has none, and a Copilot subscription cannot substitute because the VS
+  Code Language Model API is reachable only from the extension host. Carried as
+  open task E2 since 0.5.0, it is now recorded as permanent in `CONTRIBUTING.md`
+  and `test/corpus/README.md`. **Reviewer prompt behaviour is unverified** — the
+  fixtures are kept for whoever configures an endpoint.
 - **A diff path containing a space or a non-ASCII byte is no longer dropped.**
   `blockPath` read the `diff --git` header with `^diff --git a/(\S+) b/(\S+)`,
   which is wrong twice over: an unquoted path may contain spaces, and git
@@ -33,12 +43,6 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 - **The scope threading is pinned by tests.** `test/extensionScope.test.ts`
   asserts the changed-file list reaches the reviewer, triager, fixer and
   re-review prompts, and that the listing cap reports its remainder.
-
-## [0.5.1-rc.1] — 2026-09-17
-
-Fixes a `/review-branch` run that appeared to hang during triage, and a reviewer
-that wandered outside the branch.
-
 - **`search_workspace` no longer spawns a git process per path.** The tree walk
   asked `git check-ignore` about every entry it met — 65 ms per spawn measured on
   Windows — so one search over a large workspace took minutes with no output.
