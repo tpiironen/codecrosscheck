@@ -368,15 +368,26 @@ Pick a version per [SemVer](https://semver.org/) (pre-1.0: minor for
 breaking changes, patch for fixes):
 
 ```bash
-npm version patch --no-git-tag-version   # 0.5.0 -> 0.5.1
+npm version patch --no-git-tag-version
 # or: npm version minor --no-git-tag-version
 ```
 
-This rewrites `package.json` `"version"`. Move the `[Unreleased]`
-section in `CHANGELOG.md` under a new `[0.5.1] - YYYY-MM-DD` heading
-and start a fresh `[Unreleased]` block.
+This rewrites `package.json` `"version"`. Rename the `[Unreleased]`
+heading in `CHANGELOG.md` to `[<new-version>] - YYYY-MM-DD` and start a
+fresh empty `[Unreleased]` block above it.
 
-### 4. Build the VSIX
+### 4. Run the release gate
+
+```bash
+npm run release
+```
+
+Refuses to proceed unless the tree is clean, the branch is `main`, the
+package name is intact, `"private": true` is still set, and
+`npm run verify` is green. It publishes nothing — it gates what you are
+about to package.
+
+### 5. Build the VSIX
 
 ```bash
 npm run build
@@ -388,7 +399,7 @@ local file. Verify a fresh build actually contains your change rather than
 trusting the version string — unzip it and grep `extension/dist/extension.cjs`
 for a symbol you just added.
 
-### 5. Install into your VS Code
+### 6. Install into your VS Code
 
 Use `code.cmd` directly — the bare `code` shim on PowerShell can detach
 from stderr and exit 0 even when the install silently failed:
@@ -426,11 +437,11 @@ To uninstall:
 (`tpiironen` is the `publisher` field in `package.json`; the extension
 id is `<publisher>.<name>`.)
 
-### 6. Hand it to a teammate
+### 7. Hand it to a teammate
 
 The `.vsix` is a single file — share it directly (Teams, file share,
 attached to a PR build artifact) and the recipient runs the same
-`code.cmd --install-extension` command from step 5. For the CLI, share
+ `code.cmd --install-extension` command from step 6. For the CLI, share
 the repo URL and have them run `npm ci && npm run build && npm link`.
 No registry, no signing, no Marketplace.
 
