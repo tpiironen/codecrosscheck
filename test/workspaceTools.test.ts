@@ -190,6 +190,48 @@ describe("workspace toolset — search_workspace", () => {
     const result = await toolset(tree).invoke(call("search_workspace", { query: "zzz-not-present" }));
     expect(result.content).toContain("No matches");
   });
+
+  it("stops at the invocation deadline and says the result is partial", async () => {
+    const result = await toolset(tree).invoke(call("search_workspace", { query: "target" }), {
+      deadlineAt: Date.now() - 1,
+    });
+    expect(result.content).toContain("time budget");
+    expect(result.content).not.toContain("src/a.ts:1");
+  });
+
+  it("counts every walked file against the cap, not only the ones it opens", async () => {
+    // `pathContains` skips a file before it is read; counting only reads let a
+    // narrowed search walk an entire repository without ever hitting the cap.
+    const files: Record<string, string> = { "aaa/1.ts": "x", "aaa/2.ts": "x", "aaa/3.ts": "x" };
+    files["src/hit.ts"] = "needle";
+    const ts = createWorkspaceToolset({ root: WS, fs: makeFs(files), ignore: allowAll, maxFilesScanned: 2 });
+
+    const result = await ts.invoke(call("search_workspace", { query: "needle", pathContains: "src/" }));
+
+    expect(result.content).toContain("stopped after walking 2 file(s)");
+    expect(result.content).not.toContain("src/hit.ts");
+  });
+
+  it("asks the ignore policy once per depth level, not once per entry", async () => {
+    const batches: number[] = [];
+    const policy: IgnorePolicy = {
+      async isIgnored() {
+        throw new Error("per-entry check used when a batch was available");
+      },
+      async filterIgnored(rels) {
+        batches.push(rels.length);
+        return new Set<string>();
+      },
+    };
+    const files = { "src/a.ts": "needle", "src/b.ts": "x", "docs/c.md": "y", "top.txt": "z" };
+
+    await createWorkspaceToolset({ root: WS, fs: makeFs(files), ignore: policy }).invoke(
+      call("search_workspace", { query: "needle" }),
+    );
+
+    // Level 0: src/, docs/, top.txt. Level 1: src's two files plus docs' one.
+    expect(batches).toEqual([3, 3]);
+  });
 });
 
 describe("workspace toolset — list_directory", () => {
@@ -246,9 +288,9 @@ describe("denylistPolicy", () => {
 describe("repositoryIgnorePolicy", () => {
   it("consults git for paths the denylist allows", async () => {
     const asked: string[] = [];
-    const policy = repositoryIgnorePolicy(WS, async (_root, rel) => {
-      asked.push(rel);
-      return rel === "generated/out.ts";
+    const policy = repositoryIgnorePolicy(WS, async (_root, rels) => {
+      asked.push(...rels);
+      return new Set(rels.filter((r) => r === "generated/out.ts"));
     });
     expect(await policy.isIgnored("generated/out.ts")).toBe(true);
     expect(await policy.isIgnored("src/a.ts")).toBe(false);
@@ -257,9 +299,9 @@ describe("repositoryIgnorePolicy", () => {
 
   it("does not consult git for a denylisted path", async () => {
     const asked: string[] = [];
-    const policy = repositoryIgnorePolicy(WS, async (_root, rel) => {
-      asked.push(rel);
-      return false;
+    const policy = repositoryIgnorePolicy(WS, async (_root, rels) => {
+      asked.push(...rels);
+      return new Set<string>();
     });
     expect(await policy.isIgnored(".env")).toBe(true);
     expect(asked).toEqual([]);
@@ -269,11 +311,33 @@ describe("repositoryIgnorePolicy", () => {
     let calls = 0;
     const policy = repositoryIgnorePolicy(WS, async () => {
       calls++;
-      return false;
+      return new Set<string>();
     });
     await policy.isIgnored("src/a.ts");
     await policy.isIgnored("src/a.ts");
     expect(calls).toBe(1);
+  });
+
+  it("answers a whole listing in one git call", async () => {
+    let calls = 0;
+    const policy = repositoryIgnorePolicy(WS, async (_root, rels) => {
+      calls++;
+      return new Set(rels.filter((r) => r.endsWith(".log")));
+    });
+    const ignored = await policy.filterIgnored!(["src/a.ts", "out.log", "node_modules", "src/b.ts"]);
+    expect(calls).toBe(1);
+    expect(Array.from(ignored).sort()).toEqual(["node_modules", "out.log"]);
+  });
+
+  it("does not re-ask git for a path already answered in a batch", async () => {
+    const asked: string[][] = [];
+    const policy = repositoryIgnorePolicy(WS, async (_root, rels) => {
+      asked.push([...rels]);
+      return new Set<string>();
+    });
+    await policy.filterIgnored!(["src/a.ts", "src/b.ts"]);
+    await policy.filterIgnored!(["src/b.ts", "src/c.ts"]);
+    expect(asked).toEqual([["src/a.ts", "src/b.ts"], ["src/c.ts"]]);
   });
 
   it("falls back to the denylist when git cannot answer, and stops asking", async () => {

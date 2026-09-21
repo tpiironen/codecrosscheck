@@ -89,14 +89,122 @@ export function filterPatchToScope(patch: string, scopePaths: string[]): string 
   const kept: string[] = [];
   for (const block of blocks) {
     if (!block.trim()) continue;
-    const header = block.split("\n", 1)[0] ?? "";
-    const m = header.match(/^diff --git a\/(\S+) b\/(\S+)/);
-    const file = m?.[2] ?? m?.[1] ?? "";
+    const file = blockPath(block);
     if (scopePaths.some((p) => file === p || file.startsWith(p.endsWith("/") ? p : p + "/"))) {
       kept.push(block);
     }
   }
   return kept.join("");
+}
+
+/** The post-image path of every per-file block in a patch, in patch order. */
+export function patchPaths(patch: string): string[] {
+  return patch
+    .split(/^(?=diff --git )/m)
+    .filter((b) => b.trim())
+    .map(blockPath)
+    .filter((p) => p.length > 0);
+}
+
+/**
+ * The path a per-file block is about.
+ *
+ * Marker lines state exactly one path each, so they are read first: `+++ `,
+ * then `--- ` for a deletion (`+++ /dev/null`), then `rename to` for a
+ * content-free rename. A mode-only block carries none of those, so the
+ * `diff --git` header must be parsed directly - and there a `\S+` pattern is
+ * wrong twice over: an unquoted path may contain spaces, and git C-quotes any
+ * path with spaces or non-ASCII bytes.
+ */
+function blockPath(block: string): string {
+  const lines = block.split("\n");
+  const post = pathFromMarker(lines, "+++ ");
+  if (post) return post;
+  const pre = pathFromMarker(lines, "--- ");
+  if (pre) return pre;
+  for (const line of lines) {
+    if (line.startsWith("rename to ")) {
+      return stripDiffPrefix(decodeQuotedPath(line.slice("rename to ".length).trimEnd()));
+    }
+  }
+  return headerPath(lines[0] ?? "");
+}
+
+/** The path on the first `marker` line, or "" if absent or `/dev/null`. */
+function pathFromMarker(lines: string[], marker: string): string {
+  for (const line of lines) {
+    if (!line.startsWith(marker)) continue;
+    const decoded = decodeQuotedPath(line.slice(marker.length).trimEnd());
+    if (!decoded || decoded === "/dev/null") return "";
+    return stripDiffPrefix(decoded);
+  }
+  return "";
+}
+
+/**
+ * The post-image path from a `diff --git` header, handling both C-quoted
+ * tokens and unquoted paths containing spaces. For the unquoted case the split
+ * point is the space at which `a/P` and `b/P` name the same path; a rename
+ * header falls back to the trailing `b/` token.
+ */
+function headerPath(header: string): string {
+  if (!header.startsWith("diff --git ")) return "";
+  const rest = header.slice("diff --git ".length).trimEnd();
+  if (rest.startsWith('"')) {
+    const first = readQuotedToken(rest);
+    const second = first.remainder.trimStart();
+    const post = second.startsWith('"') ? readQuotedToken(second).path : decodeQuotedPath(second);
+    return stripDiffPrefix(post || first.path);
+  }
+  for (let i = rest.indexOf(" "); i !== -1; i = rest.indexOf(" ", i + 1)) {
+    const a = rest.slice(0, i);
+    const b = rest.slice(i + 1);
+    if (a.startsWith("a/") && b.startsWith("b/") && a.slice(2) === b.slice(2)) return a.slice(2);
+  }
+  const m = rest.match(/^a\/(\S+) b\/(\S+)$/);
+  return m ? (m[2] ?? "") : stripDiffPrefix(rest);
+}
+
+/** Read one quoted token from the head of `s`; returns its decoded path and the remainder. */
+function readQuotedToken(s: string): { path: string; remainder: string } {
+  let i = 1;
+  for (; i < s.length; i++) {
+    if (s[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (s[i] === '"') break;
+  }
+  return { path: decodeQuotedPath(s.slice(0, i + 1)), remainder: s.slice(i + 1) };
+}
+
+/** Strip the `a/` or `b/` diff prefix git puts on both sides. */
+function stripDiffPrefix(p: string): string {
+  return p.startsWith("a/") || p.startsWith("b/") ? p.slice(2) : p;
+}
+
+/** Undo git's C-style quoting; pass anything unquoted through unchanged. */
+function decodeQuotedPath(raw: string): string {
+  if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) return raw;
+  const body = raw.slice(1, -1);
+  const bytes: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] !== "\\") {
+      bytes.push(...Buffer.from(body[i]!, "utf8"));
+      continue;
+    }
+    const next = body[++i];
+    if (next === undefined) break;
+    const octal = body.slice(i, i + 3);
+    if (/^[0-7]{3}$/.test(octal)) {
+      bytes.push(parseInt(octal, 8));
+      i += 2;
+      continue;
+    }
+    const simple: Record<string, number> = { n: 10, t: 9, r: 13, '"': 34, "\\": 92 };
+    bytes.push(simple[next] ?? Buffer.from(next, "utf8")[0]!);
+  }
+  return Buffer.from(bytes).toString("utf8");
 }
 
 /** Count the per-file blocks in a unified-diff patch. */

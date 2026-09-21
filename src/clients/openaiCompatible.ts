@@ -179,7 +179,8 @@ export class OpenAiCompatibleClient implements ChatClient {
           continue;
         }
         budget.calls++;
-        const result = await tools.invoke(call);
+        tools.onCallStart?.(call);
+        const result = await tools.invoke(call, { deadlineAt: budget.deadlineAt });
         tools.onCall?.(call, result);
         history.push({ role: "tool", tool_call_id: raw.id, content: result.content });
       }

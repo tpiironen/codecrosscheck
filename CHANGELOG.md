@@ -20,6 +20,32 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
   than gating anything. The job is now reachable by manual dispatch only;
   dispatch it after touching `src/prompts/`.
 
+## [0.5.1-rc.1] — 2026-09-17
+
+Fixes a `/review-branch` run that appeared to hang during triage, and a reviewer
+that wandered outside the branch.
+
+- **`search_workspace` no longer spawns a git process per path.** The tree walk
+  asked `git check-ignore` about every entry it met — 65 ms per spawn measured on
+  Windows — so one search over a large workspace took minutes with no output.
+  `IgnorePolicy` gained `filterIgnored()`, answered by a single
+  `git check-ignore -z --stdin` call, and the walk is now breadth-first so one
+  query covers a whole depth level. Measured on this repository: **346 paths,
+  133 → 7 git spawns, 6.7 s → 0.48 s** (~22 s under the original per-path policy).
+- **Tool calls are announced before they run.** `ToolContext.onCallStart` fires
+  ahead of `invoke`, so a slow call is visible while it is slow instead of only
+  once it returns.
+- **A long tool call is cut off.** `invoke` receives the loop's `deadlineAt`;
+  `search_workspace` stops there and says its results are partial.
+- **The file cap counts every walked file**, not only the ones opened. A search
+  narrowed with `pathContains` previously skipped the counter and could walk an
+  entire repository without reaching `maxFilesScanned`.
+- **The branch's changed files are named as the review scope.** The reviewer,
+  triager and fixer prompts now list every path in the diff and state that
+  findings must cite one of them — unchanged code is context, not subject
+  matter. Fixes runs that drifted into designing infrastructure the branch never
+  implied.
+
 ## [0.5.0] — 2026-09-16
 
 OpenSpec changes (all archived under `openspec/changes/archive/2026-09-16-*`):

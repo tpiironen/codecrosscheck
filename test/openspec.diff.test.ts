@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { filterPatchToScope, chunkPatch, countPatchFiles, scopePatchToPaths } from "../src/openspec/diff.js";
+import { filterPatchToScope, chunkPatch, countPatchFiles, patchPaths, scopePatchToPaths } from "../src/openspec/diff.js";
 
 const SAMPLE = [
   "diff --git a/src/cli.ts b/src/cli.ts",
@@ -59,6 +59,94 @@ describe("openspec/diff", () => {
     expect(chunks).toHaveLength(1);
     expect(chunks[0]).toContain("a.ts");
     expect(chunks[0]).toContain("c.ts");
+  });
+
+  it("patchPaths lists every changed file in patch order", () => {
+    expect(patchPaths(SAMPLE)).toEqual(["src/cli.ts", "docs/readme.md"]);
+  });
+
+  it("patchPaths takes the post-image path of a rename", () => {
+    const renamed = "diff --git a/src/old.ts b/src/new.ts\nsimilarity index 95%\nrename from src/old.ts\nrename to src/new.ts\n";
+    expect(patchPaths(renamed)).toEqual(["src/new.ts"]);
+  });
+
+  it("patchPaths returns nothing for an empty patch", () => {
+    expect(patchPaths("")).toEqual([]);
+  });
+
+  it("patchPaths names a mode-only change whose path contains a space", () => {
+    const modeOnly = [
+      "diff --git a/src/my file.ts b/src/my file.ts",
+      "old mode 100644",
+      "new mode 100755",
+      "",
+    ].join("\n");
+    expect(patchPaths(modeOnly)).toEqual(["src/my file.ts"]);
+  });
+
+  it("patchPaths decodes a C-quoted path in a mode-only header", () => {
+    const modeOnly = [
+      'diff --git "a/src/caf\\303\\251 log.ts" "b/src/caf\\303\\251 log.ts"',
+      "old mode 100644",
+      "new mode 100755",
+      "",
+    ].join("\n");
+    expect(patchPaths(modeOnly)).toEqual(["src/caf\u00e9 log.ts"]);
+  });
+
+  it("patchPaths handles a path containing a space", () => {
+    const spaced = [
+      "diff --git a/src/my file.ts b/src/my file.ts",
+      "index 111..222 100644",
+      "--- a/src/my file.ts",
+      "+++ b/src/my file.ts",
+      "@@ -1,1 +1,1 @@",
+      "-old",
+      "+new",
+      "",
+    ].join("\n");
+    expect(patchPaths(spaced)).toEqual(["src/my file.ts"]);
+  });
+
+  it("patchPaths decodes a C-quoted path", () => {
+    const quoted = [
+      'diff --git "a/src/caf\\303\\251 log.ts" "b/src/caf\\303\\251 log.ts"',
+      "index 111..222 100644",
+      '--- "a/src/caf\\303\\251 log.ts"',
+      '+++ "b/src/caf\\303\\251 log.ts"',
+      "@@ -1,1 +1,1 @@",
+      "-old",
+      "+new",
+      "",
+    ].join("\n");
+    expect(patchPaths(quoted)).toEqual(["src/caf\u00e9 log.ts"]);
+  });
+
+  it("patchPaths names a deleted file with a quoted, spaced path", () => {
+    const deleted = [
+      'diff --git "a/src/old file.ts" "b/src/old file.ts"',
+      "deleted file mode 100644",
+      "index 111..0000000",
+      '--- "a/src/old file.ts"',
+      "+++ /dev/null",
+      "@@ -1,1 +0,0 @@",
+      "-gone",
+      "",
+    ].join("\n");
+    expect(patchPaths(deleted)).toEqual(["src/old file.ts"]);
+  });
+
+  it("filterPatchToScope keeps a deleted spaced path when its directory is in scope", () => {
+    const deleted = [
+      'diff --git "a/src/old file.ts" "b/src/old file.ts"',
+      "deleted file mode 100644",
+      '--- "a/src/old file.ts"',
+      "+++ /dev/null",
+      "@@ -1,1 +0,0 @@",
+      "-gone",
+      "",
+    ].join("\n");
+    expect(filterPatchToScope(deleted, ["src/"])).toContain("old file.ts");
   });
 });
 
