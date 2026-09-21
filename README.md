@@ -311,8 +311,7 @@ scripts/
   copy-assets.mjs          # bundles src/prompts/ + .github/skills/ into dist/
   selftest.mjs             # end-to-end live PLAN→CODE→EXECUTE smoke
   selftest-openspec.mjs    # end-to-end live with --openspec fixture
-  release.mjs              # publish guard (clean tree, branch=main, registry check)
-  publish-vsix.mjs         # az artifacts universal publish wrapper
+  release.mjs              # pre-package gate (clean tree, branch=main, private, verify)
   bundle-extension.mjs     # esbuild bundle of the extension entry point
 docs/
   ARCHITECTURE.md          # component + sequence diagrams, deep dive
@@ -441,19 +440,21 @@ This repo deliberately ships **no public artifacts**:
 
 - No public npm package.
 - No VS Code Marketplace listing.
-- No Azure Artifacts feed required for ordinary use.
+- No registry of any kind.
 
-The `scripts/release.mjs` and `scripts/publish-vsix.mjs` scripts and the
-`.npmrc.template` / `publishConfig` entries in `package.json` are
-placeholders for an optional future internal feed. They are **not
-exercised** by the local build-and-install flow above and you do not
-need to configure them. If a private feed is set up later, those
-scripts give it a one-command path; until then, ignore them.
+`package.json` sets `"private": true`, which is what enforces that: it
+is the one thing standing between a stray `npm publish` and the public
+registry. [scripts/release.mjs](scripts/release.mjs) is a pre-package
+gate, not a publisher — it checks for a clean tree on `main`, the
+package name, `private`, and a green `npm run verify`, then tells you to
+run `vsce package`.
 
 ## Security notes
 
-- EXECUTE sandbox: spawn (no shell), env allowlist, `NO_PROXY=*` when network
-  denied, fresh tmpdir per run, hard-killed on timeout.
+- EXECUTE sandbox: spawn (no shell), env allowlist, fresh tmpdir per run,
+  hard-killed on timeout. It is **containment, not a security boundary**:
+  generated code runs as the invoking user with unrestricted network. There is
+  no network toggle, because none was ever implemented.
 - Reviewer prompt names OWASP A01–A10 explicitly so injection-style flaws
   (like raw SQL string concat) are flagged with severity `high`.
 - Validator pre-gate (OpenSpec mode) blocks reviewer calls when

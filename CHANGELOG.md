@@ -13,6 +13,56 @@ history or a timeline. On every version bump, rename `## [Unreleased]` to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed model call no longer produces a retry that invents a response.**
+  `sendStructured` initialised `firstRaw` to `""` and only assigned it on
+  success, so an attempt that threw before returning any text — an HTTP 500,
+  an empty message body, a rejected `sendRequest` — built a retry containing a
+  fabricated empty assistant turn and the claim *"That response is not valid
+  JSON for schema X"*, with the transport error rendered as though it were a
+  schema violation. Both clients now re-send the original messages unchanged
+  when there was no response to correct. The two-strike error still reports
+  the originating failure. OpenSpec change:
+  [`fix-retry-without-response`](openspec/changes/archive/2026-09-21-fix-retry-without-response/proposal.md).
+- **Release scripts no longer shell-interpret an interpolated command string.**
+  `scripts/publish-vsix.mjs` interpolated `CCC_UNIVERSAL_FEED` and
+  `CCC_VSIX_PACKAGE` from the environment straight into an `execSync` command;
+  `scripts/release.mjs` did the same for its `git` calls. Both violated the
+  `distribution` and `chat-loop` specs and `openspec/AGENTS.md`.
+- **README no longer credits the EXECUTE sandbox with a network restriction it
+  does not have.** It claimed `NO_PROXY=*` was set "when network denied";
+  `NO_PROXY` tells clients to *bypass* a proxy and denies nothing, which is why
+  it was removed in 0.5.0.
+
+### Changed
+
+- **Distribution is local-only, and now enforced rather than asserted.**
+  `package.json` sets `"private": true` and declares no `publishConfig`; the
+  `publish:npm` and `publish:vsix` scripts and `scripts/publish-vsix.mjs` are
+  removed. `scripts/release.mjs` becomes a pre-package gate — clean tree,
+  `main`, package name, `private`, and a green `npm run verify` — and publishes
+  nothing. Its previous gate required `publishConfig.registry` to match an
+  Azure Artifacts feed that has not existed since 0.4.0, so it rejected every
+  invocation; 0.5.0 and 0.5.1 both shipped around it.
+- **`codecrosscheck-install` installs the delegation skill only.** Its default
+  path downloaded a `.vsix` from an Azure Artifacts universal feed that does
+  not exist. With no subcommand it now prints the documented build-and-install
+  procedure and exits non-zero.
+
+### Documentation
+
+- The `distribution`, `vscode-extension` and `verification` specs are brought
+  level with the code. Between them they still required a setting removed in
+  0.5.0 (`execute.allowNetwork`), described re-review scoping and triage in
+  terms of a context harvest deleted in 0.5.0, and asserted that a live test
+  had parsed a verdict from a real API response — which the corpus requirement
+  in the same file contradicts. See
+  [`correct-vscode-extension-spec-drift`](openspec/changes/archive/2026-09-21-correct-vscode-extension-spec-drift/proposal.md),
+  [`remove-superseded-live-test-requirement`](openspec/changes/archive/2026-09-21-remove-superseded-live-test-requirement/proposal.md)
+  and
+  [`realign-distribution-to-reality`](openspec/changes/archive/2026-09-21-realign-distribution-to-reality/proposal.md).
+
 ## [0.5.1] — 2026-09-21
 
 Fixes a `/review-branch` run that appeared to hang during triage, a reviewer

@@ -1,6 +1,7 @@
 {
   "name": "codecrosscheck",
   "version": "0.5.1",
+  "private": true,
   "description": "Two-model review loop: a worker LLM produces, a reviewer LLM judges, both as a Node CLI and a VS Code chat participant.",
   "type": "module",
   "engines": {
@@ -27,8 +28,6 @@
     "verify": "npm ci && npm run lint && npm run typecheck && npm run build && npm test",
     "selftest": "npm run build && node scripts/selftest.mjs",
     "selftest:openspec": "npm run build && node scripts/selftest-openspec.mjs",
-    "publish:npm": "npm publish",
-    "publish:vsix": "node scripts/publish-vsix.mjs",
     "release": "node scripts/release.mjs"
   },
   "dependencies": {
@@ -53,9 +52,6 @@
     "vscode": {
       "optional": true
     }
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "repository": {
     "type": "git",

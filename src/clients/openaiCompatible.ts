@@ -228,17 +228,22 @@ export class OpenAiCompatibleClient implements ChatClient {
     throwIfAborted(opts?.signal, this.modelId);
 
     // Echo the failed response back so the model can see what it produced.
-    const retryMessages: ChatMessage[] = [
-      ...messages,
-      { role: "assistant", content: firstRaw },
-      {
-        role: "system",
-        content:
-          `That response is not valid JSON for schema "${schemaName}". ` +
-          `It failed with: ${explainFailure(firstError)}. ` +
-          `Reply with ONLY a JSON object matching this schema and nothing else: ${JSON.stringify(jsonSchema)}`,
-      },
-    ];
+    // An attempt that threw before returning text produced nothing to echo, so
+    // the retry re-sends the original prompt rather than describing a response
+    // the model never made.
+    const retryMessages: ChatMessage[] = firstRaw
+      ? [
+          ...messages,
+          { role: "assistant", content: firstRaw },
+          {
+            role: "system",
+            content:
+              `That response is not valid JSON for schema "${schemaName}". ` +
+              `It failed with: ${explainFailure(firstError)}. ` +
+              `Reply with ONLY a JSON object matching this schema and nothing else: ${JSON.stringify(jsonSchema)}`,
+          },
+        ]
+      : messages;
     try {
       // No tools on the retry: the reminder is about JSON shape, not missing
       // data, and re-running the loop would spend a second budget on it.

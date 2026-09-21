@@ -55,22 +55,6 @@ The test suite SHALL load every prompt file under `src/prompts/` AND assert the 
 - **WHEN** the prompt-contract test runs
 - **THEN** the test fails with a message naming the offending file
 
-### Requirement: Gated live integration test
-
-The system SHALL include a live integration test that exercises the GitHub Models endpoint with the default model pair. The test SHALL be skipped unless `RUN_LIVE_TESTS=1` AND `GITHUB_TOKEN` are both present in the environment.
-
-#### Scenario: Live test skipped by default
-
-- **WHEN** `npm test` runs without `RUN_LIVE_TESTS`
-- **THEN** the live test is reported as skipped, not failed
-
-#### Scenario: Live test passes against real endpoint
-
-- **GIVEN** `RUN_LIVE_TESTS=1` AND a valid `GITHUB_TOKEN`
-- **WHEN** `npm test` runs
-- **THEN** the live test passes
-- **AND** at least one structured verdict is parsed from a real API response
-
 ### Requirement: Cross-platform gate
 
 The repository SHALL provide a single `npm run verify` script that runs `npm ci`, `npm run build`, AND `npm test` on Windows, macOS, and Linux without any shell-specific dependencies.

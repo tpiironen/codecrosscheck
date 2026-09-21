@@ -440,14 +440,8 @@ flowchart TB
 ### 8.3 Installers ([src/install.ts](../src/install.ts))
 
 The `codecrosscheck-install` bin (also runnable directly as
-`node dist/install.js`) handles two jobs based on `argv[2]`:
+`node dist/install.js`) handles one job, selected by `argv[2]`:
 
-- `install` (default): would download the latest `.vsix` from a
-  configured Azure Artifacts universal feed and run
-  `code --install-extension <path>`. **Inert in the default local-only
-  setup** — no feed is configured, so users build and install the
-  `.vsix` by hand (see the README's Contributing & local install
-  section).
 - `install skill [--user]`: copies the bundled delegation skill (same
   file the VS Code command writes) into the workspace or user-profile
   skills folder. Works from any local clone with `npm run build`
@@ -498,12 +492,12 @@ installed directly from a checkout — no registry, no feed:
 | `codecrosscheck` CLI (`bin`: `codecrosscheck`, `ccc`) | `npm run build` | `npm link` from the checkout |
 | `codecrosscheck-<ver>.vsix` | `npx vsce package` (see README §4) | `code.cmd --install-extension <path>` |
 
-Neither artifact ships to public npm or the VS Code Marketplace.
-[scripts/release.mjs](../scripts/release.mjs) and
-[scripts/publish-vsix.mjs](../scripts/publish-vsix.mjs) exist for an
-optional future internal Azure Artifacts feed; they are not part of the
-default flow and require an `.npmrc` + `az` login that this repo
-doesn't ship. End users can ignore them.
+Neither artifact ships to any registry. `package.json` sets
+`"private": true`, which is what stops an accidental `npm publish`.
+[scripts/release.mjs](../scripts/release.mjs) is a pre-package gate: it
+checks for a clean tree on `main`, the package name, `private`, and a
+green `npm run verify`, then tells you to run `vsce package`. It
+publishes nothing.
 
 ## 12. Self-hosting
 
